@@ -13,6 +13,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -421,7 +422,7 @@ def cmd_doctor(root: Path) -> int:
         ok(n <= budget, f"CLAUDE.md is {n} lines (budget {budget})", "/devaccel-tune to prune")
     for f in ("CLAUDE.md", ".claude/skills/verify-app/SKILL.md"):
         p = root / f
-        if p.exists() and "devaccel:fill" in p.read_text() and "<!-- devaccel:fill" in p.read_text():
+        if p.exists() and re.search(r"<!-- devaccel:fill\b(?!ed)", p.read_text()):
             notes.append(f"{f} still has devaccel:fill placeholders → /devaccel-setup")
 
     rep = root / ".claude/hooks/devaccel_report.py"
