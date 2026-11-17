@@ -37,7 +37,7 @@ class GuardTest(unittest.TestCase):
                     "git diff --output=/home/u/.bashrc", "git log -p --ext-diff",
                     "git -c core.pager=evil log", "git diff --out=x", "git diff --outp x",
                     "git log --ext", "git -calias.x=!sh x", "git diff --o x", "git diff --OUT=x",
-                    "git diff '--outpu'=x", "git log --e",
+                    "git diff '--outpu'=x", "git log --e", "git diff \\--output=x",
                     # rules see heredoc bodies too (no parser differential)
                     "bash <<'EOF'\nsudo rm -rf /\nEOF"]:
             self.assertEqual(self.verdict(cmd), "deny", cmd)
@@ -46,6 +46,8 @@ class GuardTest(unittest.TestCase):
         for cmd in ["git add -A", "git add .", "git reset --hard HEAD~1", "git clean -fd",
                     "git checkout -- .", "psql -c 'DROP TABLE users'"]:
             self.assertEqual(self.verdict(cmd), "ask", cmd)
+        for cmd in ["git diff${IFS}--output=x", "git diff $(cat opts)", "git log `x`"]:
+            self.assertIn(self.verdict(cmd), ("ask", "deny"), cmd)
 
     def test_allow(self):
         for cmd in ["rm -rf build", "rm -rf ./dist", "rm file.txt", "git push origin main",

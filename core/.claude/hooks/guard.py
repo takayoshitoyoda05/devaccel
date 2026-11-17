@@ -55,9 +55,12 @@ ASK: list[tuple[re.Pattern, str]] = [
 
 def _git_options(command: str) -> tuple[str, str] | None:
     """git accepts abbreviated long options (--out= == --output=): check per token."""
-    if not re.search(r"\bgit\b", command):
+    flat = command.replace("'", "").replace('"', "").replace("\\", "")
+    if not re.search(r"\bgit\b", flat):
         return None
-    for w in re.split(r"[\s;&|()]+", command.replace("'", "").replace('"', "")):
+    if "$" in flat.replace("${PIPESTATUS", "") or "`" in flat:
+        return "ask", "git コマンドに変数・コマンド展開が含まれています。内容を確認してください。"
+    for w in re.split(r"(?:\s|\$\{?IFS\}?|[;&|()<>])+", flat):
         if w.startswith("--") and len(w) > 2:
             name = w[2:].split("=", 1)[0].lower()
             if "output".startswith(name) or "ext-diff".startswith(name):

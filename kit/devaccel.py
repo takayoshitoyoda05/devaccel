@@ -194,8 +194,11 @@ def render_check(presets: list[str], runner: str) -> str:
 
 SANDBOX = {
     "enabled": True,
-    # secrets: OS-level read denial for shell commands (the Read tool uses permissions.deny)
-    "filesystem": {"denyRead": ["~/**/.env", "~/**/.env.*"]},
+    "failIfUnavailable": True,          # fail closed: no silent unsandboxed fallback
+    "allowUnsandboxedCommands": False,  # ignore dangerouslyDisableSandbox retries
+    # secrets: OS-level read denial for shell commands (the Read tool uses permissions.deny).
+    # "./" = project root in project settings; "~/" covers checkouts under $HOME.
+    "filesystem": {"denyRead": ["./**/.env", "./**/.env.*", "~/**/.env", "~/**/.env.*"]},
 }
 NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "github.com"]}
 
@@ -232,7 +235,8 @@ def render_settings(presets: list[str]) -> dict:
                 "Bash(git push*)",
             ],
             # "/path" = project-relative per the permissions docs; "./" kept for older behavior
-            "deny": ["Read(/.env)", "Read(/.env.*)", "Edit(/.env)", "Edit(/.env.*)",
+            "deny": ["Read(**/.env)", "Read(**/.env.*)", "Edit(**/.env)", "Edit(**/.env.*)",
+                     "Read(/.env)", "Read(/.env.*)", "Edit(/.env)", "Edit(/.env.*)",
                      "Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
                      "Bash(git * --out*)", "Bash(git * --ext*)"],
         },

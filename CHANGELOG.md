@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 (2026-11-18)
+- サンドボックス: `failIfUnavailable: true`(依存が無ければ起動しない)と `allowUnsandboxedCommands: false`(サンドボックス外での再試行を禁止)。denyRead をプロジェクト相対 `./**/.env*` にも拡大。Read/Edit の deny に `**/.env*`。
+- guard: git の判定をバックスラッシュ除去・`${IFS}` 区切りの後に実施。`$`/バッククォートを含む git コマンドは確認。
+
 ## 0.2.0 (2026-11-18)
 - **方針変更**: guard から `.env` などの秘密の検出を削除し、破壊的操作の検出に専念。秘密は OS レベルのサンドボックス(`sandbox.filesystem.denyRead`)と Read の deny で守る(docs/design.md D5b)。0.1.x の正規表現による検出は誤検知と抜け道の修正が交互に続き、並列・非対話実行の速度を落としていた。
 - guard: 規則はヒアドキュメント本文を含む生のコマンドに適用(パーサ差異を作らない)。
