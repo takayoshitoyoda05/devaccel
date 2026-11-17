@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.4 (2026-11-18)
+- `protect.sh`(新規、人が実行): base ブランチに GitHub のブランチ保護を設定(直接・force push・削除の禁止を管理者にも、PR 必須、CI `check` 必須)。非公開リポジトリの無料プランでは使えない旨を表示。
+- doctor: ブランチ保護の状態(on / off / unavailable)を表示。
+
 ## 0.5.3 (2026-11-18)
 - guard: 疑似端末ラッパー(script / unbuffer / expect / empty / socat)を拒否(land の端末確認を偽装できたため)。`.claude/hooks/` を含むコマンドでのワイルドカード・ブレース展開と `cd .claude/hooks` を拒否(名前をぼかした実行の対策)。
 

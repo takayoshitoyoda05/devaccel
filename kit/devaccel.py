@@ -5,6 +5,7 @@ Run from the root of the target project:
     ~/devaccel/install.sh      # first time
     ~/devaccel/update.sh       # replace core files (refuses if hand-edited)
     ~/devaccel/doctor.sh       # health check
+    ~/devaccel/protect.sh      # protect the base branch on GitHub (public repo or Pro)
 """
 
 from __future__ import annotations
@@ -467,6 +468,11 @@ def cmd_doctor(root: Path) -> int:
             notes.append(f"origin is {origin}: PR flow expects https://github.com/... (SSH may fail in the sandbox)")
         auth = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
         ok(auth.returncode == 0, "gh is not authenticated", "gh auth login")
+        if auth.returncode == 0:
+            st = protection_state(root)
+            if st != "on":
+                notes.append(f"branch protection on {base_branch(root)}: {st} — the guard is best-effort; "
+                             "run ~/devaccel/protect.sh (public repo or Pro) so CI `check` is required server-side")
     ok(hooks_wired(root / ".claude/settings.json"), "hooks not wired in .claude/settings.json",
        "add the PreToolUse(Bash) guard and Stop gate entries (README)")
 
@@ -516,12 +522,72 @@ def cmd_doctor(root: Path) -> int:
     return 1 if problems else 0
 
 
+PROTECTION = {
+    # solo-friendly: Claude uses the same account, so "require approval" would only lock you out.
+    # What the server enforces: no direct/force push to the base, merges via PR with CI `check` green.
+    "required_status_checks": {"strict": False, "contexts": ["check"]},
+    "enforce_admins": True,
+    "required_pull_request_reviews": {"required_approving_review_count": 0},
+    "restrictions": None,
+    "allow_force_pushes": False,
+    "allow_deletions": False,
+}
+
+
+def origin_slug(root: Path) -> str:
+    url = subprocess.run(["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+                         capture_output=True, text=True).stdout.strip()
+    m = re.match(r"^(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url)
+    return m.group(1) if m else ""
+
+
+def base_branch(root: Path) -> str:
+    try:
+        return json.loads((root / ".claude/project.json").read_text()).get("scale", {}).get("base_branch", "main")
+    except (OSError, ValueError):
+        return "main"
+
+
+def protection_state(root: Path) -> str:
+    """'on' / 'off' / 'unavailable' (private repo on a free plan) / 'unknown'."""
+    slug = origin_slug(root)
+    if not slug or not shutil.which("gh"):
+        return "unknown"
+    r = subprocess.run(["gh", "api", f"repos/{slug}/branches/{base_branch(root)}/protection"],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        return "on"
+    err = r.stdout + r.stderr
+    return "unavailable" if "Upgrade to GitHub Pro" in err else "off" if "not protected" in err.lower() else "unknown"
+
+
+def cmd_protect(root: Path) -> int:
+    """Human-run: protect the base branch on GitHub (the real boundary behind the guard)."""
+    slug = origin_slug(root)
+    if not slug:
+        print("origin is not a github.com repository")
+        return 2
+    base = base_branch(root)
+    print(f"{slug}:{base} に保護を設定: 直接 push・force push・削除の禁止(管理者も)、PR 経由のみ、CI `check` 必須")
+    if input("続けるなら yes: ").strip() != "yes":
+        return 1
+    r = subprocess.run(["gh", "api", "-X", "PUT", f"repos/{slug}/branches/{base}/protection", "--input", "-"],
+                       input=json.dumps(PROTECTION), capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = (r.stdout + r.stderr).strip()
+        print("failed: " + ("非公開リポジトリは無料プランでは保護できません(公開するか Pro に)" if "Upgrade" in msg else msg[:300]))
+        return 1
+    print("protected")
+    return 0
+
+
 def main() -> int:
-    if len(sys.argv) < 2 or sys.argv[1] not in ("install", "update", "doctor"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("install", "update", "doctor", "protect"):
         print(__doc__)
         return 2
     root = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else Path.cwd()
-    return {"install": cmd_install, "update": cmd_update, "doctor": cmd_doctor}[sys.argv[1]](root)
+    return {"install": cmd_install, "update": cmd_update, "doctor": cmd_doctor,
+            "protect": cmd_protect}[sys.argv[1]](root)
 
 
 if __name__ == "__main__":
