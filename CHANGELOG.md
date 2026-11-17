@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.6.2 (2026-11-18)
+- ゲート・PR スクリプト・bench: check.sh を別の木に向けるとき、パスをシェル本文に埋め込まず環境変数 `DEVACCEL_ROOT` で渡す(worktree 名によるコマンド注入の対策)。
+
 ## 0.6.1 (2026-11-18)
 - 0.6.0 の退行を修正: worktree を検査対象にした際、guard の lock 照合・ゲートの設定・check.sh まで worktree(単位が書き換えられる)から読んでいた。信頼の基準 `trusted_root()`(本体)と検査対象 `project_root()`(worktree)を分け、lock・project.json・check.sh は常に本体から。settings 生成の ask に worktree 内の検証基盤(`**/scripts/check.sh` ほか)を追加。
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -43,8 +44,14 @@ LABELS = {
 }
 
 
-def run(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+def run(cmd: list[str], cwd: Path, timeout: int = 600, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+
+
+# check.sh starts with `cd "$(dirname "$0")/.."`; when it runs from elsewhere, point it at the
+# tree via an env var (never by pasting a path into shell text)
+CD_LINE = 'cd "$(dirname "$0")/.."'
+CD_ENV = 'cd "$DEVACCEL_ROOT"'
 
 
 DOCS = ["*.md", "**/*.md", "docs/**"]
@@ -57,9 +64,10 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path) -> tuple
     if not base_check:
         return False, ["== missing: scripts/check.sh"], "", 0.0
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8") as f:
-        f.write(base_check.replace('cd "$(dirname "$0")/.."', f'cd "{workdir}"'))
+        f.write(base_check.replace(CD_LINE, CD_ENV))
     try:
-        r = run(["bash", f.name, "full"], workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10)
+        r = run(["bash", f.name, "full"], workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10,
+                env={**os.environ, "DEVACCEL_ROOT": str(workdir)})
     finally:
         Path(f.name).unlink(missing_ok=True)
     out = (r.stdout + r.stderr).splitlines()

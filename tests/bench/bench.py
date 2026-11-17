@@ -67,8 +67,8 @@ def grade(d: Path, task: str, check_sh: str) -> dict:
     (t / "_heldout_common.py").unlink()
     (t / f"test_heldout_{task}.py").unlink()
     cs = HERE / "results" / "_check.sh"
-    cs.write_text(check_sh.replace('cd "$(dirname "$0")/.."', f'cd "{d}"'))
-    c = sh(["bash", str(cs), "full"], d)
+    cs.write_text(check_sh.replace('cd "$(dirname "$0")/.."', 'cd "$DEVACCEL_ROOT"'))
+    c = sh(["bash", str(cs), "full"], d, env={**os.environ, "DEVACCEL_ROOT": str(d)})
     cs.unlink()
     stat = sh(["git", "diff", "--shortstat"], d).stdout.strip()
     untracked = [f for f in sh(["git", "ls-files", "-o", "--exclude-standard"], d).stdout.split() if f]

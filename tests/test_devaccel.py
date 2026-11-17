@@ -156,6 +156,13 @@ class KitTest(unittest.TestCase):
         r = sh(wt, "python3", str(self.root / ".claude/hooks/guard.py"), env={"CLAUDE_PROJECT_DIR": str(self.root)},
                stdin=json.dumps({"cwd": str(wt), "tool_input": {"command": "python3 .claude/hooks/devaccel_pr.py --title t"}}))
         self.assertIn("deny", r.stdout)
+        odd = self.tmp / 'u"; touch PWNED; "'  # a hostile worktree name is data, not shell
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "odd", str(odd))
+        (odd / "app.py").write_text("BROKEN\n")
+        sh(odd, "python3", str(self.root / ".claude/hooks/stop_gate.py"),
+           env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce"},
+           stdin=json.dumps({"session_id": "s", "agent_id": "a3", "cwd": str(odd)}))
+        self.assertFalse(any(p.name == "PWNED" for p in self.tmp.rglob("PWNED")))
         other = self.tmp / "other"  # an unrelated repo in cwd must not redirect the gate
         other.mkdir()
         sh(other, "git", "init", "-q")

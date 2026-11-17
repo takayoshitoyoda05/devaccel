@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -96,11 +97,13 @@ def run_check(root: Path, timeout: int, anchor: Path | None = None) -> tuple[str
     if not script.exists():
         return "missing", 0, "", 0.0
     t0 = time.time()
-    text = script.read_text(encoding="utf-8").replace('cd "$(dirname "$0")/.."', f'cd "{root}"')
+    # the path goes in through the environment, never pasted into shell text
+    text = script.read_text(encoding="utf-8").replace('cd "$(dirname "$0")/.."', 'cd "$DEVACCEL_ROOT"')
     try:
         r = subprocess.run(
             ["bash", "-c", text, "check.sh", "fast"],
             cwd=root,
+            env={**os.environ, "DEVACCEL_ROOT": str(root)},
             capture_output=True,
             text=True,
             timeout=timeout,
