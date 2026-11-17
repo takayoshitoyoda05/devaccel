@@ -193,8 +193,10 @@ def render_check(presets: list[str], runner: str) -> str:
 
 
 def render_settings(presets: list[str]) -> dict:
-    allow = ["Bash(scripts/check.sh *)", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
-             "Bash(git show*)", "Bash(uv sync*)"]
+    # exact subcommand + space: "git diff*" would also match "git difftool"
+    allow = ["Bash(scripts/check.sh *)", "Bash(git status)", "Bash(git status *)",
+             "Bash(git diff)", "Bash(git diff *)", "Bash(git log)", "Bash(git log *)",
+             "Bash(git show *)", "Bash(uv sync)", "Bash(uv sync *)"]
     for p in presets:
         for n in PRESETS[p]:
             allow += PIECES[n]["allow"]
@@ -209,7 +211,8 @@ def render_settings(presets: list[str]) -> dict:
                 "Edit(./.github/workflows/**)",
                 "Bash(git push*)",
             ],
-            "deny": ["Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)"],
+            "deny": ["Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
+                     "Bash(git * --output*)", "Bash(git * --ext-diff*)"],
         },
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [

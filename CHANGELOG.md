@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4 (2026-11-18)
+- guard: git の `--output` / `--ext-diff` / `-c <pager等>=` を拒否(読み取り系 allow を経由した書き込み・外部実行を防止)。
+- settings 生成: allow をサブコマンド完全一致に(`git diff*` が `git difftool` に一致していた)、deny に git `--output` / `--ext-diff` を追加。既存プロジェクトの settings.json は自動更新されないので、必要なら手で合わせる。
+
 ## 0.1.3 (2026-11-18)
 - doctor: setup 済みの `devaccel:filled` 目印を未記入と誤判定していたのを修正。
 

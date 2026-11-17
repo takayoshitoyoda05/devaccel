@@ -27,6 +27,10 @@ _RM = re.compile(
 DENY: list[tuple[re.Pattern, str]] = [
     (_RM, "広範囲の rm -rf は禁止です。対象を具体的なパスに絞ってください。"),
     (re.compile(r"\bsudo\b"), "sudo は使えません。必要ならユーザーに依頼してください。"),
+    (  # read-only git commands that can write files or run programs (bypass allow rules)
+        re.compile(r"\bgit\b[^;&|]*\s(--output\b|--ext-diff\b|-c\s+\S*(pager|editor|ssh|exec|textconv|fsmonitor)\S*=)", re.I),
+        "git の --output / --ext-diff / -c による外部コマンド指定は使えません。",
+    ),
     (
         re.compile(r"\bgit\s+push\b[^;&|]*\s(--force(?!-with-lease)|-f\b|\+\S)"),
         "force push は禁止です(--force-with-lease はユーザー確認の上で)。",
