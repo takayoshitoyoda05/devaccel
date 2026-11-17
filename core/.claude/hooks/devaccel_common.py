@@ -45,13 +45,27 @@ DEFAULTS: dict = {
 MODES = ("off", "observe", "enforce")
 
 
+def _git_out(cwd: Path, *args: str) -> str:
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
 def project_root(data: dict | None = None) -> Path:
+    """The tree being worked on. CLAUDE_PROJECT_DIR stays the main checkout even inside a
+    worktree (/batch units), so prefer the hook's cwd when it is a worktree of the same repo."""
     env = os.environ.get("CLAUDE_PROJECT_DIR")
+    cwd = Path(data["cwd"]) if data and data.get("cwd") else None
+    if cwd and cwd.is_dir():
+        top = _git_out(cwd, "rev-parse", "--show-toplevel")
+        if top and (not env or Path(_git_out(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir") or "x")
+                    == Path(_git_out(Path(env), "rev-parse", "--path-format=absolute", "--git-common-dir") or "y")):
+            return Path(top)
     if env:
         return Path(env)
-    if data and data.get("cwd"):
-        return Path(data["cwd"])
-    return Path.cwd()
+    return cwd or Path.cwd()
 
 
 def read_stdin_json() -> dict:

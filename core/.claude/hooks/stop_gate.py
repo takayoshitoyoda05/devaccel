@@ -198,7 +198,7 @@ def main() -> int:
 
     sig = signature(root, relevant)
     state = load_state(root)
-    sid = data.get("session_id", "default")
+    sid = data.get("agent_id") or data.get("session_id", "default")  # each /batch unit has its own rounds
     sess = state.setdefault(sid, {"ok": "", "seen": "", "streak": 0, "noticed": []})
     sess["t"] = time.time()
     if sig in (sess["ok"], sess["seen"]):

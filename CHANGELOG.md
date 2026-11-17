@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0 (2026-11-18)
+- **修正: /batch の単位内でゲートが動いていなかった**。単位はサブエージェントなので終了は `SubagentStop`(未登録だった)。さらに `CLAUDE_PROJECT_DIR` は worktree 内でも本体を指すため、発火しても本体の木を検査していた。settings 生成に `SubagentStop` を追加し、ゲートは hook の `cwd` が同じリポジトリの worktree ならそちらを検査、ラウンドは `agent_id` ごと。既存プロジェクトは settings.json に手で追記(doctor が表示)。
+- トークン削減(fable の調査より): seed CLAUDE.md の /batch 規則を「独立 S/M が 4 件以上のときだけ、先に fetch、各単位にコンテキストパック(編集ファイル・参照・受け入れ条件・テスト・範囲外)」に。settings 生成で `.claude/worktrees/**`・`.venv/**`・`uv.lock` の Read を deny。
+
 ## 0.5.4 (2026-11-18)
 - `protect.sh`(新規、人が実行): base ブランチに GitHub のブランチ保護を設定(直接・force push・削除の禁止を管理者にも、PR 必須、CI `check` 必須)。非公開リポジトリの無料プランでは使えない旨を表示。必須チェックは GitHub Actions アプリに固定(トークンで投稿した commit status では満たせない)。
 - doctor: ブランチ保護の状態(on / off / unavailable)を表示。

@@ -252,12 +252,17 @@ def render_settings(presets: list[str]) -> dict:
                      "Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
                      "Bash(git * --out*)", "Bash(git * --ext*)", "Bash(gh *)",
                      "Bash(git push --force*)", "Bash(git push -f *)", "Bash(git push * --force*)",
-                     "Bash(git remote add *)", "Bash(git remote set-url *)"],
+                     "Bash(git remote add *)", "Bash(git remote set-url *)",
+                     # token hygiene: never worth reading (sibling worktrees, venv, lockfile)
+                     "Read(/.claude/worktrees/**)", "Read(/.venv/**)", "Read(/uv.lock)"],
         },
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [
                 {"type": "command", "command": HOOK_CMDS["guard"], "timeout": 10}]}],
             "Stop": [{"hooks": [
+                {"type": "command", "command": HOOK_CMDS["stop"], "timeout": 120}]}],
+            # /batch units are subagents: their end is SubagentStop, not Stop
+            "SubagentStop": [{"hooks": [
                 {"type": "command", "command": HOOK_CMDS["stop"], "timeout": 120}]}],
         },
     }
@@ -475,6 +480,13 @@ def cmd_doctor(root: Path) -> int:
                              "run ~/devaccel/protect.sh (public repo or Pro) so CI `check` is required server-side")
     ok(hooks_wired(root / ".claude/settings.json"), "hooks not wired in .claude/settings.json",
        "add the PreToolUse(Bash) guard and Stop gate entries (README)")
+    try:
+        wired = json.loads((root / ".claude/settings.json").read_text()).get("hooks", {})
+    except (OSError, ValueError):
+        wired = {}
+    if "stop_gate.py" not in json.dumps(wired.get("SubagentStop", [])):
+        notes.append("SubagentStop is not wired: the gate does not run inside /batch units. Add to hooks:\n"
+                     + json.dumps({"SubagentStop": render_settings(["python"])["hooks"]["SubagentStop"]}))
 
     try:
         cfg = json.loads((root / ".claude/project.json").read_text())

@@ -131,6 +131,26 @@ class KitTest(unittest.TestCase):
         (self.root / "app.py").write_text("BROKEN\n")
         self.assertEqual(self.stop("off"), {})
 
+    def test_gate_checks_the_worktree_not_the_main_checkout(self):
+        wt = self.tmp / "wt"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "unit", str(wt))
+        (wt / "app.py").write_text("BROKEN\n")  # main checkout stays clean
+        r = sh(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"),
+               env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce"},
+               stdin=json.dumps({"session_id": "s", "agent_id": "a1", "cwd": str(wt)}))
+        self.assertEqual(json.loads(r.stdout or "{}").get("decision"), "block", r.stdout + r.stderr)
+        other = self.tmp / "other"  # an unrelated repo in cwd must not redirect the gate
+        other.mkdir()
+        sh(other, "git", "init", "-q")
+        r = sh(self.root, "python3", ".claude/hooks/stop_gate.py",
+               env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce"},
+               stdin=json.dumps({"session_id": "s", "cwd": str(other)}))
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_settings_wire_subagent_stop(self):
+        st = json.loads((self.root / ".claude/settings.json").read_text())
+        self.assertIn("stop_gate.py", json.dumps(st["hooks"]["SubagentStop"]))
+
     def test_gate_ignores_docs_only(self):
         (self.root / "README.md").write_text("BROKEN\n")
         self.assertEqual(self.stop(), {})
