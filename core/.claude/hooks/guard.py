@@ -77,7 +77,9 @@ OUTPUT_CMDS = re.compile(r"\bgit\s+" + GITOPT + r"(diff|log|show|format-patch|di
 PR_SCRIPT = re.compile(r"devaccel_(?:pr|land)\b")
 PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s|$)")
 LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-run)?\s*$")
-READERS = re.compile(r"^\s*(?:cat|head|tail|less|grep|rg|sed -n|wc|diff|ls|git (?:diff|log|show|status|add|commit))\b")
+# reads that cannot execute anything (no sed/less/rg: they have exec escapes)
+READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status|add))\s[^`$<>]*$")
+LAND_MERGE = re.compile(r"devaccel_land.*\s-+m")  # defense in depth, anywhere in the command
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
 PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
 GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
@@ -154,6 +156,8 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         if not branch or branch in _protected_branches(cwd, cfg):
             return "deny", f"デフォルトブランチ({branch or 'detached HEAD'})へは push できません。作業ブランチを切ってください。"
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
+    if LAND_MERGE.search(flat):
+        return "deny", "devaccel_land.py --merge(マージ)は人が端末で実行します。"
     for s in SEP.split(FD.sub(" ", flat)):
         if not PR_SCRIPT.search(s) or READERS.search(s):
             continue

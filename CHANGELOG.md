@@ -1,8 +1,13 @@
 # Changelog
 
+## 0.5.1 (2026-11-18)
+- guard: devaccel_pr/land を名指しする区切りのうち、読むだけの除外を実行手段を持たないコマンド(cat/head/tail/wc/ls/grep/git diff 等)に限定。`devaccel_land` と `--m…` はコマンドのどこにあっても拒否。
+- tests/bench: 素の Claude Code と devaccel の比較ベンチ(配布対象外)。
+
 ## 0.5.0 (2026-11-18)
 - 並列 PR の統合 `devaccel_land.py`(新規、人が実行): `evidence-ok` の PR を最新 base 上で 1 本ずつ合わせて base の `check.sh full` を再実行し、衝突・統合後の失敗を `needs-human` に降格。`--merge` で通過分を squash merge(検証した木と一致を確認)、`--dry-run`。guard は Claude からの `--merge` を拒否し、land も lock 照合の対象に。
 - devaccel_pr.py: base の最新を fetch してから判定、本文に検証時の base/head を記録、既存 PR があれば本文とラベルを更新、docs 未変更を表示(判定には使わない)。リポジトリ名は insteadOf 展開前の origin 設定から取る。
+- land は PR 本文末尾の証拠マーカーの head と現在の head が一致する PR だけを扱い、PR 自身の差分(merge-base から)で静的判定をやり直す。フォークの PR は扱わない。`--merge` は対話端末での確認入力が必須、guard は land を `python3 .claude/hooks/devaccel_land.py [--dry-run]` の形だけ許可。PR の再実行による `needs-human` の解除は、ブランチが最新の base を取り込んだ後だけ。
 - seed CLAUDE.md: /batch の単位はファイルが重ならないよう切り、docs は振る舞いを変えた単位が更新する。devaccel-pr スキル: 降格されたら merge origin/base → push → 再実行。
 
 ## 0.4.1 (2026-11-18)
