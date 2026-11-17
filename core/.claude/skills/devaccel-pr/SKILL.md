@@ -15,3 +15,5 @@ description: 作業を PR にするときに使う(/batch の各単位の最後�
    - 迷ったら先に `--dry-run` で本文とラベルを確認。
    - `needs-human` が付いたら、理由をユーザーに伝える。ラベルを外す・理由を消すために変更を加えない。
 5. 出力の URL とラベルを報告して終わる。
+
+衝突・統合後の失敗で `needs-human` に落とされたら: rebase せず `git merge origin/<base>` → 解消してコミット → `git push origin HEAD` → 4 を再実行(既存 PR の本文とラベルが更新される)。

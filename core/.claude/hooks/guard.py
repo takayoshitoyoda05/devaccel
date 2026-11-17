@@ -73,14 +73,15 @@ REMOTE = re.compile(
 )
 GH = re.compile(r"^\s*(?:\w+=\S*\s+)*" + WRAP + r"gh\s")
 OUTPUT_CMDS = re.compile(r"\bgit\s+" + GITOPT + r"(diff|log|show|format-patch|difftool|grep|stash\s+show)\b")
-PR_SCRIPT = re.compile(r"\.claude/hooks/devaccel_pr\.py\b")
+PR_SCRIPT = re.compile(r"\.claude/hooks/devaccel_(?:pr|land)\.py\b")
+LAND_MERGE = re.compile(r"devaccel_land\.py\b.*--merge")
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
 PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
 GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
                     r"gist|ssh-key|gpg-key|ruleset|cache|codespace|extension|alias)\b")
 LAUNCHER = re.compile(r"(?<![\w./-])(?:eval|exec|xargs|(?:ba|z|da)?sh\s+-\w*c|python3?\s+-c|perl\s+-e|"
                       r"node\s+-e|ruby\s+-e|find\b[^;&|\n]*-exec)\b")
-PR_FILES = ("devaccel_pr.py", "devaccel_common.py", "stop_gate.py")
+PR_FILES = ("devaccel_pr.py", "devaccel_land.py", "devaccel_common.py", "stop_gate.py")
 
 
 def _segments(command: str) -> list[str]:
@@ -149,8 +150,10 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         branch = _current_branch(cwd)
         if not branch or branch in _protected_branches(cwd, cfg):
             return "deny", f"デフォルトブランチ({branch or 'detached HEAD'})へは push できません。作業ブランチを切ってください。"
+    if LAND_MERGE.search(command.replace("'", "").replace('"', "")):
+        return "deny", "devaccel_land.py --merge(マージ)は人が実行します。検証だけなら --merge なしで。"
     if PR_SCRIPT.search(command) and not _pr_script_intact(cwd, project):
-        return "deny", "devaccel_pr.py(または依存)が lock と一致しません。改変された PR スクリプトは実行できません。"
+        return "deny", "devaccel_pr.py / devaccel_land.py(または依存)が lock と一致しません。改変されたスクリプトは実行できません。"
     for s in segs:  # --output / --ext-diff (incl. abbreviations) only matter for these subcommands
         if OUTPUT_CMDS.search(s):
             if re.search(r"[`]|\$(?!\{?IFS)|\{[^}]*(,|\.\.)|\{[^}]*$", s.replace("@{", "")):

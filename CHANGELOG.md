@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0 (2026-11-18)
+- 並列 PR の統合 `devaccel_land.py`(新規、人が実行): `evidence-ok` の PR を最新 base 上で 1 本ずつ合わせて base の `check.sh full` を再実行し、衝突・統合後の失敗を `needs-human` に降格。`--merge` で通過分を squash merge(検証した木と一致を確認)、`--dry-run`。guard は Claude からの `--merge` を拒否し、land も lock 照合の対象に。
+- devaccel_pr.py: base の最新を fetch してから判定、本文に検証時の base/head を記録、既存 PR があれば本文とラベルを更新、docs 未変更を表示(判定には使わない)。リポジトリ名は insteadOf 展開前の origin 設定から取る。
+- seed CLAUDE.md: /batch の単位はファイルが重ならないよう切り、docs は振る舞いを変えた単位が更新する。devaccel-pr スキル: 降格されたら merge origin/base → push → 再実行。
+
 ## 0.4.1 (2026-11-18)
 - guard: `git push` / `gh <サブコマンド>` を区切りの途中でも検出し、`bash -c`・`eval`・`xargs`・`python -c`・`find -exec` 等の起動手段と git/gh の組み合わせを拒否(サンドボックスの自動許可と組み合わさる経路を塞ぐ)。README に「本当の境界は GitHub のブランチ保護」を明記。
 

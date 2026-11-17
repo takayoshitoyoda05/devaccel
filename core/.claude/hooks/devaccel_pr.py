@@ -7,6 +7,8 @@ Optional auto-merge for `evidence-ok` when project.json parallel.auto_merge is t
 
 usage: python3 .claude/hooks/devaccel_pr.py --title T --verify-notes FILE [--dry-run]
 The branch must be committed and pushed first (pushing stays under your permissions).
+Re-running on a branch that already has an open PR updates its body and label.
+The evidence is for the branch alone; devaccel_land.py re-verifies the merged result.
 """
 
 from __future__ import annotations
@@ -45,8 +47,30 @@ def run(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedPr
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
+DOCS = ["*.md", "**/*.md", "docs/**"]
+
+
+def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path) -> tuple[bool, list[str], str, float]:
+    """Run the *base branch's* check.sh full in workdir: a branch cannot weaken the check that judges it."""
+    t0 = time.time()
+    base_check = git(root, "show", f"{base_ref}:scripts/check.sh") if base_ref else ""
+    if not base_check:
+        return False, ["== missing: scripts/check.sh"], "", 0.0
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8") as f:
+        f.write(base_check.replace('cd "$(dirname "$0")/.."', f'cd "{workdir}"'))
+    try:
+        r = run(["bash", f.name, "full"], workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10)
+    finally:
+        Path(f.name).unlink(missing_ok=True)
+    out = (r.stdout + r.stderr).splitlines()
+    ok = r.returncode == 0
+    stages = [ln for ln in out if re.match(r"== (ok|failed|missing):", ln)]
+    return ok, stages, ("" if ok else "\n".join(out[-30:])), round(time.time() - t0, 1)
+
+
 def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
     head = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    git(root, "fetch", "-q", "origin", base_branch)  # best effort: judge against the latest base
     base = (git(root, "merge-base", "HEAD", f"origin/{base_branch}").strip()
             or git(root, "merge-base", "HEAD", base_branch).strip())
     files = [f for f in git(root, "diff", "--name-only", f"{base}..HEAD").splitlines() if f]
@@ -81,20 +105,11 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
             acs += [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
                     if re.match(r"\s*- \[[ xX]\] ", ln)]
 
-    t0 = time.time()
-    # run the *base branch's* check.sh: a branch cannot weaken the check that judges it
-    base_check = git(root, "show", f"{base}:scripts/check.sh") if base else ""
-    if base_check:
-        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8") as f:
-            f.write(base_check.replace('cd "$(dirname "$0")/.."', f'cd "{root}"'))
-        r = run(["bash", f.name, "full"], root, timeout=int(cfg["gate"]["timeout_sec"]) * 10)
-        Path(f.name).unlink(missing_ok=True)
-        check_ok = r.returncode == 0
-        stages = [ln for ln in (r.stdout + r.stderr).splitlines() if re.match(r"== (ok|failed|missing):", ln)]
-        tail = "\n".join((r.stdout + r.stderr).splitlines()[-30:]) if not check_ok else ""
-    else:
-        check_ok, stages, tail = False, ["== missing: scripts/check.sh"], ""
-    check_secs = round(time.time() - t0, 1)
+    check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, root)
+    base_sha = (git(root, "rev-parse", "-q", "--verify", f"origin/{base_branch}").strip()
+                or git(root, "rev-parse", "-q", "--verify", base_branch).strip())
+    # display only: behaviour changed but no docs touched (parallel units drift apart here)
+    docs_untouched = any(not match_any(f, DOCS) for f in files) and not any(match_any(f, DOCS) for f in files)
 
     escalations = 0
     log = root / ".claude" / "state" / "gate-log.jsonl"
@@ -129,7 +144,8 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
     return {
         "head": head, "base": base_branch, "files": files, "stat": stat, "risky": risky,
         "acs": acs, "designs": designs, "check_ok": check_ok, "stages": stages, "tail": tail,
-        "check_secs": check_secs, "reasons": reasons,
+        "check_secs": check_secs, "reasons": reasons, "base_sha": base_sha,
+        "head_sha": git(root, "rev-parse", "HEAD").strip(), "docs_untouched": docs_untouched,
         "label": "needs-human" if reasons else "evidence-ok",
     }
 
@@ -143,6 +159,8 @@ def render(ev: dict, notes: str) -> str:
         f"- {ok} `scripts/check.sh full`({ev['check_secs']}s): " + ", ".join(s[3:] for s in ev["stages"]),
         f"- 変更: {ev['stat'] or 'なし'}",
     ]
+    if ev.get("docs_untouched"):
+        lines.append("- docs 更新なし(README 等の追随が要らないか確認)")
     if ev["designs"]:
         lines.append("- 設計書: " + ", ".join(f"`{d}`" for d in ev["designs"]))
     if ev["acs"]:
@@ -150,7 +168,9 @@ def render(ev: dict, notes: str) -> str:
     lines += ["", "### 実動作確認(verify-app)", notes.strip() or "_記録なし_"]
     if ev["tail"]:
         lines += ["", "<details><summary>check.sh full の失敗出力</summary>", "", "```", ev["tail"], "```", "</details>"]
-    lines += ["", "---", "_Generated by devaccel. Review the evidence; read the diff when labeled `needs-human`._"]
+    lines += ["", "---", "_Generated by devaccel. Review the evidence; read the diff when labeled `needs-human`. "
+              "Merge with `devaccel_land.py --merge` so the combined result is re-verified._",
+              f"<!-- devaccel:evidence base={ev.get('base_sha', '')} head={ev.get('head_sha', '')} -->"]
     return "\n".join(lines) + "\n"
 
 
@@ -171,7 +191,7 @@ def read_notes(path: str, root: Path) -> str:
 
 
 def github_repo(root: Path) -> str:
-    url = git(root, "remote", "get-url", "origin").strip()
+    url = git(root, "config", "--get", "remote.origin.url").strip()  # as configured (gh -R slug)
     m = re.match(r"^(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url)
     return m.group(1) if m else ""
 
@@ -214,13 +234,23 @@ def main() -> int:
         run(["gh", "label", "create", name, "-R", repo, "--color", color, "--description", desc], root)
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write(body)
-    r = run(["gh", "pr", "create", "-R", repo, "--base", ev["base"], "--head", ev["head"], "--title", a.title,
-             "--body-file", f.name, "--label", ev["label"]], root)
-    Path(f.name).unlink(missing_ok=True)
+    try:
+        cur = run(["gh", "pr", "view", ev["head"], "-R", repo, "--json", "url,state"], root)
+        existing = json.loads(cur.stdout) if cur.returncode == 0 and cur.stdout.strip() else {}
+        if existing.get("state") == "OPEN":  # re-run after fixing / merging base: refresh evidence and label
+            other = "needs-human" if ev["label"] == "evidence-ok" else "evidence-ok"
+            r = run(["gh", "pr", "edit", existing["url"], "-R", repo, "--body-file", f.name,
+                     "--add-label", ev["label"], "--remove-label", other], root)
+            url = existing["url"]
+        else:
+            r = run(["gh", "pr", "create", "-R", repo, "--base", ev["base"], "--head", ev["head"], "--title", a.title,
+                     "--body-file", f.name, "--label", ev["label"]], root)
+            url = r.stdout.strip().splitlines()[-1] if r.returncode == 0 else ""
+    finally:
+        Path(f.name).unlink(missing_ok=True)
     if r.returncode != 0:
         print(r.stderr.strip() or r.stdout.strip(), file=sys.stderr)
         return 1
-    url = r.stdout.strip().splitlines()[-1]
     print(f"{url}  [{ev['label']}]" + (f" reasons: {' / '.join(ev['reasons'])}" if ev["reasons"] else ""))
     if ev["label"] == "evidence-ok" and par.get("auto_merge"):
         # auto-merge only behind branch protection with a required status check (CI = check.sh full)

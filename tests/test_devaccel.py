@@ -244,6 +244,127 @@ class KitTest(unittest.TestCase):
         r = sh(self.root, "python3", ".claude/hooks/devaccel_pr.py", "--title", "t", "--dry-run")
         self.assertEqual(r.returncode, 2)
 
+    # ---- parallel landing (devaccel_land.py) with a local bare repo posing as GitHub and a fake gh ----
+    def with_origin(self) -> None:
+        bare = self.tmp / "o.git"
+        sh(self.tmp, "git", "init", "-q", "--bare", str(bare))
+        sh(self.root, "git", "remote", "add", "origin", "https://github.com/o/r.git")
+        sh(self.root, "git", "config", f"url.{bare}.insteadOf", "https://github.com/o/r.git")
+        self.assertEqual(sh(self.root, "git", "push", "-q", "origin", "main").returncode, 0)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        (self.bin / "gh").write_text(
+            '#!/usr/bin/env bash\necho "$*" >> "$FAKE_GH_LOG"\n'
+            'case "$1 $2" in\n'
+            '  "pr list") cat "$FAKE_GH_PRS";;\n'
+            '  "pr view") if [ -n "$FAKE_GH_VIEW" ]; then echo "$FAKE_GH_VIEW"; else exit 1; fi;;\n'
+            '  "pr create") echo https://github.com/o/r/pull/9;;\n'
+            'esac\n')
+        (self.bin / "gh").chmod(0o755)
+        self.prs: list[dict] = []
+
+    def commit_main(self, path: str, text: str) -> None:
+        (self.root / path).write_text(text)
+        sh(self.root, "git", "add", path)
+        sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", f"main {path}")
+        sh(self.root, "git", "push", "-q", "origin", "main")
+
+    def pr_branch(self, number: int, name: str, files: dict[str, str]) -> None:
+        sh(self.root, "git", "checkout", "-q", "-b", name, "main")
+        for path, text in files.items():
+            (self.root / path).write_text(text)
+            sh(self.root, "git", "add", path)
+        sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", name)
+        sh(self.root, "git", "push", "-q", "origin", "HEAD")
+        oid = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        sh(self.root, "git", "checkout", "-q", "main")
+        self.prs.append({"number": number, "headRefName": name, "headRefOid": oid, "title": name})
+
+    def land(self, *args: str, view: str = "", script: str = "devaccel_land.py"):
+        prs, log = self.tmp / "prs.json", self.tmp / "gh.log"
+        prs.write_text(json.dumps(self.prs))
+        log.write_text("")
+        r = sh(self.root, "python3", f".claude/hooks/{script}", *args,
+               env={"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_PRS": str(prs),
+                    "FAKE_GH_LOG": str(log), "FAKE_GH_VIEW": view})
+        return r, log.read_text()
+
+    def test_land_detects_textual_conflict(self):
+        self.with_origin()
+        self.pr_branch(1, "a", {"app.py": "X = 2\n"})
+        self.pr_branch(2, "b", {"app.py": "X = 3\n"})
+        r, log = self.land()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("#1 ok", r.stdout)
+        self.assertIn("#2 needs-human", r.stdout)
+        self.assertIn("衝突", r.stdout)
+        self.assertIn("pr edit 2", log)
+        self.assertIn("--add-label needs-human", log)
+        self.assertNotIn("pr edit 1", log)
+        self.assertNotIn("pr merge", log)  # verify-only by default
+        self.assertIn("--label evidence-ok", log)  # never looks at needs-human PRs (never upgrades)
+        self.assertEqual(sh(self.root, "git", "worktree", "list").stdout.count("\n"), 1)  # scratch removed
+
+    def test_land_green_alone_red_together(self):
+        self.with_origin()
+        self.commit_main("scripts/check.sh", '#!/usr/bin/env bash\n'
+                         'if [ -f a.flag ] && [ -f b.flag ]; then echo "== failed: tests (0s)"; exit 1; fi\n'
+                         'echo "== ok: tests (0s)"\n')
+        self.pr_branch(1, "a", {"a.flag": "1\n"})
+        self.pr_branch(2, "b", {"b.flag": "1\n"})
+        r, log = self.land("--dry-run")
+        self.assertIn("#1 ok", r.stdout)
+        self.assertIn("#2 needs-human", r.stdout)
+        self.assertIn("統合後", r.stdout)
+        self.assertNotIn("pr edit", log)  # --dry-run changes nothing
+
+    def test_land_uses_base_check(self):
+        self.with_origin()
+        self.pr_branch(1, "a", {"app.py": "BROKEN\n",
+                                "scripts/check.sh": "#!/usr/bin/env bash\necho '== ok: tests (0s)'\n"})
+        r, _ = self.land("--dry-run")
+        self.assertIn("#1 needs-human", r.stdout)
+
+    def test_land_orders_docs_last(self):
+        self.with_origin()
+        self.pr_branch(1, "docs", {"README.md": "# x\n"})
+        self.pr_branch(2, "code", {"app.py": "X = 2\n"})
+        r, _ = self.land("--dry-run")
+        self.assertLess(r.stdout.index("#2 ok"), r.stdout.index("#1 ok"), r.stdout)
+
+    def test_land_policy_in_guard(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_land.py"))
+        for cmd in ["python3 .claude/hooks/devaccel_land.py --merge", "python3 .claude/hooks/devaccel_land.py --dry-run '--merge'"]:
+            self.assertEqual(self.gv(cmd), "deny", cmd)
+        p = self.root / ".claude/hooks/devaccel_land.py"
+        p.write_text(p.read_text() + "\n# hack\n")
+        self.assertEqual(self.gv("python3 .claude/hooks/devaccel_land.py"), "deny")
+
+    def test_pr_body_records_base_and_docs_note(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        ev = self.pr_dry_run()
+        main_sha = sh(self.root, "git", "rev-parse", "main").stdout.strip()
+        self.assertIn(f"devaccel:evidence base={main_sha}", ev["body"])
+        self.assertIn("docs 更新なし", ev["body"])
+        self.assertEqual(ev["label"], "evidence-ok")  # display only, not a reason
+
+    def test_pr_rerun_updates_existing(self):
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qam", "w")
+        sh(self.root, "git", "push", "-q", "origin", "HEAD")
+        nf = self.tmp / "n.txt"
+        nf.write_text("ran it")
+        r, log = self.land("--title", "t", "--verify-notes", str(nf), script="devaccel_pr.py",
+                           view='{"url":"https://github.com/o/r/pull/9","state":"OPEN"}')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pr edit https://github.com/o/r/pull/9", log)
+        self.assertIn("--add-label evidence-ok --remove-label needs-human", log)
+        self.assertNotIn("pr create", log)
+
     def test_update_never_touches_project_files(self):
         cm = self.root / "CLAUDE.md"
         cm.write_text("# mine\n")
