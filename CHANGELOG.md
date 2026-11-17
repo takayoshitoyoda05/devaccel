@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.5.3 (2026-11-18)
+- guard: 疑似端末ラッパー(script / unbuffer / expect / empty / socat)を拒否(land の端末確認を偽装できたため)。`.claude/hooks/` を含むコマンドでのワイルドカード・ブレース展開と `cd .claude/hooks` を拒否(名前をぼかした実行の対策)。
+
 ## 0.5.2 (2026-11-18)
 - guard: devaccel_pr/land を名指しするコマンドは、読むだけのコマンド同士以外へのパイプを拒否(`cat … | python3 -` 対策)。`--merge` の検出は改行をまたいでも効く。
 

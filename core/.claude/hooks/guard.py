@@ -81,6 +81,8 @@ LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-ru
 READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status|add))\s[^`$<>]*$")
 LAND_MERGE = re.compile(r"devaccel_land.*\s-+m", re.S)  # defense in depth, anywhere in the command
 PIPE = re.compile(r"(?<!\|)\|(?!\|)")
+HOOKS_GLOB = re.compile(r"\.claude/hooks/\S*[*?\[{]|\.claude/hooks/?\s|\.claude/hook[*?\[{]|\.claude/[*?\[{]")
+PTY = re.compile(r"(?:^|[\s;&|(])(?:script|unbuffer|expect|empty|socat)\s")
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
 PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
 GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
@@ -157,6 +159,10 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         if not branch or branch in _protected_branches(cwd, cfg):
             return "deny", f"デフォルトブランチ({branch or 'detached HEAD'})へは push できません。作業ブランチを切ってください。"
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
+    if PTY.search(flat):
+        return "deny", "script / unbuffer / expect などの疑似端末ラッパーは使えません(人の確認を偽装できるため)。"
+    if HOOKS_GLOB.search(flat):
+        return "deny", ".claude/hooks/ のファイルはワイルドカードや展開を使わず、名前を正確に書いてください。"
     if LAND_MERGE.search(flat):
         return "deny", "devaccel_land.py --merge(マージ)は人が端末で実行します。"
     segs_flat = [s for s in SEP.split(FD.sub(" ", flat)) if s.strip()]
