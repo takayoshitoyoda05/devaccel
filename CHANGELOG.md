@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.5.2 (2026-11-18)
+- guard: devaccel_pr/land を名指しするコマンドは、読むだけのコマンド同士以外へのパイプを拒否(`cat … | python3 -` 対策)。`--merge` の検出は改行をまたいでも効く。
+
 ## 0.5.1 (2026-11-18)
 - guard: devaccel_pr/land を名指しする区切りのうち、読むだけの除外を実行手段を持たないコマンド(cat/head/tail/wc/ls/grep/git diff 等)に限定。`devaccel_land` と `--m…` はコマンドのどこにあっても拒否。
 - tests/bench: 素の Claude Code と devaccel の比較ベンチ(配布対象外)。

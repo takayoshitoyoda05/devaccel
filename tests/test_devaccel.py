@@ -352,7 +352,7 @@ class KitTest(unittest.TestCase):
     def test_land_policy_in_guard(self):
         sh(self.root, "git", "checkout", "-qb", "feat")
         for ok in ["python3 .claude/hooks/devaccel_land.py", "python3 .claude/hooks/devaccel_land.py --dry-run",
-                   "grep -n merge .claude/hooks/devaccel_land.py", "python3 .claude/hooks/devaccel_pr.py --title 't' --dry-run",
+                   "grep -n merge .claude/hooks/devaccel_land.py", "grep -c def .claude/hooks/devaccel_pr.py | head -1", "python3 .claude/hooks/devaccel_pr.py --title 't' --dry-run",
                    "N=$(mktemp) && echo ok > $N && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N"]:
             self.assertIsNone(self.gv(ok), ok)
         for cmd in ["python3 .claude/hooks/devaccel_land.py --merge", "python3 .claude/hooks/devaccel_land.py --dry-run '--merge'",
@@ -361,7 +361,8 @@ class KitTest(unittest.TestCase):
                     "script -qc 'python3 .claude/hooks/devaccel_land.py --merge' /dev/null",
                     "uv run python .claude/hooks/devaccel_land.py", "python3 /tmp/devaccel_pr.py --title t",
                     "sed -n 1e.claude/hooks/devaccel_land.py x", "rg --pre sh x .claude/hooks/devaccel_land.py",
-                    "less .claude/hooks/devaccel_land.py", "cat .claude/hooks/devaccel_land.py | sh -s -- --merge"]:
+                    "less .claude/hooks/devaccel_land.py", "cat .claude/hooks/devaccel_land.py | sh -s -- --merge",
+                    "cat .claude/hooks/devaccel_land.py | python3 -", "cat .claude/hooks/devaccel_land.py\npython3 x --merge"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
         r = sh(self.root, "python3", ".claude/hooks/devaccel_land.py", "--merge")  # no TTY: refused in the script too
         self.assertEqual(r.returncode, 2)

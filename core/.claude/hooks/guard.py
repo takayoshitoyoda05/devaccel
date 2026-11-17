@@ -79,7 +79,8 @@ PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s|$)")
 LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-run)?\s*$")
 # reads that cannot execute anything (no sed/less/rg: they have exec escapes)
 READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status|add))\s[^`$<>]*$")
-LAND_MERGE = re.compile(r"devaccel_land.*\s-+m")  # defense in depth, anywhere in the command
+LAND_MERGE = re.compile(r"devaccel_land.*\s-+m", re.S)  # defense in depth, anywhere in the command
+PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
 PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
 GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
@@ -158,7 +159,10 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
     if LAND_MERGE.search(flat):
         return "deny", "devaccel_land.py --merge(マージ)は人が端末で実行します。"
-    for s in SEP.split(FD.sub(" ", flat)):
+    segs_flat = [s for s in SEP.split(FD.sub(" ", flat)) if s.strip()]
+    if PR_SCRIPT.search(flat) and PIPE.search(flat) and not all(READERS.search(s) for s in segs_flat):
+        return "deny", "devaccel_pr/land を名指しするコマンドで、他のコマンドへのパイプは使えません。"
+    for s in segs_flat:
         if not PR_SCRIPT.search(s) or READERS.search(s):
             continue
         if "devaccel_land" in s and not LAND_RUN.search(s):
