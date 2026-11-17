@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.2 (2026-11-18)
+- サンドボックス: Python プリセットにツールキャッシュの書き込み許可(`~/.cache/uv` ほか)と registry.npmjs.org(pyright 用)を追加。実機でサンドボックス内の `uv run pytest` が読み取り専用エラーで動かなかった。
+
 ## 0.3.1 (2026-11-18)
 - devaccel-pr: 「変更は自分のチェックを変えられない」を徹底。check.sh は base ブランチ版で実行。検証基盤(check.sh・.claude/・.github/・CLAUDE.md・conftest・ツール設定)の変更と、既存テストの行削除は常に needs-human。自動マージは必須ステータスチェックつきのブランチ保護がある時だけ。
 

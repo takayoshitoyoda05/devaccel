@@ -200,7 +200,9 @@ SANDBOX = {
     # "./" = project root in project settings; "~/" covers checkouts under $HOME.
     "filesystem": {"denyRead": ["./**/.env", "./**/.env.*", "~/**/.env", "~/**/.env.*"]},
 }
-NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "github.com"]}
+NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "github.com", "registry.npmjs.org"]}
+# tool caches outside the project that the toolchain must write to inside the sandbox
+CACHE_WRITES = {"python": ["~/.cache/uv", "~/.cache/pip", "~/.cache/pyright-python", "~/.cache/ruff"]}
 
 
 def sandbox_ready() -> bool:
@@ -222,6 +224,9 @@ def render_settings(presets: list[str]) -> dict:
     domains = sorted({d for p in presets for d in NET_DOMAINS.get(p, [])})
     if domains:
         sandbox["network"] = {"allowedDomains": domains}
+    writes = sorted({d for p in presets for d in CACHE_WRITES.get(p, [])})
+    if writes:
+        sandbox["filesystem"]["allowWrite"] = writes
     return {
         # parallel subagents (/batch units) multiply token use: cap concurrency (official default 20)
         "env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3"},

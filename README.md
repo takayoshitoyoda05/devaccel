@@ -96,8 +96,11 @@ install が `.claude/settings.json` にサンドボックス設定を書く。�
   "enabled": true,
   "failIfUnavailable": true,
   "allowUnsandboxedCommands": false,
-  "filesystem": { "denyRead": ["./**/.env", "./**/.env.*", "~/**/.env", "~/**/.env.*"] },
-  "network": { "allowedDomains": ["files.pythonhosted.org", "github.com", "pypi.org"] }
+  "filesystem": {
+    "denyRead": ["./**/.env", "./**/.env.*", "~/**/.env", "~/**/.env.*"],
+    "allowWrite": ["~/.cache/pip", "~/.cache/pyright-python", "~/.cache/ruff", "~/.cache/uv"]
+  },
+  "network": { "allowedDomains": ["files.pythonhosted.org", "github.com", "pypi.org", "registry.npmjs.org"] }
 }
 ```
 - `failIfUnavailable: true` のため、bubblewrap/socat が無いと Claude Code は起動しない(黙って保護なしで動くより安全)。協業者にも初回のインストールを案内する。
