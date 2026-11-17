@@ -58,8 +58,8 @@ def _git_options(command: str) -> tuple[str, str] | None:
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
     if not re.search(r"\bgit\b", flat):
         return None
-    if "$" in flat.replace("${PIPESTATUS", "") or "`" in flat:
-        return "ask", "git コマンドに変数・コマンド展開が含まれています。内容を確認してください。"
+    if re.search(r"[$`{]", flat):  # any expansion (vars, commands, braces): let the human look
+        return "ask", "git コマンドに展開($ ` {)が含まれています。内容を確認してください。"
     for w in re.split(r"(?:\s|\$\{?IFS\}?|[;&|()<>])+", flat):
         if w.startswith("--") and len(w) > 2:
             name = w[2:].split("=", 1)[0].lower()

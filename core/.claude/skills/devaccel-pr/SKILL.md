@@ -1,0 +1,17 @@
+---
+name: devaccel-pr
+description: 作業を PR にするときに使う(/batch の各単位の最後も)。実動作確認の記録を残し、検証の証拠を本文にした PR を作ってレビュー要否のラベルを付ける。
+---
+
+# devaccel-pr
+
+人は差分ではなく証拠を見る。PR 本文はスクリプトが機械的に組み立てる(自分で書かない)。
+
+1. **実動作確認**: verify-app の手順で動かし、「実行したコマンド / 出力の要点 / 期待と合ったか」を数行で一時ファイルに書く(`mktemp`)。確認できなかったことは、できなかったと書く。
+2. **コミット**: 変更をコミットする。メッセージ末尾に検証の記録を 1 行付ける(未実施は `none`):
+   `Verified-by: check-full=<pass|fail> verify-app=<yes|none> spec-review=<yes|none>`
+3. **push**: `git push -u origin HEAD`(権限の確認に従う)。
+4. **PR 作成**: `python3 .claude/hooks/devaccel_pr.py --title "<要約>" --verify-notes <1のファイル>`
+   - 迷ったら先に `--dry-run` で本文とラベルを確認。
+   - `needs-human` が付いたら、理由をユーザーに伝える。ラベルを外す・理由を消すために変更を加えない。
+5. 出力の URL とラベルを報告して終わる。

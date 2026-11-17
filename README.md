@@ -34,6 +34,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `.claude/hooks/guard.py` | core | うっかりの破壊的 Bash(広範囲 rm -rf、sudo、force push、curl\|sh、git の --output 等)を拒否/確認。秘密は扱わない |
 | `.claude/hooks/stop_gate.py` | core | 終了時に `check.sh fast`。失敗段だけ返す・3 ラウンドで人に報告・L/テスト弱体化を表示 |
 | `.claude/skills/devaccel-{setup,tune}` | core | 手動専用(説明は常駐しない) |
+| `.claude/skills/devaccel-pr` + `hooks/devaccel_pr.py` | core | 証拠つき PR と `evidence-ok` / `needs-human` の振り分け |
 | `CLAUDE.md` | project | 進め方(S/M/L)と検証の作法 |
 | `.claude/skills/design` | project | L 規模: 質問 → 受け入れ条件つき設計書 → 仕様照合 |
 | `.claude/skills/verify-app` | project | 「完了」前に実際に動かす手順(setup が生成) |
@@ -59,6 +60,18 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 - Codex 併用時(`/devaccel-setup --codex on`)、Codex には Stop フックが無いので担保は AGENTS.md の指示と CI のみ。
 - チーム利用: `scripts/check.sh`・`.claude/`・`.github/workflows/` を CODEOWNERS とブランチ保護で守ると、ゲートを緩める変更に人の承認が必要になる。
 - セッション途中でモデルを変えない、スキルに `model:` を書かない(キャッシュが作り直しになる)。
+
+## 並列開発(Anthropic 式: 人は差分ではなく証拠を見る)
+
+検証ループ(ゲート・verify-app・仕様照合)で 1 本の作業を信頼できるものにし、それを並列に回して、人は振り分けられた PR だけを読む。
+
+1. 独立した S/M 作業の束を `/batch <指示>` に渡す(公式機能。作業を単位に分け、単位ごとに worktree で並列実装)。L は並列化せず design スキルで 1 本ずつ。
+2. 各単位は devaccel-pr スキルで PR を作る。本文はスクリプトが機械的に組み立てる証拠: `check.sh full` の結果、実動作確認の記録、受け入れ条件、変更規模。
+3. ラベルで振り分け:
+   - `evidence-ok`: 検査通過・実動作確認あり・S/M・リスクのあるパスなし → 証拠だけ見てマージ
+   - `needs-human`: 理由つき(検査失敗、確認なし、L 規模、risky_paths、テスト削除/skip、ゲートの判断依頼、未チェックの受け入れ条件) → 差分を読む
+4. 任意: `.claude/project.json` の `"parallel": {"auto_merge": true}` で `evidence-ok` を自動マージ(GitHub 側で auto-merge を許可し、`check` ワークフローを必須チェックにしたブランチ保護が必要)。最初は off で振り分けの精度を見て、evidence-ok のリバートが出ない期間が続いてから。
+5. 並列度は settings.json の `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`(既定 3)。並列数だけトークンも増える(公式)。`/devaccel-tune` が PR の振り分け実績(件数・マージ・リバート)を見て閾値を調整する。
 
 ## 守りの分担
 

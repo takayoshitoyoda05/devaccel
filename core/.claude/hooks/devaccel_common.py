@@ -37,6 +37,9 @@ DEFAULTS: dict = {
     "integrity": {"test_globs": ["tests/**", "**/test_*.py", "**/*_test.py"]},
     "budget": {"claude_md_max_lines": 60},
     "guard": {"deny_regex": [], "ask_regex": []},
+    # Anthropic-style parallel work: /batch fans out, devaccel-pr turns each unit into an
+    # evidence PR labeled evidence-ok / needs-human. auto_merge only for evidence-ok.
+    "parallel": {"auto_merge": False},
 }
 
 MODES = ("off", "observe", "enforce")

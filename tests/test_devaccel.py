@@ -46,7 +46,8 @@ class GuardTest(unittest.TestCase):
         for cmd in ["git add -A", "git add .", "git reset --hard HEAD~1", "git clean -fd",
                     "git checkout -- .", "psql -c 'DROP TABLE users'"]:
             self.assertEqual(self.verdict(cmd), "ask", cmd)
-        for cmd in ["git diff${IFS}--output=x", "git diff $(cat opts)", "git log `x`"]:
+        for cmd in ["git diff${IFS}--output=x", "git diff $(cat opts)", "git log `x`",
+                    "git diff --{out,x}put=y", "git log --oneline; echo ${PIPESTATUS[0]}"]:
             self.assertIn(self.verdict(cmd), ("ask", "deny"), cmd)
 
     def test_allow(self):
@@ -155,6 +156,39 @@ class KitTest(unittest.TestCase):
         sh(self.root, str(KIT / "update.sh"))
         self.assertTrue(victim.exists())
         self.assertTrue((self.root / "CLAUDE.md").exists())
+
+    def pr_dry_run(self, notes: str = "ran: uv run app -> ok") -> dict:
+        nf = self.tmp / "notes.txt"
+        nf.write_text(notes)
+        sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qam", "wip")
+        r = sh(self.root, "python3", ".claude/hooks/devaccel_pr.py", "--title", "t",
+               "--verify-notes", str(nf), "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1]) | {"body": r.stdout}
+
+    def test_pr_triage_evidence_ok(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        ev = self.pr_dry_run()
+        self.assertEqual(ev["label"], "evidence-ok", ev)
+        self.assertIn("check.sh full", ev["body"])
+
+    def test_pr_triage_needs_human(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("BROKEN\n")
+        ev = self.pr_dry_run(notes="")
+        self.assertEqual(ev["label"], "needs-human")
+        self.assertTrue(any("check.sh full" in r for r in ev["reasons"]))
+        self.assertTrue(any("verify-app" in r for r in ev["reasons"]))
+
+    def test_pr_triage_risky_path(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "auth").mkdir()
+        (self.root / "auth" / "login.py").write_text("X = 1\n")
+        sh(self.root, "git", "add", "auth")
+        ev = self.pr_dry_run()
+        self.assertEqual(ev["label"], "needs-human")
+        self.assertTrue(any("auth/login.py" in r for r in ev["reasons"]))
 
     def test_update_never_touches_project_files(self):
         cm = self.root / "CLAUDE.md"

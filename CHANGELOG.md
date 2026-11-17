@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 (2026-11-18)
+- 並列開発(Anthropic 式): devaccel-pr スキルと `hooks/devaccel_pr.py`。PR 本文を証拠(check.sh full・実動作確認・受け入れ条件・規模)から機械的に組み立て、`evidence-ok` / `needs-human` を理由つきで付与。`parallel.auto_merge`(既定 off)で evidence-ok を自動マージ。
+- settings 生成: `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3`、`.claude/worktrees/` を gitignore。
+- CLAUDE.md: S/M の束は `/batch`、PR は devaccel-pr。tune: PR 振り分け実績を入力に。
+- guard: 展開($ ` {)を含む git コマンドは確認。
+
 ## 0.2.1 (2026-11-18)
 - サンドボックス: `failIfUnavailable: true`(依存が無ければ起動しない)と `allowUnsandboxedCommands: false`(サンドボックス外での再試行を禁止)。denyRead をプロジェクト相対 `./**/.env*` にも拡大。Read/Edit の deny に `**/.env*`。
 - guard: git の判定をバックスラッシュ除去・`${IFS}` 区切りの後に実施。`$`/バッククォートを含む git コマンドは確認。

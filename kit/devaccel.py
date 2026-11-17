@@ -113,7 +113,7 @@ jobs:
       - run: scripts/check.sh full
 """
 
-GITIGNORE_LINES = ["# devaccel", ".claude/state/", ".claude/settings.local.json", "__pycache__/"]
+GITIGNORE_LINES = ["# devaccel", ".claude/state/", ".claude/settings.local.json", ".claude/worktrees/", "__pycache__/"]
 
 
 # ---------- helpers ----------
@@ -223,6 +223,8 @@ def render_settings(presets: list[str]) -> dict:
     if domains:
         sandbox["network"] = {"allowedDomains": domains}
     return {
+        # parallel subagents (/batch units) multiply token use: cap concurrency (official default 20)
+        "env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3"},
         "sandbox": sandbox,
         "permissions": {
             "allow": allow,
