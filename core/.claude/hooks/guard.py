@@ -114,7 +114,7 @@ def _expands_to_secret(command: str, cwd: Path) -> str | None:
                 continue
             head, base = os.path.split(part)
             dynamic = "$" in part or "`" in part
-            if dynamic and ("." in part or "{" in part or "env" in part.lower()):
+            if dynamic and re.search(r"(^|/)\.|\.e|env|\{", part, re.I):
                 return "ask"
             if not (_GLOB.search(base) and base.startswith(("." , "{", "["))):
                 continue
@@ -153,7 +153,16 @@ def _git_check(command: str) -> tuple[str, str] | None:
     return None
 
 
+_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+
+
+def strip_heredocs(command: str) -> str:
+    """Heredoc bodies are data (file contents, scripts), not shell words: drop them."""
+    return _HEREDOC.sub(lambda m: "<<" + m.group(2) + m.group(3), command)
+
+
 def decide(command: str, cfg: dict, cwd: Path | None = None) -> tuple[str, str] | None:
+    command = strip_heredocs(command)
     git_hit = _git_check(command)
     if git_hit and git_hit[0] == "deny":
         return git_hit

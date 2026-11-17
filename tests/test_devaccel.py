@@ -55,8 +55,12 @@ class GuardTest(unittest.TestCase):
             self.assertIn(self.verdict(cmd), ("ask", "deny"), cmd)
         for cmd in ["cat {.,x}env", "cat {x,.e}nv"]:
             self.assertEqual(self.verdict(cmd), "deny", cmd)
-        for cmd in ["ls *", "cat *.md", "echo $PATH", "uv run pytest -k test_a"]:
+        for cmd in ["ls *", "cat *.md", "echo $PATH", "uv run pytest -k test_a", 'echo "$X.txt"',
+                    "cat > docs/a.md <<'EOF'\nprice $5. see .[x] and .{y}\nEOF",
+                    "python3 - <<EOF\ns = d['k'].e$x\nprint(s.{1})\nEOF\necho done"]:
             self.assertIsNone(self.verdict(cmd), cmd)
+        self.assertEqual(self.verdict("cat > .env <<'EOF'\nX=1\nEOF"), "deny")
+        self.assertEqual(self.verdict("cat <<EOF\nx\nEOF\ncat .?nv"), "deny")
         self.assertEqual(self.verdict("cat .e$X"), "ask")
         self.assertEqual(self.verdict("cat .`echo env`"), "ask")
 
