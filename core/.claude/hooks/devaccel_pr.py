@@ -68,35 +68,52 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path) -> tuple
     return ok, stages, ("" if ok else "\n".join(out[-30:])), round(time.time() - t0, 1)
 
 
+def static_triage(root: Path, cfg: dict, base: str, ref: str) -> tuple[list[str], list[str], list[str]]:
+    """Diff-only reasons (no execution). Shared with devaccel_land.py, which re-applies them."""
+    rng = f"{base}..{ref}"
+    files = [f for f in git(root, "diff", "--name-only", rng).splitlines() if f]
+    diff = git(root, "diff", "-U0", rng)
+    status = git(root, "diff", "--name-status", rng).splitlines()
+    scale, tg = cfg["scale"], cfg["integrity"]["test_globs"]
+    risky = [f for f in files if match_any(f, scale["risky_paths"])]
+    tests_deleted = [ln.split("\t", 1)[1] for ln in status
+                     if ln.startswith("D") and match_any(ln.split("\t", 1)[1], tg)]
+    skips = [ln[1:].strip() for ln in diff.splitlines() if SKIP_RE.match(ln)]
+    machinery = [f for f in files if match_any(f, ALWAYS_HUMAN)]
+    if "pyproject.toml" in files and any(
+            TOOL_CFG.match(ln) for ln in git(root, "diff", "-U0", rng, "--", "pyproject.toml").splitlines()
+            if not ln.startswith(("+++", "---"))):
+        machinery.append("pyproject.toml(ツール設定)")
+    tests_shrunk = []  # existing tests that lost lines (pure additions of new tests are fine)
+    for ln in status:
+        st, _, path = ln.partition("\t")
+        if st.startswith("M") and match_any(path, tg):
+            d = git(root, "diff", "--numstat", rng, "--", path).split()
+            if d and d[1].isdigit() and int(d[1]) > 0:
+                tests_shrunk.append(path)
+    reasons = []
+    if len(files) > scale["large_if_files_over"]:
+        reasons.append(f"L 規模({len(files)} ファイル)")
+    if risky:
+        reasons.append("リスクのあるパス: " + ", ".join(risky[:5]))
+    if machinery:
+        reasons.append("検証基盤の変更: " + ", ".join(machinery[:5]))
+    if tests_shrunk:
+        reasons.append("既存テストの行削除: " + ", ".join(tests_shrunk[:5]))
+    if tests_deleted:
+        reasons.append("テスト削除: " + ", ".join(tests_deleted[:5]))
+    if skips:
+        reasons.append(f"skip/xfail 追加 {len(skips)} 件")
+    return files, reasons, risky
+
+
 def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
     head = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
     git(root, "fetch", "-q", "origin", base_branch)  # best effort: judge against the latest base
     base = (git(root, "merge-base", "HEAD", f"origin/{base_branch}").strip()
             or git(root, "merge-base", "HEAD", base_branch).strip())
-    files = [f for f in git(root, "diff", "--name-only", f"{base}..HEAD").splitlines() if f]
+    files, static, risky = static_triage(root, cfg, base, "HEAD")
     stat = git(root, "diff", "--shortstat", f"{base}..HEAD").strip()
-    diff = git(root, "diff", "-U0", f"{base}..HEAD")
-    status = git(root, "diff", "--name-status", f"{base}..HEAD").splitlines()
-
-    scale = cfg["scale"]
-    risky = [f for f in files if match_any(f, scale["risky_paths"])]
-    large = len(files) > scale["large_if_files_over"]
-    tests_deleted = [ln.split("\t", 1)[1] for ln in status
-                     if ln.startswith("D") and match_any(ln.split("\t", 1)[1], cfg["integrity"]["test_globs"])]
-    skips = [ln[1:].strip() for ln in diff.splitlines() if SKIP_RE.match(ln)]
-    machinery = [f for f in files if match_any(f, ALWAYS_HUMAN)]
-    if "pyproject.toml" in files and any(
-            TOOL_CFG.match(ln) for ln in git(root, "diff", "-U0", f"{base}..HEAD", "--", "pyproject.toml").splitlines()
-            if not ln.startswith(("+++", "---"))):
-        machinery.append("pyproject.toml(ツール設定)")
-    # existing tests that lost lines (pure additions of new tests are fine)
-    tests_shrunk = []
-    for ln in status:
-        st, _, path = ln.partition("\t")
-        if st.startswith("M") and match_any(path, cfg["integrity"]["test_globs"]):
-            d = git(root, "diff", "--numstat", f"{base}..HEAD", "--", path).split()
-            if d and d[1].isdigit() and int(d[1]) > 0:
-                tests_shrunk.append(path)
     designs = [f for f in files if f.startswith("docs/design/") and f.endswith(".md") and "TEMPLATE" not in f]
     acs: list[str] = []
     for d in designs:
@@ -125,18 +142,7 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
         reasons.append("`check.sh full` が失敗")
     if not notes.strip():
         reasons.append("実動作確認(verify-app)の記録が無い")
-    if large:
-        reasons.append(f"L 規模({len(files)} ファイル)")
-    if risky:
-        reasons.append("リスクのあるパス: " + ", ".join(risky[:5]))
-    if machinery:
-        reasons.append("検証基盤の変更: " + ", ".join(machinery[:5]))
-    if tests_shrunk:
-        reasons.append("既存テストの行削除: " + ", ".join(tests_shrunk[:5]))
-    if tests_deleted:
-        reasons.append("テスト削除: " + ", ".join(tests_deleted[:5]))
-    if skips:
-        reasons.append(f"skip/xfail 追加 {len(skips)} 件")
+    reasons += static
     if escalations:
         reasons.append(f"ゲートが人への判断依頼を {escalations} 回出した")
     if acs and any("[ ]" in a for a in acs):
@@ -235,9 +241,23 @@ def main() -> int:
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write(body)
     try:
-        cur = run(["gh", "pr", "view", ev["head"], "-R", repo, "--json", "url,state"], root)
+        cur = run(["gh", "pr", "view", ev["head"], "-R", repo, "--json",
+                   "url,state,headRefOid,baseRefName,isCrossRepository,labels"], root)
         existing = json.loads(cur.stdout) if cur.returncode == 0 and cur.stdout.strip() else {}
         if existing.get("state") == "OPEN":  # re-run after fixing / merging base: refresh evidence and label
+            if (existing.get("isCrossRepository") or existing.get("baseRefName") != ev["base"]
+                    or existing.get("headRefOid") != ev["head_sha"]):
+                print(f"open PR {existing.get('url')} does not match this branch (head/base/repo); not updating",
+                      file=sys.stderr)
+                return 2
+            labels = {x.get("name") for x in existing.get("labels") or []}
+            up_to_date = bool(ev["base_sha"]) and git(root, "merge-base", "HEAD", ev["base_sha"]).strip() == ev["base_sha"]
+            if ev["label"] == "evidence-ok" and "needs-human" in labels and not up_to_date:
+                # a downgrade (e.g. by land) is lifted only after the branch has merged the latest base
+                ev["label"], ev["reasons"] = "needs-human", ev["reasons"] + [
+                    f"base より遅れている(`git merge origin/{ev['base']}` してから再実行)"]
+                body = render(ev, notes)
+                Path(f.name).write_text(body, encoding="utf-8")
             other = "needs-human" if ev["label"] == "evidence-ok" else "evidence-ok"
             r = run(["gh", "pr", "edit", existing["url"], "-R", repo, "--body-file", f.name,
                      "--add-label", ev["label"], "--remove-label", other], root)

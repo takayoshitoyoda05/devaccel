@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -29,7 +30,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from devaccel_common import git, load_config, match_any  # noqa: E402
-from devaccel_pr import DOCS, github_repo, run, run_base_check  # noqa: E402
+from devaccel_pr import DOCS, github_repo, run, run_base_check, static_triage  # noqa: E402
 
 IDENT = ["-c", "user.name=devaccel-land", "-c", "user.email=devaccel-land@localhost"]
 
@@ -44,10 +45,17 @@ def order(prs: list[dict]) -> list[dict]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--merge", action="store_true", help="squash-merge each PR that passes (humans only)")
     ap.add_argument("--dry-run", action="store_true", help="do not change labels or merge")
     a = ap.parse_args()
+    if a.merge and not a.dry_run:
+        # merging is a human decision: require a person at a terminal, not just a flag
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print("--merge needs an interactive terminal (humans only)", file=sys.stderr)
+            return 2
+        if input("evidence-ok の PR を検証し、通ったものを squash merge します。続けるなら merge と入力: ").strip() != "merge":
+            return 1
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     cfg = load_config(root)
@@ -62,11 +70,16 @@ def main() -> int:
         print(f"origin/{base} not found", file=sys.stderr)
         return 2
     r = run(["gh", "pr", "list", "-R", repo, "--state", "open", "--base", base, "--label", "evidence-ok",
-             "--json", "number,headRefName,headRefOid,title", "--limit", "100"], root)
+             "--json", "number,headRefName,headRefOid,title,body,isCrossRepository", "--limit", "100"], root)
     if r.returncode != 0:
         print(r.stderr.strip(), file=sys.stderr)
         return 1
-    prs = json.loads(r.stdout or "[]")
+    prs = []
+    for p in json.loads(r.stdout or "[]"):
+        if p.get("isCrossRepository"):  # forks are never landed automatically
+            print(f"#{p['number']} skipped: from a fork (review by hand)")
+        else:
+            prs.append(p)
     for p in prs:
         if not git(root, "rev-parse", "-q", "--verify", f"{p['headRefOid']}^{{commit}}").strip():
             run(["git", "fetch", "-q", "origin", f"pull/{p['number']}/head"], root)
@@ -102,6 +115,15 @@ def main() -> int:
     try:
         for p in prs:
             n, oid = p["number"], p["headRefOid"]
+            # the label is only as good as the commit it was computed for
+            mark = re.search(r"devaccel:evidence base=\w* head=(\w+)", p.get("body") or "")
+            if not mark or mark.group(1) != oid:
+                downgrade(p, "証拠と現在の head が一致しない(証拠の後に push された)。devaccel_pr.py を再実行")
+                continue
+            static = static_triage(root, cfg, base_sha, oid)[1]
+            if static:
+                downgrade(p, "base に対する差分で再判定: " + " / ".join(static))
+                continue
             m = run(["git", *IDENT, "merge", "--no-ff", "--no-edit", "-m", f"land #{n}", oid], wt)
             if m.returncode != 0:
                 bad = [f for f in git(wt, "diff", "--name-only", "--diff-filter=U").splitlines() if f]

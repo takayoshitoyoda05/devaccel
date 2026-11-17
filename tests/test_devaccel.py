@@ -278,7 +278,8 @@ class KitTest(unittest.TestCase):
         sh(self.root, "git", "push", "-q", "origin", "HEAD")
         oid = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
         sh(self.root, "git", "checkout", "-q", "main")
-        self.prs.append({"number": number, "headRefName": name, "headRefOid": oid, "title": name})
+        self.prs.append({"number": number, "headRefName": name, "headRefOid": oid, "title": name,
+                         "body": f"<!-- devaccel:evidence base=x head={oid} -->", "isCrossRepository": False})
 
     def land(self, *args: str, view: str = "", script: str = "devaccel_land.py"):
         prs, log = self.tmp / "prs.json", self.tmp / "gh.log"
@@ -332,14 +333,35 @@ class KitTest(unittest.TestCase):
         r, _ = self.land("--dry-run")
         self.assertLess(r.stdout.index("#2 ok"), r.stdout.index("#1 ok"), r.stdout)
 
+    def test_land_rejects_stale_label_fork_and_risky(self):
+        self.with_origin()
+        self.pr_branch(1, "pushed-after", {"app.py": "X = 2\n"})
+        self.prs[-1]["body"] = "<!-- devaccel:evidence base=x head=0000 -->"  # evidence for an older commit
+        self.pr_branch(2, "fork", {"b.py": "Y = 1\n"})
+        self.prs[-1]["isCrossRepository"] = True
+        (self.root / "auth").mkdir()
+        self.pr_branch(3, "risky", {"auth/x.py": "Z = 1\n"})
+        r, _ = self.land("--dry-run")
+        self.assertIn("#1 needs-human: 証拠と現在の head", r.stdout)
+        self.assertIn("#2 skipped", r.stdout)
+        self.assertIn("#3 needs-human: base に対する差分で再判定", r.stdout)
+        self.assertIn("landed 0/2", r.stdout)
+
     def test_land_policy_in_guard(self):
         sh(self.root, "git", "checkout", "-qb", "feat")
         self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_land.py"))
-        for cmd in ["python3 .claude/hooks/devaccel_land.py --merge", "python3 .claude/hooks/devaccel_land.py --dry-run '--merge'"]:
+        for cmd in ["python3 .claude/hooks/devaccel_land.py --merge", "python3 .claude/hooks/devaccel_land.py --dry-run '--merge'",
+                    "python3 .claude/hooks/devaccel_land.py --mer", "python3 .claude/hooks/devaccel_land.py \\--merge",
+                    "python3 .claude/hooks/devaccel_\\land.py --merge"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
+        r = sh(self.root, "python3", ".claude/hooks/devaccel_land.py", "--merge")  # no TTY: refused in the script too
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("interactive", r.stderr)
         p = self.root / ".claude/hooks/devaccel_land.py"
         p.write_text(p.read_text() + "\n# hack\n")
-        self.assertEqual(self.gv("python3 .claude/hooks/devaccel_land.py"), "deny")
+        for cmd in ["python3 .claude/hooks/devaccel_land.py", "python3 .claude//hooks/devaccel_land.py",
+                    "python3 ./.claude/hooks/devaccel_\\land.py", "python3 '.claude/hooks/devaccel_land.py'"]:
+            self.assertEqual(self.gv(cmd), "deny", cmd)
 
     def test_pr_body_records_base_and_docs_note(self):
         sh(self.root, "git", "checkout", "-qb", "feat")
@@ -359,11 +381,28 @@ class KitTest(unittest.TestCase):
         nf = self.tmp / "n.txt"
         nf.write_text("ran it")
         r, log = self.land("--title", "t", "--verify-notes", str(nf), script="devaccel_pr.py",
-                           view='{"url":"https://github.com/o/r/pull/9","state":"OPEN"}')
+                           view='{"url":"https://github.com/o/r/pull/9","state":"OPEN","headRefOid":"other",'
+                                '"baseRefName":"main","isCrossRepository":false}')
+        self.assertEqual(r.returncode, 2)  # PR found by branch name but for another commit: refuse
+        self.assertNotIn("pr edit", log)
+        oid = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        r, log = self.land("--title", "t", "--verify-notes", str(nf), script="devaccel_pr.py",
+                           view='{"url":"https://github.com/o/r/pull/9","state":"OPEN","headRefOid":"%s",'
+                                '"baseRefName":"main","isCrossRepository":false}' % oid)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("pr edit https://github.com/o/r/pull/9", log)
         self.assertIn("--add-label evidence-ok --remove-label needs-human", log)
         self.assertNotIn("pr create", log)
+        # downgraded by land, and base moved on: re-running alone does not lift needs-human
+        sh(self.root, "git", "checkout", "-q", "main")
+        self.commit_main("other.py", "O = 1\n")
+        sh(self.root, "git", "checkout", "-q", "feat")
+        r, log = self.land("--title", "t", "--verify-notes", str(nf), script="devaccel_pr.py",
+                           view='{"url":"https://github.com/o/r/pull/9","state":"OPEN","headRefOid":"%s",'
+                                '"baseRefName":"main","isCrossRepository":false,"labels":[{"name":"needs-human"}]}' % oid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--add-label needs-human --remove-label evidence-ok", log)
+        self.assertIn("base より遅れている", r.stdout)
 
     def test_update_never_touches_project_files(self):
         cm = self.root / "CLAUDE.md"
