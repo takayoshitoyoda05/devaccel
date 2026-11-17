@@ -36,8 +36,12 @@ DENY: list[tuple[re.Pattern, str]] = [
         "ダウンロードしたスクリプトをそのまま実行しないでください。",
     ),
     (
-        re.compile(r"(^|[\s=:/<(])\.env(?!\.example\b)(\.[\w-]+)?(?=$|[\s/;&|)])"),
+        re.compile(r"(^|[\s=:/<>(){},])\.env(?!\.example\b)(\.[\w-]+)?(?=$|[\s/;&|)<>(){},*?\[\]])"),
         ".env には触れないでください(.env.example は可)。",
+    ),
+    (  # globs that could expand to .env without spelling it: .e*, .en?, .en[v], {.e,...}
+        re.compile(r"(?<![\w.-])\.e[\w.-]*[*?\[{]"),
+        ".env を含みうるワイルドカードは使わないでください。",
     ),
 ]
 
