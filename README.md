@@ -71,7 +71,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
    - `evidence-ok`: 検査通過・実動作確認あり・S/M・リスクのあるパスなし → 証拠だけ見てマージ
    - `needs-human`: 理由つき(検査失敗、確認なし、L 規模、risky_paths、テスト削除/skip、ゲートの判断依頼、未チェックの受け入れ条件) → 差分を読む
 4. 任意: `.claude/project.json` の `"parallel": {"auto_merge": true}` で `evidence-ok` を自動マージ(GitHub 側で auto-merge を許可し、`check` ワークフローを必須チェックにしたブランチ保護が必要)。最初は off で振り分けの精度を見て、evidence-ok のリバートが出ない期間が続いてから。
-5. 押し出しの規則(guard が強制): push は作業ブランチから `git push origin HEAD` のみ(main/master・デフォルトブランチ・force・他リモート不可)。`gh` は直接使えず、PR は lock と一致する `devaccel_pr.py` だけが作る。サンドボックス内のコマンドは確認なしで動く(`autoAllowBashIfSandboxed`)ので、並列の単位が確認待ちで止まらない。GitHub 側でもデフォルトブランチを保護すると確実(プランによっては非公開リポジトリで使えない)。
+5. 押し出しの規則(guard が強制): push は作業ブランチから `git push origin HEAD` のみ(main/master・デフォルトブランチ・force・他リモート不可)。`gh` は直接使えず、PR は lock と一致する `devaccel_pr.py` だけが作る。サンドボックス内のコマンドは確認なしで動く(`autoAllowBashIfSandboxed`)ので、並列の単位が確認待ちで止まらない。**本当の境界は GitHub 側**: guard は文字列判定の best-effort(`bash -c` 等の経由も拒否するが、完全ではない)。デフォルトブランチを保護する(PR 必須・force push 禁止・`check` を必須チェック)のが最後の砦。プランによっては非公開リポジトリでブランチ保護が使えないので、その場合は guard と PR 判定のみが頼り。より厳密にするなら、push と PR 作成だけができる fine-grained token を使う。
 6. 並列度は settings.json の `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`(既定 3)。並列数だけトークンも増える(公式)。`/devaccel-tune` が PR の振り分け実績(件数・マージ・リバート)を見て閾値を調整する。
 
 ## 守りの分担

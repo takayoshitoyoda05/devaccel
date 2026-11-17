@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.4.1 (2026-11-18)
+- guard: `git push` / `gh <サブコマンド>` を区切りの途中でも検出し、`bash -c`・`eval`・`xargs`・`python -c`・`find -exec` 等の起動手段と git/gh の組み合わせを拒否(サンドボックスの自動許可と組み合わさる経路を塞ぐ)。README に「本当の境界は GitHub のブランチ保護」を明記。
+
 ## 0.4.0 (2026-11-18)
 - 並列 PR フローを実機の失敗(/batch の 3 単位すべてが commit/push で拒否)から修正。
 - guard: push は作業ブランチからの `git push origin HEAD` のみ(main/master・デフォルトブランチ・force・他リモート・cd/git -C 併用は拒否)。リモート設定の変更と `gh` の直接実行を拒否。PR スクリプトは lock とハッシュが一致する時だけ実行可。git の展開チェックは diff/log 等のサブコマンドに限定、コマンドは区切りごとに判定。ASK 規則は区切りの先頭のみ。

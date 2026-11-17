@@ -74,6 +74,12 @@ REMOTE = re.compile(
 GH = re.compile(r"^\s*(?:\w+=\S*\s+)*" + WRAP + r"gh\s")
 OUTPUT_CMDS = re.compile(r"\bgit\s+" + GITOPT + r"(diff|log|show|format-patch|difftool|grep|stash\s+show)\b")
 PR_SCRIPT = re.compile(r"\.claude/hooks/devaccel_pr\.py\b")
+# anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
+PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
+GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
+                    r"gist|ssh-key|gpg-key|ruleset|cache|codespace|extension|alias)\b")
+LAUNCHER = re.compile(r"(?<![\w./-])(?:eval|exec|xargs|(?:ba|z|da)?sh\s+-\w*c|python3?\s+-c|perl\s+-e|"
+                      r"node\s+-e|ruby\s+-e|find\b[^;&|\n]*-exec)\b")
 PR_FILES = ("devaccel_pr.py", "devaccel_common.py", "stop_gate.py")
 
 
@@ -124,6 +130,12 @@ def _pr_script_intact(cwd: Path, project: Path) -> bool:
 def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str, str] | None:
     segs = _segments(command)
     for s in segs:
+        if LAUNCHER.search(s) and re.search(r"(?<![\w./-])(?:git|gh)\b", s):
+            return "deny", "bash -c / eval / xargs などを経由した git・gh は使えません。直接実行してください。"
+        if GH_ANY.search(s) and not GH.search(s):
+            return "deny", "gh は直接使えません。PR は python3 .claude/hooks/devaccel_pr.py で作ってください。"
+        if PUSH_ANY.search(s) and not OK_PUSH.search(s):
+            return "deny", "push は `git push origin HEAD`(作業ブランチを origin へ)を単独で実行する形だけです。"
         if REMOTE.search(s):
             return "deny", "git のリモート設定・push 設定は変更できません。"
         if GH.search(s):

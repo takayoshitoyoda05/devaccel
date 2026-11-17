@@ -215,7 +215,10 @@ class KitTest(unittest.TestCase):
         for cmd in ["git push origin main", "git push", "git push origin HEAD:main", "git push origin +HEAD",
                     "git push --force-with-lease origin HEAD", "git push other HEAD", "git -C /x push origin HEAD",
                     "cd /x && git push origin HEAD", "git remote set-url origin evil", "git config remote.origin.url x",
-                    "gh pr merge 1 --admin", "gh api -X DELETE repos/x", "FOO=1 gh pr list"]:
+                    "gh pr merge 1 --admin", "gh api -X DELETE repos/x", "FOO=1 gh pr list",
+                    'bash -c "git push origin main"', "echo main | xargs git push origin", "eval git push origin main",
+                    "sh -c 'gh pr merge 1'", "python3 -c 'import os; os.system(\"git push origin main\")'",
+                    "find . -exec git push origin main ;", "echo x; ( git push origin main )", "true && gh api user"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
 
     def test_pr_script_must_match_lock(self):
