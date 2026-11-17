@@ -525,7 +525,9 @@ def cmd_doctor(root: Path) -> int:
 PROTECTION = {
     # solo-friendly: Claude uses the same account, so "require approval" would only lock you out.
     # What the server enforces: no direct/force push to the base, merges via PR with CI `check` green.
-    "required_status_checks": {"strict": False, "contexts": ["check"]},
+    # pinned to the GitHub Actions app (15368): a commit status posted with the user's token cannot satisfy it.
+    # strict=False on purpose: devaccel_land re-verifies the combined tree before merging.
+    "required_status_checks": {"strict": False, "checks": [{"context": "check", "app_id": 15368}]},
     "enforce_admins": True,
     "required_pull_request_reviews": {"required_approving_review_count": 0},
     "restrictions": None,
