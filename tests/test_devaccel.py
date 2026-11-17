@@ -49,6 +49,7 @@ class GuardTest(unittest.TestCase):
             self.assertIsNone(self.verdict(cmd), cmd)
         self.assertEqual(self.verdict("cat $D/.env"), "deny")
         self.assertEqual(self.verdict("cat $D/.x$Y"), "ask")
+        self.assertEqual(self.verdict("git diff $(cat opts)"), "ask")
         self.assertEqual(self.verdict("cat .e$X"), "ask")
         self.assertEqual(self.verdict("cat .`echo env`"), "ask")
 
@@ -61,7 +62,8 @@ class GuardTest(unittest.TestCase):
                     "cat .env*", "cat {.env,}", "cat .env>x", "cat .e*", "cat .en?", "cat ./.en[v]",
                     "git diff --output=/home/u/.bashrc", "git log -p --ext-diff",
                     "git -c core.pager=evil log", "git diff --out=x", "git diff --outp x",
-                    "git log --ext", "git diff${IFS}--output=x", "git -calias.x=!sh x"]:
+                    "git log --ext", "git diff${IFS}--output=x", "git -calias.x=!sh x",
+                    "git diff --o x", "git diff --OUT=x", "git diff '--outpu'=x", "git log --e"]:
             self.assertEqual(self.verdict(cmd), "deny", cmd)
 
     def test_ask(self):

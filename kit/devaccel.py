@@ -195,9 +195,11 @@ def render_check(presets: list[str], runner: str) -> str:
 def render_settings(presets: list[str]) -> dict:
     # Only narrow, known-safe git forms: git accepts abbreviated long options
     # (--out= == --output=), so "git diff *" cannot be made safe by deny rules.
-    allow = ["Bash(scripts/check.sh *)", "Bash(git status)", "Bash(git status --short*)",
-             "Bash(git diff)", "Bash(git diff --stat*)", "Bash(git diff --name-only*)",
-             "Bash(git log --oneline*)", "Bash(git show --stat*)", "Bash(uv sync)"]
+    # Exact forms only (no trailing wildcard); anything else asks.
+    allow = ["Bash(scripts/check.sh fast)", "Bash(scripts/check.sh full)",
+             "Bash(git status)", "Bash(git status --short)", "Bash(git diff)",
+             "Bash(git diff --stat)", "Bash(git diff --name-only)", "Bash(git log --oneline)",
+             "Bash(git show --stat)", "Bash(uv sync)"]
     for p in presets:
         for n in PRESETS[p]:
             allow += PIECES[n]["allow"]
@@ -213,7 +215,7 @@ def render_settings(presets: list[str]) -> dict:
                 "Bash(git push*)",
             ],
             "deny": ["Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
-                     "Bash(git * --output*)", "Bash(git * --ext-diff*)"],
+                     "Bash(git * --out*)", "Bash(git * --ext*)"],
         },
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [

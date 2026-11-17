@@ -131,7 +131,28 @@ def _expands_to_secret(command: str, cwd: Path) -> str | None:
     return None
 
 
+def _git_check(command: str) -> tuple[str, str] | None:
+    """Token-level git check: abbreviations of --output/--ext-diff, dynamic words."""
+    if not re.search(r"\bgit\b", command):
+        return None
+    if "$" in command or "`" in command:
+        return "ask", "git コマンドに変数・コマンド展開が含まれています。内容を確認してください。"
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return "ask", "git コマンドを解析できません。内容を確認してください。"
+    for w in words:
+        if w.startswith("--") and len(w) > 2:
+            name = w[2:].split("=", 1)[0].lower()
+            if "output".startswith(name) or "ext-diff".startswith(name):
+                return "deny", "git の --output / --ext-diff(省略形を含む)は使えません。"
+    return None
+
+
 def decide(command: str, cfg: dict, cwd: Path | None = None) -> tuple[str, str] | None:
+    git_hit = _git_check(command)
+    if git_hit and git_hit[0] == "deny":
+        return git_hit
     hit = _expands_to_secret(command, cwd or Path.cwd())
     if hit == "deny":
         return "deny", "このワイルドカードは .env に展開されます。.env には触れないでください。"
@@ -145,6 +166,8 @@ def decide(command: str, cfg: dict, cwd: Path | None = None) -> tuple[str, str] 
     for rx, why in ask:
         if rx.search(command):
             return "ask", why
+    if git_hit:
+        return git_hit
     if hit == "ask":
         return "ask", "変数展開でドットファイル名を組み立てています。対象を確認してください。"
     return None
