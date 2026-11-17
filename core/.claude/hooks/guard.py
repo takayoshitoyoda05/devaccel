@@ -101,10 +101,10 @@ def _expands_to_secret(command: str, cwd: Path) -> str | None:
         words = shlex.split(command, comments=False, posix=True)
     except ValueError:
         words = command.split()
-    risky = None
+    moved = False  # after cd/pushd, globs resolve against a directory we did not list
     for w in words:
-        if w in ("cd", "pushd"):  # later words resolve against another directory
-            risky = risky or "ask"
+        if w in ("cd", "pushd"):
+            moved = True
         for part in re.split(r"[=:<>();&|]", w):
             if not part:
                 continue
@@ -116,7 +116,7 @@ def _expands_to_secret(command: str, cwd: Path) -> str | None:
                 continue
             if base.count("{") > 1 or re.search(r"\{[^}]*\{", base):
                 return "deny"  # nested / multiple brace groups: do not try to emulate bash
-            if dynamic or "~" in head or _GLOB.search(head):
+            if dynamic or moved or "~" in head or _GLOB.search(head):
                 return "ask"
             directory = (cwd / head) if head else cwd
             if not directory.is_dir():
@@ -128,7 +128,7 @@ def _expands_to_secret(command: str, cwd: Path) -> str | None:
                 alts = [base[: m.start()] + a + base[m.end():] for a in m.group(1).split(",")]
             if any(fnmatch.fnmatchcase(n, a) for n in names for a in alts if a):
                 return "deny"
-    return risky
+    return None
 
 
 def decide(command: str, cfg: dict, cwd: Path | None = None) -> tuple[str, str] | None:
