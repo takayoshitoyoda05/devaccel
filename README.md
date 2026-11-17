@@ -60,6 +60,27 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 - チーム利用: `scripts/check.sh`・`.claude/`・`.github/workflows/` を CODEOWNERS とブランチ保護で守ると、ゲートを緩める変更に人の承認が必要になる。
 - セッション途中でモデルを変えない、スキルに `model:` を書かない(キャッシュが作り直しになる)。
 
+## より強い保護: サンドボックス(任意・推奨)
+
+guard は「うっかり」を止める best-effort です(シェルは表現力が高く、正規表現では完全に塞げない)。
+シェルコマンドを OS レベルで縛るには Claude Code のサンドボックスを併用する(公式: https://code.claude.com/docs/en/sandboxing)。
+
+```bash
+sudo apt-get install bubblewrap socat   # WSL2 / Linux。WSL1 は非対応
+```
+`.claude/settings.json` に追記(コミットすれば全員に効く。`/sandbox` は local 設定に書く):
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "filesystem": { "denyRead": ["~/**/.env"] }
+  }
+}
+```
+- 書き込みは作業ディレクトリと一時領域のみ、ネットワークは許可ドメイン経由のみになる。読み取りは既定で広いので `denyRead` で秘密を閉じる。
+- フックと Read/Edit ツールはサンドボックスの外で動く。Read ツールの `.env` は permissions の deny が担う(devaccel が設定済み)。
+- 起動後 `/sandbox` の Dependencies タブで有効を確認。
+
 ## 開発
 
 ```bash

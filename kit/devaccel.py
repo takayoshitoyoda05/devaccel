@@ -214,7 +214,9 @@ def render_settings(presets: list[str]) -> dict:
                 "Edit(./.github/workflows/**)",
                 "Bash(git push*)",
             ],
-            "deny": ["Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
+            # "/path" = project-relative per the permissions docs; "./" kept for older behavior
+            "deny": ["Read(/.env)", "Read(/.env.*)", "Edit(/.env)", "Edit(/.env.*)",
+                     "Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
                      "Bash(git * --out*)", "Bash(git * --ext*)"],
         },
         "hooks": {

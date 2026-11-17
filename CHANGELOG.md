@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.11 (2026-11-18)
+- README: サンドボックス併用の節を追加(guard は best-effort、強い保護は OS レベルで)。
+- settings 生成: .env の deny に公式のプロジェクト相対表記 `/.env` を追加。
+
 ## 0.1.10 (2026-11-18)
 - guard: `shopt`/`dotglob`/`GLOBIGNORE` と `$'...'` は確認、`{.` / `,.` の波括弧は拒否、`cd`/`pushd`/`popd`/`git -C`/`env -C` を区切り記号の後でも検出。guard はここで打ち止め(best-effort)。強い保護はサンドボックスで。
 
