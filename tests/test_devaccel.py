@@ -330,6 +330,7 @@ class KitTest(unittest.TestCase):
         self.with_origin()
         self.pr_branch(1, "docs", {"README.md": "# x\n"})
         self.pr_branch(2, "code", {"app.py": "X = 2\n"})
+        self.commit_main(".claude/project.json", "{}\n")  # base moved on: its changes are not the PRs' changes
         r, _ = self.land("--dry-run")
         self.assertLess(r.stdout.index("#2 ok"), r.stdout.index("#1 ok"), r.stdout)
 

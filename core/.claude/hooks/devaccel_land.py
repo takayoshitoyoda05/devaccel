@@ -120,7 +120,8 @@ def main() -> int:
             if not mark or mark.group(1) != oid:
                 downgrade(p, "証拠と現在の head が一致しない(証拠の後に push された)。devaccel_pr.py を再実行")
                 continue
-            static = static_triage(root, cfg, base_sha, oid)[1]
+            fork_point = git(root, "merge-base", base_sha, oid).strip()  # the PR's own changes only
+            static = static_triage(root, cfg, fork_point, oid)[1]
             if static:
                 downgrade(p, "base に対する差分で再判定: " + " / ".join(static))
                 continue
