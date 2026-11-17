@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 (2026-11-18)
+- 並列 PR フローを実機の失敗(/batch の 3 単位すべてが commit/push で拒否)から修正。
+- guard: push は作業ブランチからの `git push origin HEAD` のみ(main/master・デフォルトブランチ・force・他リモート・cd/git -C 併用は拒否)。リモート設定の変更と `gh` の直接実行を拒否。PR スクリプトは lock とハッシュが一致する時だけ実行可。git の展開チェックは diff/log 等のサブコマンドに限定、コマンドは区切りごとに判定。ASK 規則は区切りの先頭のみ。
+- devaccel_pr.py: デフォルトブランチ・未 push では実行しない。`-R owner/repo` で対象を固定。`--verify-notes` はリポジトリ内か一時ディレクトリの 4KB 以下、認証情報らしき内容は拒否。
+- settings 生成: `Bash(git push*)` の ask を削除し、add/commit/`git push origin HEAD`/PR スクリプトを allow、`gh *`・force push・remote 変更を deny。サンドボックスに `autoAllowBashIfSandboxed` と github.com / api.github.com。
+- devaccel-pr スキル: commit・push・PR を別コマンドで、`git add <パス>`。
+- doctor: 信頼ダイアログ未承認、残った push の ask 規則、api.github.com、gh 認証、origin の形式を点検。
+
 ## 0.3.2 (2026-11-18)
 - サンドボックス: Python プリセットにツールキャッシュの書き込み許可(`~/.cache/uv` ほか)と registry.npmjs.org(pyright 用)を追加。実機でサンドボックス内の `uv run pytest` が読み取り専用エラーで動かなかった。
 

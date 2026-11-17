@@ -47,15 +47,14 @@ class GuardTest(unittest.TestCase):
                     "git checkout -- .", "psql -c 'DROP TABLE users'"]:
             self.assertEqual(self.verdict(cmd), "ask", cmd)
         for cmd in ["git diff${IFS}--output=x", "git diff $(cat opts)", "git log `x`",
-                    "git diff --{out,x}put=y", "git log --oneline; echo ${PIPESTATUS[0]}"]:
+                    "git diff --{out,x}put=y", "git log $(cat opts) --oneline"]:
             self.assertIn(self.verdict(cmd), ("ask", "deny"), cmd)
 
     def test_allow(self):
-        for cmd in ["rm -rf build", "rm -rf ./dist", "rm file.txt", "git push origin main",
-                    "git push --force-with-lease", "git add src/a.py", "uv run pytest", "ls -la",
+        for cmd in ["rm -rf build", "rm -rf ./dist", "rm file.txt", "git add src/a.py", "uv run pytest", "ls -la",
                     "echo sudoku", "git diff --stat", "git log --oneline -5", "git diff --no-ext-diff",
                     "git log --oneline --output-indicator-new=+", "git -c color.ui=false log",
-                    "grep -E '.*foo' src/a.py", "echo rc=${PIPESTATUS[0]}", "ls .* *.py",
+                    "grep -E '.*foo' src/a.py", "echo rc=${PIPESTATUS[0]}", "git log --oneline; echo ${PIPESTATUS[0]}", "ls .* *.py",
                     "cat > docs/a.md <<'EOF'\nprice $5. see .[x] and .{y}\nEOF"]:
             self.assertIsNone(self.verdict(cmd), cmd)
 
@@ -199,6 +198,48 @@ class KitTest(unittest.TestCase):
         self.assertEqual(ev["label"], "needs-human")
         self.assertTrue(any("check.sh full" in r for r in ev["reasons"]), ev)  # base check.sh still fails
         self.assertTrue(any("検証基盤" in r for r in ev["reasons"]), ev)
+
+    def gv(self, cmd: str):
+        cfg = json.loads((self.root / ".claude/project.json").read_text())
+        v = guard.decide(cmd, guard.load_config(self.root) | cfg, self.root, self.root)
+        return v[0] if v else None
+
+    def test_push_policy(self):
+        self.assertEqual(self.gv("git push origin HEAD"), "deny")  # on main
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        for cmd in ["git push origin HEAD", "git push -u origin HEAD",
+                    "git add app.py && git commit -m x && git push origin HEAD",
+                    "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"", "git diff @{upstream}...HEAD",
+                    "echo exit $?; git status --short", "git log --oneline 2>&1 | head"]:
+            self.assertIsNone(self.gv(cmd), cmd)
+        for cmd in ["git push origin main", "git push", "git push origin HEAD:main", "git push origin +HEAD",
+                    "git push --force-with-lease origin HEAD", "git push other HEAD", "git -C /x push origin HEAD",
+                    "cd /x && git push origin HEAD", "git remote set-url origin evil", "git config remote.origin.url x",
+                    "gh pr merge 1 --admin", "gh api -X DELETE repos/x", "FOO=1 gh pr list"]:
+            self.assertEqual(self.gv(cmd), "deny", cmd)
+
+    def test_pr_script_must_match_lock(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        cmd = "python3 .claude/hooks/devaccel_pr.py --title t --dry-run"
+        self.assertIsNone(self.gv(cmd))
+        p = self.root / ".claude/hooks/devaccel_pr.py"
+        p.write_text(p.read_text() + "\n# label everything evidence-ok\n")
+        self.assertEqual(self.gv(cmd), "deny")
+
+    def test_pr_script_refuses_secret_notes(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 3\n")
+        sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qam", "w")
+        bad = self.tmp / "n.txt"
+        bad.write_text("token ghp_" + "a" * 36)
+        r = sh(self.root, "python3", ".claude/hooks/devaccel_pr.py", "--title", "t", "--verify-notes", str(bad), "--dry-run")
+        self.assertNotEqual(r.returncode, 0)
+        r = sh(self.root, "python3", ".claude/hooks/devaccel_pr.py", "--title", "t",
+               "--verify-notes", str(Path.home() / ".bashrc"), "--dry-run")
+        self.assertNotEqual(r.returncode, 0)
+        sh(self.root, "git", "checkout", "-q", "main")
+        r = sh(self.root, "python3", ".claude/hooks/devaccel_pr.py", "--title", "t", "--dry-run")
+        self.assertEqual(r.returncode, 2)
 
     def test_update_never_touches_project_files(self):
         cm = self.root / "CLAUDE.md"

@@ -196,11 +196,13 @@ SANDBOX = {
     "enabled": True,
     "failIfUnavailable": True,          # fail closed: no silent unsandboxed fallback
     "allowUnsandboxedCommands": False,  # ignore dangerouslyDisableSandbox retries
+    "autoAllowBashIfSandboxed": True,   # sandboxed commands need no prompt (parallel units can't answer)
     # secrets: OS-level read denial for shell commands (the Read tool uses permissions.deny).
     # "./" = project root in project settings; "~/" covers checkouts under $HOME.
     "filesystem": {"denyRead": ["./**/.env", "./**/.env.*", "~/**/.env", "~/**/.env.*"]},
 }
-NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "github.com", "registry.npmjs.org"]}
+NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]}
+BASE_DOMAINS = ["github.com", "api.github.com"]  # git push + gh (PR script)
 # tool caches outside the project that the toolchain must write to inside the sandbox
 CACHE_WRITES = {"python": ["~/.cache/uv", "~/.cache/pip", "~/.cache/pyright-python", "~/.cache/ruff"]}
 
@@ -216,12 +218,15 @@ def render_settings(presets: list[str]) -> dict:
     allow = ["Bash(scripts/check.sh fast)", "Bash(scripts/check.sh full)",
              "Bash(git status)", "Bash(git status --short)", "Bash(git diff)",
              "Bash(git diff --stat)", "Bash(git diff --name-only)", "Bash(git log --oneline)",
-             "Bash(git show --stat)", "Bash(uv sync)"]
+             "Bash(git show --stat)", "Bash(uv sync)",
+             # parallel-PR flow (guard enforces: work branch only, origin only, verified script)
+             "Bash(git add *)", "Bash(git commit *)", "Bash(git push origin HEAD)",
+             "Bash(python3 .claude/hooks/devaccel_pr.py *)"]
     for p in presets:
         for n in PRESETS[p]:
             allow += PIECES[n]["allow"]
     sandbox = json.loads(json.dumps(SANDBOX))
-    domains = sorted({d for p in presets for d in NET_DOMAINS.get(p, [])})
+    domains = sorted(set(BASE_DOMAINS) | {d for p in presets for d in NET_DOMAINS.get(p, [])})
     if domains:
         sandbox["network"] = {"allowedDomains": domains}
     writes = sorted({d for p in presets for d in CACHE_WRITES.get(p, [])})
@@ -239,13 +244,14 @@ def render_settings(presets: list[str]) -> dict:
                 "Edit(./.claude/settings.json)",
                 "Edit(./.claude/project.json)",
                 "Edit(./.github/workflows/**)",
-                "Bash(git push*)",
             ],
             # "/path" = project-relative per the permissions docs; "./" kept for older behavior
             "deny": ["Read(**/.env)", "Read(**/.env.*)", "Edit(**/.env)", "Edit(**/.env.*)",
                      "Read(/.env)", "Read(/.env.*)", "Edit(/.env)", "Edit(/.env.*)",
                      "Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
-                     "Bash(git * --out*)", "Bash(git * --ext*)"],
+                     "Bash(git * --out*)", "Bash(git * --ext*)", "Bash(gh *)",
+                     "Bash(git push --force*)", "Bash(git push -f *)", "Bash(git push * --force*)",
+                     "Bash(git remote add *)", "Bash(git remote set-url *)"],
         },
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [
@@ -438,6 +444,29 @@ def cmd_doctor(root: Path) -> int:
     if sb.get("enabled"):
         ok(sandbox_ready(), "sandbox enabled but bubblewrap/socat missing",
            "sudo apt-get install bubblewrap socat")
+    try:
+        perms = json.loads((root / ".claude/settings.json").read_text()).get("permissions", {})
+    except (OSError, ValueError):
+        perms = {}
+    ok("Bash(git push*)" not in perms.get("ask", []), "settings ask rule Bash(git push*) blocks parallel PR units",
+       "remove it; the guard enforces push policy (see CHANGELOG 0.4.0)")
+    ok("api.github.com" in json.dumps(sb.get("network", {})), "sandbox network lacks api.github.com",
+       "add github.com and api.github.com to sandbox.network.allowedDomains")
+    try:
+        trusted = json.loads((Path.home() / ".claude.json").read_text()).get("projects", {}) \
+            .get(str(root), {}).get("hasTrustDialogAccepted")
+    except (OSError, ValueError):
+        trusted = None
+    if not trusted:
+        notes.append("workspace not trusted yet: run `claude` here once and accept the dialog "
+                      "(permissions.allow is ignored until then; -p and /batch never ask)")
+    origin = subprocess.run(["git", "-C", str(root), "remote", "get-url", "origin"],
+                            capture_output=True, text=True).stdout.strip()
+    if origin and shutil.which("gh"):
+        if not origin.startswith("https://github.com/"):
+            notes.append(f"origin is {origin}: PR flow expects https://github.com/... (SSH may fail in the sandbox)")
+        auth = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+        ok(auth.returncode == 0, "gh is not authenticated", "gh auth login")
     ok(hooks_wired(root / ".claude/settings.json"), "hooks not wired in .claude/settings.json",
        "add the PreToolUse(Bash) guard and Stop gate entries (README)")
 

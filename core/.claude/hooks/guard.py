@@ -4,6 +4,8 @@
 Scope is deliberately narrow (see docs/design.md D6):
 - Destructive / irreversible operations: broad rm -rf, sudo, force push, curl|sh,
   git options that write files or run programs, history-destroying git, DROP TABLE.
+- Parallel-PR policy: push only `git push origin HEAD` from a non-default branch, no remote
+  changes, no direct gh (the verified PR script is the only gateway).
 - It does NOT try to protect secrets such as .env: parsing shell text cannot do that
   reliably. Secrets are protected by the OS-level sandbox (sandbox.filesystem.denyRead)
   and permissions.deny for the Read tool, both in .claude/settings.json.
@@ -13,7 +15,9 @@ On internal error it asks instead of allowing.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -44,27 +48,106 @@ DENY: list[tuple[re.Pattern, str]] = [
     ),
 ]
 
+# ASK rules are convenience checks (not a security boundary): they match only at the start of a
+# command segment, so text inside heredoc bodies or strings does not trigger them.
 ASK: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bgit\s+add\s+(-A\b|--all\b|\.(\s|$))"), "git add -A/. は秘密情報やゴミを含めがちです。対象を確認してください。"),
-    (re.compile(r"\bgit\s+reset\s+--hard\b"), "未コミットの変更が消えます。"),
-    (re.compile(r"\bgit\s+clean\s+-[a-zA-Z]*f"), "未追跡ファイルが消えます。"),
-    (re.compile(r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)"), "未コミットの変更が消えます。"),
+    (re.compile(r"^\s*git\s+add\s+(-A\b|--all\b|\.(\s|$))"), "git add -A/. は秘密情報やゴミを含めがちです。対象を確認してください。"),
+    (re.compile(r"^\s*git\s+reset\s+--hard\b"), "未コミットの変更が消えます。"),
+    (re.compile(r"^\s*git\s+clean\s+-[a-zA-Z]*f"), "未追跡ファイルが消えます。"),
+    (re.compile(r"^\s*git\s+(checkout|restore)\s+(--\s+)?\.(\s|$)"), "未コミットの変更が消えます。"),
     (re.compile(r"\b(DROP\s+(TABLE|DATABASE)|TRUNCATE\s+TABLE)\b", re.I), "破壊的な DB 操作です。案を先に示してください。"),
 ]
 
 
-def _git_options(command: str) -> tuple[str, str] | None:
-    """git accepts abbreviated long options (--out= == --output=): check per token."""
+# ---- git policy (segment-based; a compound "a && b" is checked per segment) ----
+FD = re.compile(r"\s*\d*>&\d+")  # 2>&1 is not a separator
+SEP = re.compile(r"&&|\|\||[;&|\n]")
+WRAP = r"(?:(?:timeout\s+\S+|time|nice|nohup|command|builtin|env)\s+)*"
+GITOPT = r"(?:-\S+\s+(?:[^-\s]\S*\s+)?)*"  # git global options before the subcommand
+PUSH = re.compile(r"^\s*(?:\w+=\S*\s+)*" + WRAP + r"git\s+" + GITOPT + r"push\b")
+OK_PUSH = re.compile(r"^\s*" + WRAP + r"git push(?: (?:-u|--set-upstream))? origin HEAD\s*$")
+REDIRECT = re.compile(r"(?:^|[\s;&|(])(?:cd|pushd)\s|\bgit\s+(?:-C|--git-dir|--work-tree)\b|\bGIT_(?:DIR|WORK_TREE)=")
+REMOTE = re.compile(
+    r"\bgit\s+" + GITOPT + r"(?:remote\s+(?:add|set-url|rename|remove|rm)\b"
+    r"|config\b[^;&|\n]*\b(?:remote\.|url\.|branch\.\S*\.(?:remote|pushremote|merge)|push\.|credential\.))"
+)
+GH = re.compile(r"^\s*(?:\w+=\S*\s+)*" + WRAP + r"gh\s")
+OUTPUT_CMDS = re.compile(r"\bgit\s+" + GITOPT + r"(diff|log|show|format-patch|difftool|grep|stash\s+show)\b")
+PR_SCRIPT = re.compile(r"\.claude/hooks/devaccel_pr\.py\b")
+PR_FILES = ("devaccel_pr.py", "devaccel_common.py", "stop_gate.py")
+
+
+def _segments(command: str) -> list[str]:
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
-    if not re.search(r"\bgit\b", flat):
-        return None
-    if re.search(r"[$`{]", flat):  # any expansion (vars, commands, braces): let the human look
-        return "ask", "git コマンドに展開($ ` {)が含まれています。内容を確認してください。"
-    for w in re.split(r"(?:\s|\$\{?IFS\}?|[;&|()<>])+", flat):
-        if w.startswith("--") and len(w) > 2:
-            name = w[2:].split("=", 1)[0].lower()
-            if "output".startswith(name) or "ext-diff".startswith(name):
-                return "deny", "git の --output / --ext-diff(省略形を含む)は使えません。"
+    return [s for s in SEP.split(FD.sub(" ", flat)) if s.strip()]
+
+
+def _current_branch(cwd: Path) -> str:
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), "symbolic-ref", "--short", "-q", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def _protected_branches(cwd: Path, cfg: dict) -> set[str]:
+    names = {"main", "master", cfg.get("scale", {}).get("base_branch", "main")}
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        if r.stdout.strip():
+            names.add(r.stdout.strip().split("/", 1)[-1])
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return names
+
+
+def _pr_script_intact(cwd: Path, project: Path) -> bool:
+    """The PR script runs from the (possibly modified) worktree: compare with the main lock."""
+    lock = project / ".claude" / "devaccel.lock"
+    try:
+        locked = {ln.split()[1]: ln.split()[0] for ln in lock.read_text().splitlines()
+                  if ln and not ln.startswith(("#", "version", "ref"))}
+    except (OSError, IndexError):
+        return False
+    for name in PR_FILES:
+        rel = f".claude/hooks/{name}"
+        try:
+            if hashlib.sha256((cwd / rel).read_bytes()).hexdigest() != locked.get(rel):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str, str] | None:
+    segs = _segments(command)
+    for s in segs:
+        if REMOTE.search(s):
+            return "deny", "git のリモート設定・push 設定は変更できません。"
+        if GH.search(s):
+            return "deny", "gh は直接使えません。PR は python3 .claude/hooks/devaccel_pr.py で作ってください。"
+    pushes = [s for s in segs if PUSH.search(s)]
+    if pushes:
+        if any(not OK_PUSH.search(s) for s in pushes):
+            return "deny", "push は `git push origin HEAD`(作業ブランチを origin へ)だけです。force・他ブランチ・他リモートは不可。"
+        if REDIRECT.search(command):
+            return "deny", "push と cd / git -C を同じコマンドにしないでください(別コマンドで)。"
+        branch = _current_branch(cwd)
+        if not branch or branch in _protected_branches(cwd, cfg):
+            return "deny", f"デフォルトブランチ({branch or 'detached HEAD'})へは push できません。作業ブランチを切ってください。"
+    if PR_SCRIPT.search(command) and not _pr_script_intact(cwd, project):
+        return "deny", "devaccel_pr.py(または依存)が lock と一致しません。改変された PR スクリプトは実行できません。"
+    for s in segs:  # --output / --ext-diff (incl. abbreviations) only matter for these subcommands
+        if OUTPUT_CMDS.search(s):
+            if re.search(r"[`]|\$(?!\{?IFS)|\{[^}]*(,|\.\.)|\{[^}]*$", s.replace("@{", "")):
+                return "ask", "git diff/log 等に展開が含まれています。内容を確認してください。"
+            for w in re.split(r"(?:\s|\$\{?IFS\}?|[()<>])+", s):
+                if w.startswith("--") and len(w) > 2:
+                    name = w[2:].split("=", 1)[0].lower()
+                    if "output".startswith(name) or "ext-diff".startswith(name):
+                        return "deny", "git の --output / --ext-diff(省略形を含む)は使えません。"
     return None
 
 
@@ -78,16 +161,20 @@ def _compile_extra(patterns: list, label: str) -> list[tuple[re.Pattern, str]]:
     return out
 
 
-def decide(command: str, cfg: dict, cwd: Path | None = None) -> tuple[str, str] | None:  # noqa: ARG001
+def decide(command: str, cfg: dict, cwd: Path | None = None, project: Path | None = None) -> tuple[str, str] | None:
     flat = command.replace('"', "").replace("'", "").replace("\\", "")  # rm -rf "/" -> rm -rf /
     extra = cfg.get("guard", {})
     for rx, why in DENY + _compile_extra(extra.get("deny_regex", []), "guard.deny_regex"):
         if rx.search(flat):
             return "deny", why
-    hit = _git_options(command)
+    cwd = cwd or Path.cwd()
+    hit = _git_policy(command, cfg, cwd, project or cwd)
     if hit:
         return hit
-    for rx, why in ASK + _compile_extra(extra.get("ask_regex", []), "guard.ask_regex"):
+    for rx, why in ASK:
+        if any(rx.search(s) for s in _segments(command)):
+            return "ask", why
+    for rx, why in _compile_extra(extra.get("ask_regex", []), "guard.ask_regex"):
         if rx.search(flat):
             return "ask", why
     return None
@@ -98,7 +185,8 @@ def main() -> int:
     command = (data.get("tool_input") or {}).get("command", "")
     if not command:
         return 0
-    verdict = decide(command, load_config(project_root(data)))
+    project = project_root(data)
+    verdict = decide(command, load_config(project), Path(data.get("cwd") or project), project)
     if verdict:
         decision, why = verdict
         emit(

@@ -32,6 +32,9 @@ ALWAYS_HUMAN = ["scripts/check.sh", ".claude/**", ".github/**", "CLAUDE.md", "AG
                 "pyrightconfig.json", "ruff.toml", ".ruff.toml"]
 TOOL_CFG = re.compile(r"^[+-].*(\[tool\.|ruff|pyright|pytest|addopts|exclude|ignore)", re.I)
 
+SECRET = re.compile(r"gh[opsu]_[A-Za-z0-9]{36}|github_pat_\w+|-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}")
+NOTES_MAX = 4096
+
 LABELS = {
     "evidence-ok": ("0e8a16", "devaccel: checks pass, app verified, low risk"),
     "needs-human": ("d93f0b", "devaccel: a human must review (see reasons in the PR body)"),
@@ -151,6 +154,28 @@ def render(ev: dict, notes: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def read_notes(path: str, root: Path) -> str:
+    """Notes go into a public-ish PR body: only small files from the repo or temp dir, no secrets."""
+    if not path:
+        return ""
+    p = Path(path).resolve()
+    allowed = [root.resolve(), Path(tempfile.gettempdir()).resolve()]
+    if not any(p == a or a in p.parents for a in allowed):
+        raise SystemExit(f"--verify-notes must be inside the repo or {tempfile.gettempdir()}")
+    if p.name.startswith(".env") or p.stat().st_size > NOTES_MAX:
+        raise SystemExit(f"--verify-notes: refused ({p.name}, max {NOTES_MAX} bytes)")
+    text = p.read_text(encoding="utf-8")
+    if SECRET.search(text):
+        raise SystemExit("--verify-notes looks like it contains a credential; refused")
+    return text
+
+
+def github_repo(root: Path) -> str:
+    url = git(root, "remote", "get-url", "origin").strip()
+    m = re.match(r"^(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url)
+    return m.group(1) if m else ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--title", required=True)
@@ -164,7 +189,12 @@ def main() -> int:
     if git(root, "status", "--porcelain", "--untracked-files=no").strip():
         print("uncommitted changes: commit first", file=sys.stderr)
         return 2
-    notes = Path(a.verify_notes).read_text(encoding="utf-8") if a.verify_notes else ""
+    head = git(root, "symbolic-ref", "--short", "-q", "HEAD").strip()
+    protected = {"main", "master", cfg["scale"]["base_branch"]}
+    if not head or head in protected:
+        print(f"refusing to open a PR from {head or 'detached HEAD'}: use a work branch", file=sys.stderr)
+        return 2
+    notes = read_notes(a.verify_notes, root)
     ev = collect(root, cfg, cfg["scale"]["base_branch"], notes)
     body = render(ev, notes)
     if a.dry_run:
@@ -172,11 +202,19 @@ def main() -> int:
         print(json.dumps({"label": ev["label"], "reasons": ev["reasons"]}, ensure_ascii=False))
         return 0
 
+    repo = github_repo(root)
+    if not repo:
+        print("origin is not a github.com repository", file=sys.stderr)
+        return 2
+    remote_head = git(root, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{head}").strip()
+    if remote_head != git(root, "rev-parse", "HEAD").strip():
+        print("push first: git push origin HEAD", file=sys.stderr)
+        return 2
     for name, (color, desc) in LABELS.items():
-        run(["gh", "label", "create", name, "--color", color, "--description", desc], root)  # exists -> ignored
+        run(["gh", "label", "create", name, "-R", repo, "--color", color, "--description", desc], root)
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write(body)
-    r = run(["gh", "pr", "create", "--base", ev["base"], "--head", ev["head"], "--title", a.title,
+    r = run(["gh", "pr", "create", "-R", repo, "--base", ev["base"], "--head", ev["head"], "--title", a.title,
              "--body-file", f.name, "--label", ev["label"]], root)
     Path(f.name).unlink(missing_ok=True)
     if r.returncode != 0:
@@ -186,11 +224,11 @@ def main() -> int:
     print(f"{url}  [{ev['label']}]" + (f" reasons: {' / '.join(ev['reasons'])}" if ev["reasons"] else ""))
     if ev["label"] == "evidence-ok" and par.get("auto_merge"):
         # auto-merge only behind branch protection with a required status check (CI = check.sh full)
-        prot = run(["gh", "api", f"repos/{{owner}}/{{repo}}/branches/{ev['base']}/protection/required_status_checks"], root)
+        prot = run(["gh", "api", f"repos/{repo}/branches/{ev['base']}/protection/required_status_checks"], root)
         if prot.returncode != 0 or '"contexts":[]' in prot.stdout.replace(" ", ""):
             print("auto-merge: skipped — base branch has no required status checks (set branch protection first)")
             return 0
-        m = run(["gh", "pr", "merge", url, "--auto", "--squash"], root)
+        m = run(["gh", "pr", "merge", url, "-R", repo, "--auto", "--squash"], root)
         print("auto-merge: " + ("enabled (merges when required checks pass)" if m.returncode == 0
                                 else "not enabled — " + (m.stderr.strip() or m.stdout.strip())[:200]))
     return 0

@@ -14,7 +14,7 @@ Claude Code を **少ないトークンで、正確に、速く** 回すため�
 git clone <this repo> ~/devaccel && cd ~/devaccel && git checkout <tag>   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
-claude                         # 起動して信頼ダイアログを承認 → /devaccel-setup
+claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
 git add -A && git commit       # .claude/ ごとコミット → 他の人は clone するだけで同じ環境
 ```
 
@@ -71,7 +71,8 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
    - `evidence-ok`: 検査通過・実動作確認あり・S/M・リスクのあるパスなし → 証拠だけ見てマージ
    - `needs-human`: 理由つき(検査失敗、確認なし、L 規模、risky_paths、テスト削除/skip、ゲートの判断依頼、未チェックの受け入れ条件) → 差分を読む
 4. 任意: `.claude/project.json` の `"parallel": {"auto_merge": true}` で `evidence-ok` を自動マージ(GitHub 側で auto-merge を許可し、`check` ワークフローを必須チェックにしたブランチ保護が必要)。最初は off で振り分けの精度を見て、evidence-ok のリバートが出ない期間が続いてから。
-5. 並列度は settings.json の `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`(既定 3)。並列数だけトークンも増える(公式)。`/devaccel-tune` が PR の振り分け実績(件数・マージ・リバート)を見て閾値を調整する。
+5. 押し出しの規則(guard が強制): push は作業ブランチから `git push origin HEAD` のみ(main/master・デフォルトブランチ・force・他リモート不可)。`gh` は直接使えず、PR は lock と一致する `devaccel_pr.py` だけが作る。サンドボックス内のコマンドは確認なしで動く(`autoAllowBashIfSandboxed`)ので、並列の単位が確認待ちで止まらない。GitHub 側でもデフォルトブランチを保護すると確実(プランによっては非公開リポジトリで使えない)。
+6. 並列度は settings.json の `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`(既定 3)。並列数だけトークンも増える(公式)。`/devaccel-tune` が PR の振り分け実績(件数・マージ・リバート)を見て閾値を調整する。
 
 ## 守りの分担
 
@@ -81,7 +82,8 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | 秘密(Read ツール経由) | permissions | `deny: Read(/.env)` 等 |
 | ネットワーク | サンドボックス | 許可ドメイン(Python は PyPI と GitHub)以外は確認 |
 | うっかりの破壊的操作 | guard フック | 正規表現の best-effort。意図的な回避は防げない |
-| 検査の改ざん | permissions `ask` + CI + ブランチ保護 | check.sh・フック・settings の編集は確認 |
+| 検査の改ざん | permissions `ask` + CI + ブランチ保護 + PR 判定 | check.sh・フック・settings の編集は確認。PR は base の check.sh で判定し、検証基盤の変更は needs-human |
+| 押し出し(push・PR) | guard + permissions deny | 作業ブランチの `git push origin HEAD` と検証済み PR スクリプトのみ |
 
 シェル文字列の解析で秘密を守るのは原理的に不可能なので、guard は破壊的操作に専念する(0.2.0 で `.env` 検出を削除)。
 
