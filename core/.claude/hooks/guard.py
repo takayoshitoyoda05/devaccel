@@ -101,16 +101,20 @@ def _expands_to_secret(command: str, cwd: Path) -> str | None:
         words = shlex.split(command, comments=False, posix=True)
     except ValueError:
         words = command.split()
-    moved = False  # after cd/pushd, globs resolve against a directory we did not list
+    # Things a static check cannot follow: glob options, ANSI-C quoting, directory changes.
+    if re.search(r"\b(shopt|dotglob|GLOBIGNORE|globskipdots|nullglob)\b|\$['\"]", command):
+        return "ask"
+    moved = bool(re.search(
+        r"(^|[;&|(){}\s])(cd|pushd|popd)\b|\bgit\s+(?:\S+\s+)*-C\b|\benv\s+(?:\S+\s+)*-C\b", command))
+    if re.search(r"\{\.|,\.", command):  # brace alternative starting with a dot: {.,x} / {x,.e}
+        return "deny"
     for w in words:
-        if w in ("cd", "pushd"):
-            moved = True
         for part in re.split(r"[=:<>();&|]", w):
             if not part:
                 continue
             head, base = os.path.split(part)
             dynamic = "$" in part or "`" in part
-            if dynamic and ("/." in part or part.startswith(".") or "{" in part):
+            if dynamic and ("." in part or "{" in part or "env" in part.lower()):
                 return "ask"
             if not (_GLOB.search(base) and base.startswith(("." , "{", "["))):
                 continue

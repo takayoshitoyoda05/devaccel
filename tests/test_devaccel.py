@@ -50,6 +50,13 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(self.verdict("cat $D/.env"), "deny")
         self.assertEqual(self.verdict("cat $D/.x$Y"), "ask")
         self.assertEqual(self.verdict("git diff $(cat opts)"), "ask")
+        for cmd in ["shopt -s dotglob; cat *", "cat $'.env'", "GLOBIGNORE=x; cat *",
+                    "(cd /tmp; cat .?n*)", "git -C /tmp show HEAD:.e*", "cat $HOME/x.e$Y"]:
+            self.assertIn(self.verdict(cmd), ("ask", "deny"), cmd)
+        for cmd in ["cat {.,x}env", "cat {x,.e}nv"]:
+            self.assertEqual(self.verdict(cmd), "deny", cmd)
+        for cmd in ["ls *", "cat *.md", "echo $PATH", "uv run pytest -k test_a"]:
+            self.assertIsNone(self.verdict(cmd), cmd)
         self.assertEqual(self.verdict("cat .e$X"), "ask")
         self.assertEqual(self.verdict("cat .`echo env`"), "ask")
 
