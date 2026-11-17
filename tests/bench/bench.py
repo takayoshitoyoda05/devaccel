@@ -24,8 +24,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 WORK = Path.home() / "programming" / "python" / "devaccel-bench"
-ALLOWED = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(uv run *)", "Bash(uv sync*)", "Bash(scripts/check.sh *)",
-           "Bash(git status*)", "Bash(git diff*)", "Bash(ls *)", "Bash(cat *)", "Bash(python3 *)"]
+# narrow on purpose: no interpreters/launchers (python3, cat, generic uv run). The agent runs as the user
+# (subscription auth lives in ~/.claude), so the allowlist is the boundary; devaccel runs add its sandbox.
+ALLOWED = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(uv run pytest*)", "Bash(uv run kakeibo *)",
+           "Bash(uv run ruff *)", "Bash(uv run pyright*)", "Bash(scripts/check.sh fast)", "Bash(scripts/check.sh full)",
+           "Bash(git status*)", "Bash(git diff*)"]
 
 
 def sh(cmd: list[str], cwd: Path, timeout: int = 900, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -98,7 +101,9 @@ def main() -> int:
         d = prepare(cond, trial, ref)
         prompt = (HERE / "tasks" / f"{task}.md").read_text(encoding="utf-8")
         t0 = time.time()
-        env = {**os.environ, "DEVACCEL_GATE_MODE": "enforce"}  # the gate as intended in steady state
+        keep = ("PATH", "HOME", "USER", "LANG", "TERM", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "UV_CACHE_DIR")
+        env = {k: v for k, v in os.environ.items() if k in keep}  # no stray tokens from this shell
+        env["DEVACCEL_GATE_MODE"] = "enforce"  # the gate as intended in steady state
         r = sh(["claude", "-p", prompt, "--output-format", "json", "--model", a.model,
                 "--max-turns", str(a.max_turns), "--permission-mode", "acceptEdits",
                 "--allowedTools", *ALLOWED], d, timeout=3600, env=env)
