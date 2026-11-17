@@ -192,6 +192,18 @@ def render_check(presets: list[str], runner: str) -> str:
     return body
 
 
+SANDBOX = {
+    "enabled": True,
+    # secrets: OS-level read denial for shell commands (the Read tool uses permissions.deny)
+    "filesystem": {"denyRead": ["~/**/.env", "~/**/.env.*"]},
+}
+NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "github.com"]}
+
+
+def sandbox_ready() -> bool:
+    return shutil.which("bwrap") is not None and shutil.which("socat") is not None
+
+
 def render_settings(presets: list[str]) -> dict:
     # Only narrow, known-safe git forms: git accepts abbreviated long options
     # (--out= == --output=), so "git diff *" cannot be made safe by deny rules.
@@ -203,7 +215,12 @@ def render_settings(presets: list[str]) -> dict:
     for p in presets:
         for n in PRESETS[p]:
             allow += PIECES[n]["allow"]
+    sandbox = json.loads(json.dumps(SANDBOX))
+    domains = sorted({d for p in presets for d in NET_DOMAINS.get(p, [])})
+    if domains:
+        sandbox["network"] = {"allowedDomains": domains}
     return {
+        "sandbox": sandbox,
         "permissions": {
             "allow": allow,
             "ask": [
@@ -293,6 +310,9 @@ def cmd_install(root: Path) -> int:
         gi.write_text(text + ("" if text.endswith("\n") or not text else "\n") + "\n".join(missing) + "\n")
 
     write_lock(root, core_files())
+    if not sandbox_ready():
+        print("\n! sandbox is enabled in settings.json but bubblewrap/socat are missing.")
+        print("  Install once:  sudo apt-get install bubblewrap socat   (then restart Claude Code)")
     print(f"devaccel {kit_version()} installed. presets={presets or 'none'} runner={runner or 'PATH'}")
     print("created: " + ", ".join(created))
     if kept:
@@ -398,6 +418,15 @@ def cmd_doctor(root: Path) -> int:
         if meta.get("version") != kit_version():
             notes.append(f"kit has {kit_version()}, project has {meta.get('version')} → update.sh")
 
+    try:
+        sb = json.loads((root / ".claude/settings.json").read_text()).get("sandbox", {})
+    except (OSError, ValueError):
+        sb = {}
+    ok(bool(sb.get("enabled")), "sandbox not enabled in .claude/settings.json",
+       "secrets (.env) are protected only by the sandbox; see README 'サンドボックス'")
+    if sb.get("enabled"):
+        ok(sandbox_ready(), "sandbox enabled but bubblewrap/socat missing",
+           "sudo apt-get install bubblewrap socat")
     ok(hooks_wired(root / ".claude/settings.json"), "hooks not wired in .claude/settings.json",
        "add the PreToolUse(Bash) guard and Stop gate entries (README)")
 

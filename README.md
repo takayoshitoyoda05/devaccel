@@ -31,7 +31,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 
 | ファイル | 層 | 役割 |
 |---|---|---|
-| `.claude/hooks/guard.py` | core | 危険な Bash(広範囲 rm -rf、sudo、force push、curl\|sh、.env 読み取り)を拒否/確認 |
+| `.claude/hooks/guard.py` | core | うっかりの破壊的 Bash(広範囲 rm -rf、sudo、force push、curl\|sh、git の --output 等)を拒否/確認。秘密は扱わない |
 | `.claude/hooks/stop_gate.py` | core | 終了時に `check.sh fast`。失敗段だけ返す・3 ラウンドで人に報告・L/テスト弱体化を表示 |
 | `.claude/skills/devaccel-{setup,tune}` | core | 手動専用(説明は常駐しない) |
 | `CLAUDE.md` | project | 進め方(S/M/L)と検証の作法 |
@@ -39,7 +39,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `.claude/skills/verify-app` | project | 「完了」前に実際に動かす手順(setup が生成) |
 | `scripts/check.sh` | project | `fast`(ゲート・自動整形あり)/ `full`(CI)。段を並べるだけ |
 | `.claude/project.json` | project | 挙動の調整点はすべてここ |
-| `.claude/settings.json` | project | permissions とフック 2 行(install 時に 1 回だけ書く) |
+| `.claude/settings.json` | project | permissions・サンドボックス・フック 2 行(install 時に 1 回だけ書く) |
 | `.github/workflows/check.yml` | project | CI で `check.sh full` |
 
 **core は編集しない層**(update で置き換わる)。変えたい挙動は `project.json` か project 層で。
@@ -60,26 +60,33 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 - チーム利用: `scripts/check.sh`・`.claude/`・`.github/workflows/` を CODEOWNERS とブランチ保護で守ると、ゲートを緩める変更に人の承認が必要になる。
 - セッション途中でモデルを変えない、スキルに `model:` を書かない(キャッシュが作り直しになる)。
 
-## より強い保護: サンドボックス(任意・推奨)
+## 守りの分担
 
-guard は「うっかり」を止める best-effort です(シェルは表現力が高く、正規表現では完全に塞げない)。
-シェルコマンドを OS レベルで縛るには Claude Code のサンドボックスを併用する(公式: https://code.claude.com/docs/en/sandboxing)。
+| 守るもの | 担当 | 仕組み |
+|---|---|---|
+| 秘密(`.env` 等) | **サンドボックス**(OS レベル) | `sandbox.filesystem.denyRead`。シェル経由の読み取りをどんな書き方でも拒否 |
+| 秘密(Read ツール経由) | permissions | `deny: Read(/.env)` 等 |
+| ネットワーク | サンドボックス | 許可ドメイン(Python は PyPI と GitHub)以外は確認 |
+| うっかりの破壊的操作 | guard フック | 正規表現の best-effort。意図的な回避は防げない |
+| 検査の改ざん | permissions `ask` + CI + ブランチ保護 | check.sh・フック・settings の編集は確認 |
 
+シェル文字列の解析で秘密を守るのは原理的に不可能なので、guard は破壊的操作に専念する(0.2.0 で `.env` 検出を削除)。
+
+### サンドボックスの準備(WSL2 / Linux、初回のみ)
 ```bash
-sudo apt-get install bubblewrap socat   # WSL2 / Linux。WSL1 は非対応
+sudo apt-get install bubblewrap socat   # WSL1 は非対応
 ```
-`.claude/settings.json` に追記(コミットすれば全員に効く。`/sandbox` は local 設定に書く):
+install が `.claude/settings.json` にサンドボックス設定を書く。起動後 `/sandbox` の Dependencies タブで有効を確認。doctor が依存の有無を点検する。
+既存の settings.json があるプロジェクトでは、次を自分で追記する(公式: https://code.claude.com/docs/en/sandboxing):
 ```json
-{
-  "sandbox": {
-    "enabled": true,
-    "filesystem": { "denyRead": ["~/**/.env"] }
-  }
+"sandbox": {
+  "enabled": true,
+  "filesystem": { "denyRead": ["~/**/.env", "~/**/.env.*"] },
+  "network": { "allowedDomains": ["files.pythonhosted.org", "github.com", "pypi.org"] }
 }
 ```
-- 書き込みは作業ディレクトリと一時領域のみ、ネットワークは許可ドメイン経由のみになる。読み取りは既定で広いので `denyRead` で秘密を閉じる。
-- フックと Read/Edit ツールはサンドボックスの外で動く。Read ツールの `.env` は permissions の deny が担う(devaccel が設定済み)。
-- 起動後 `/sandbox` の Dependencies タブで有効を確認。
+- フックと Read/Edit ツールはサンドボックスの外で動く(Read の秘密は permissions が担当)。
+- 読み取りは既定で広い。ほかに守りたいもの(`~/.ssh` 等)は `denyRead` に足す。
 
 ## 開発
 
