@@ -51,6 +51,14 @@ DENY: list[tuple[re.Pattern, str]] = [
         re.compile(r"(^|[\s=:/<>(){},])\.env(?!\.example\b)(\.[\w-]+)?(?=$|[\s/;&|)<>(){},*?\[\]])"),
         ".env には触れないでください(.env.example は可)。",
     ),
+    (  # backstop, independent of the directory listing: .e*, .en?, .en[v], .e{n,x}v ...
+        re.compile(r"(?<![\w.-])\.e[\w.-]*[*?\[{]"),
+        ".env を含みうるワイルドカードは使わないでください。",
+    ),
+    (  # bare-dot globs: .?nv, .*, .[a-z]nv ... (bash matches dotfiles only with a leading dot)
+        re.compile(r"(?<![\w.-])\.[*?\[{]"),
+        "ドットファイルにマッチするワイルドカードは使わないでください。",
+    ),
 ]
 
 ASK: list[tuple[re.Pattern, str]] = [
@@ -93,23 +101,34 @@ def _expands_to_secret(command: str, cwd: Path) -> str | None:
         words = shlex.split(command, comments=False, posix=True)
     except ValueError:
         words = command.split()
+    risky = None
     for w in words:
+        if w in ("cd", "pushd"):  # later words resolve against another directory
+            risky = risky or "ask"
         for part in re.split(r"[=:<>();&|]", w):
             if not part:
                 continue
             head, base = os.path.split(part)
-            if ("$" in base or "`" in base) and base.startswith("."):
+            dynamic = "$" in part or "`" in part
+            if dynamic and ("/." in part or part.startswith(".") or "{" in part):
                 return "ask"
-            if not _GLOB.search(base):
+            if not (_GLOB.search(base) and base.startswith(("." , "{", "["))):
                 continue
-            names = _secret_files((cwd / head) if head else cwd)
+            if base.count("{") > 1 or re.search(r"\{[^}]*\{", base):
+                return "deny"  # nested / multiple brace groups: do not try to emulate bash
+            if dynamic or "~" in head or _GLOB.search(head):
+                return "ask"
+            directory = (cwd / head) if head else cwd
+            if not directory.is_dir():
+                return "ask"
+            names = _secret_files(directory)
             alts = [base]
             m = re.search(r"\{([^{}]*)\}", base)
-            if m:  # one level of brace expansion is enough for a heuristic
+            if m:
                 alts = [base[: m.start()] + a + base[m.end():] for a in m.group(1).split(",")]
             if any(fnmatch.fnmatchcase(n, a) for n in names for a in alts if a):
                 return "deny"
-    return None
+    return risky
 
 
 def decide(command: str, cfg: dict, cwd: Path | None = None) -> tuple[str, str] | None:

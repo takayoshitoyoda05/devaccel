@@ -43,8 +43,12 @@ class GuardTest(unittest.TestCase):
         for cmd in ["cat .?nv", "cat ./.?nv*", "cat .[e]nv", "cat .e*", "cat {.env,x}",
                     "cat .*", "head -1 .env.l*", "cat ./.e{n,x}v"]:
             self.assertEqual(self.verdict(cmd), "deny", cmd)
-        for cmd in ["cat $X", "ls *.py", "cat .envr?", "cat .env.example"]:
+        for cmd in ["cd /tmp && cat .e*", "cat sub/.?nv", "cat .{e,x}{n,y}v", "cat ~/.e*"]:
+            self.assertEqual(self.verdict(cmd), "deny", cmd)
+        for cmd in ["cat $X", "ls *.py", "cat .env.example", "ls src/*.py"]:
             self.assertIsNone(self.verdict(cmd), cmd)
+        self.assertEqual(self.verdict("cat $D/.env"), "deny")
+        self.assertEqual(self.verdict("cat $D/.x$Y"), "ask")
         self.assertEqual(self.verdict("cat .e$X"), "ask")
         self.assertEqual(self.verdict("cat .`echo env`"), "ask")
 
