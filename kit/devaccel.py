@@ -294,6 +294,10 @@ def cmd_install(root: Path) -> int:
 
 def cmd_update(root: Path) -> int:
     meta, locked = read_lock(root)
+    bad = [f for f in locked if not _safe_core_path(root, f)]
+    for f in bad:
+        print(f"warning: ignoring lock entry outside .claude/: {f!r}")
+        del locked[f]
     if not locked:
         print("no devaccel.lock here. Run install.sh first.")
         return 1
@@ -321,7 +325,8 @@ def cmd_update(root: Path) -> int:
         for rel in new_files:
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             os.replace(staging / rel, root / rel)
-    removed = [f for f in locked if f not in new_files and (root / f).exists()]
+    removed = [f for f in locked if f not in new_files and _safe_core_path(root, f)
+               and (root / f).is_file() and not (root / f).is_symlink()]
     for f in removed:
         (root / f).unlink()
     write_lock(root, new_files)
@@ -337,6 +342,18 @@ def cmd_update(root: Path) -> int:
         print("project-owned files differ from the current seed (expected; never overwritten). "
               "Check CHANGELOG for anything worth adopting: " + ", ".join(drift))
     return 0
+
+
+def _safe_core_path(root: Path, rel: str) -> bool:
+    """Lock entries come from the project repo: only ever delete inside .claude/."""
+    p = Path(rel)
+    if p.is_absolute() or ".." in p.parts or p.parts[:1] != (".claude",):
+        return False
+    try:
+        (root / p).resolve().relative_to((root / ".claude").resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def hooks_wired(settings: Path) -> bool:
@@ -361,6 +378,9 @@ def cmd_doctor(root: Path) -> int:
     meta, locked = read_lock(root)
     ok(bool(locked), "devaccel.lock missing", "run install.sh")
     if locked:
+        for f in [f for f in locked if not _safe_core_path(root, f)]:
+            problems.append(f"lock entry outside .claude/: {f!r}")
+            del locked[f]
         for f, h in locked.items():
             p = root / f
             ok(p.exists(), f"core file missing: {f}", "run update.sh")
