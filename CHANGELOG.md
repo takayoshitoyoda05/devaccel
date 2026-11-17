@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.6.1 (2026-11-18)
+- 0.6.0 の退行を修正: worktree を検査対象にした際、guard の lock 照合・ゲートの設定・check.sh まで worktree(単位が書き換えられる)から読んでいた。信頼の基準 `trusted_root()`(本体)と検査対象 `project_root()`(worktree)を分け、lock・project.json・check.sh は常に本体から。settings 生成の ask に worktree 内の検証基盤(`**/scripts/check.sh` ほか)を追加。
+
 ## 0.6.0 (2026-11-18)
 - **修正: /batch の単位内でゲートが動いていなかった**。単位はサブエージェントなので終了は `SubagentStop`(未登録だった)。さらに `CLAUDE_PROJECT_DIR` は worktree 内でも本体を指すため、発火しても本体の木を検査していた。settings 生成に `SubagentStop` を追加し、ゲートは hook の `cwd` が同じリポジトリの worktree ならそちらを検査、ラウンドは `agent_id` ごと。既存プロジェクトは settings.json に手で追記(doctor が表示)。
 - トークン削減(fable の調査より): seed CLAUDE.md の /batch 規則を「独立 S/M が 4 件以上のときだけ、先に fetch、各単位にコンテキストパック(編集ファイル・参照・受け入れ条件・テスト・範囲外)」に。settings 生成で `.claude/worktrees/**`・`.venv/**`・`uv.lock` の Read を deny。

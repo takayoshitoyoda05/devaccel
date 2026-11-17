@@ -26,6 +26,7 @@ from devaccel_common import (  # noqa: E402
     log_event,
     match_any,
     project_root,
+    trusted_root,
     read_stdin_json,
     state_dir,
 )
@@ -88,15 +89,17 @@ def branch_files(root: Path, base: str) -> set[str]:
 # ---------- check.sh ----------
 
 
-def run_check(root: Path, timeout: int) -> tuple[str, int, str, float]:
-    """Returns (result, returncode, output, seconds). result: pass|fail|timeout|missing."""
-    script = root / "scripts" / "check.sh"
+def run_check(root: Path, timeout: int, anchor: Path | None = None) -> tuple[str, int, str, float]:
+    """Returns (result, returncode, output, seconds). result: pass|fail|timeout|missing.
+    Runs the anchor's (main checkout's) check.sh against root, so a worktree cannot weaken its gate."""
+    script = (anchor or root) / "scripts" / "check.sh"
     if not script.exists():
         return "missing", 0, "", 0.0
     t0 = time.time()
+    text = script.read_text(encoding="utf-8").replace('cd "$(dirname "$0")/.."', f'cd "{root}"')
     try:
         r = subprocess.run(
-            ["bash", str(script), "fast"],
+            ["bash", "-c", text, "check.sh", "fast"],
             cwd=root,
             capture_output=True,
             text=True,
@@ -180,8 +183,9 @@ def save_state(root: Path, state: dict) -> None:
 
 def main() -> int:
     data = read_stdin_json()
-    root = project_root(data)
-    cfg = load_config(root)
+    root = project_root(data)  # what is checked (may be a /batch worktree)
+    anchor = trusted_root(data)  # config and check.sh come from here, not from the worktree
+    cfg = load_config(anchor)
     gate = cfg["gate"]
     mode = gate["mode"]
     if mode == "off" or not is_git_repo(root):
@@ -203,7 +207,7 @@ def main() -> int:
     sess["t"] = time.time()
     if sig in (sess["ok"], sess["seen"]):
         return 0  # nothing changed since the last check (e.g. a question-only turn)
-    result, _rc, output, secs = run_check(root, int(gate["timeout_sec"]))
+    result, _rc, output, secs = run_check(root, int(gate["timeout_sec"]), anchor)
     # fast mode may auto-format: remember the tree as it is *after* the check
     relevant = [it for it in changed_paths(root) if not match_any(it[1], gate["ignore"])]
     sig = signature(root, relevant)

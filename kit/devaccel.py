@@ -245,6 +245,9 @@ def render_settings(presets: list[str]) -> dict:
                 "Edit(./.claude/settings.json)",
                 "Edit(./.claude/project.json)",
                 "Edit(./.github/workflows/**)",
+                # the same machinery inside /batch worktrees (.claude/worktrees/<unit>/...)
+                "Edit(**/scripts/check.sh)", "Edit(**/.claude/hooks/**)", "Edit(**/.claude/settings.json)",
+                "Edit(**/.claude/project.json)", "Edit(**/.github/workflows/**)",
             ],
             # "/path" = project-relative per the permissions docs; "./" kept for older behavior
             "deny": ["Read(**/.env)", "Read(**/.env.*)", "Edit(**/.env)", "Edit(**/.env.*)",

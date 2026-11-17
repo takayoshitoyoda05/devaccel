@@ -139,6 +139,23 @@ class KitTest(unittest.TestCase):
                env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce"},
                stdin=json.dumps({"session_id": "s", "agent_id": "a1", "cwd": str(wt)}))
         self.assertEqual(json.loads(r.stdout or "{}").get("decision"), "block", r.stdout + r.stderr)
+        # the unit cannot switch its gate off or neuter check.sh in its own worktree
+        (wt / ".claude/project.json").write_text('{"gate": {"mode": "off"}}')
+        (wt / "scripts/check.sh").write_text("#!/usr/bin/env bash\necho '== ok: tests (0s)'\n")
+        (wt / "app.py").write_text("BROKEN again\n")
+        r = sh(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"),
+               env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce"},
+               stdin=json.dumps({"session_id": "s", "agent_id": "a2", "cwd": str(wt)}))
+        self.assertEqual(json.loads(r.stdout or "{}").get("decision"), "block", r.stdout + r.stderr)
+        # guard: a tampered PR script in the worktree is compared with the main checkout's lock
+        p = wt / ".claude/hooks/devaccel_pr.py"
+        p.write_text(p.read_text() + "\n# hack\n")
+        lock = wt / ".claude/devaccel.lock"
+        lock.write_text(lock.read_text().replace(guard.hashlib.sha256((self.root / ".claude/hooks/devaccel_pr.py")
+                        .read_bytes()).hexdigest(), guard.hashlib.sha256(p.read_bytes()).hexdigest()))
+        r = sh(wt, "python3", str(self.root / ".claude/hooks/guard.py"), env={"CLAUDE_PROJECT_DIR": str(self.root)},
+               stdin=json.dumps({"cwd": str(wt), "tool_input": {"command": "python3 .claude/hooks/devaccel_pr.py --title t"}}))
+        self.assertIn("deny", r.stdout)
         other = self.tmp / "other"  # an unrelated repo in cwd must not redirect the gate
         other.mkdir()
         sh(other, "git", "init", "-q")

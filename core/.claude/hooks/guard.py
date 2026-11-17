@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from devaccel_common import emit, load_config, project_root, read_stdin_json  # noqa: E402
+from devaccel_common import emit, load_config, read_stdin_json, trusted_root  # noqa: E402
 
 # rm with both -r and -f aimed at a broad target (/, ~, $HOME, *, ., .., .git)
 _RM = re.compile(
@@ -224,7 +224,7 @@ def main() -> int:
     command = (data.get("tool_input") or {}).get("command", "")
     if not command:
         return 0
-    project = project_root(data)
+    project = trusted_root(data)  # lock and config come from the main checkout, never a worktree
     verdict = decide(command, load_config(project), Path(data.get("cwd") or project), project)
     if verdict:
         decision, why = verdict
