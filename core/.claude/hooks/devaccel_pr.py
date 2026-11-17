@@ -25,6 +25,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from devaccel_common import git, load_config, match_any  # noqa: E402
 from stop_gate import SKIP_RE  # noqa: E402
 
+# "Changes can't modify their own checks": touching the verification machinery always
+# needs a human, whatever project.json says (project.json itself is in this list).
+ALWAYS_HUMAN = ["scripts/check.sh", ".claude/**", ".github/**", "CLAUDE.md", "AGENTS.md",
+                "**/conftest.py", "conftest.py", "pytest.ini", "setup.cfg", "tox.ini",
+                "pyrightconfig.json", "ruff.toml", ".ruff.toml"]
+TOOL_CFG = re.compile(r"^[+-].*(\[tool\.|ruff|pyright|pytest|addopts|exclude|ignore)", re.I)
+
 LABELS = {
     "evidence-ok": ("0e8a16", "devaccel: checks pass, app verified, low risk"),
     "needs-human": ("d93f0b", "devaccel: a human must review (see reasons in the PR body)"),
@@ -50,6 +57,19 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
     tests_deleted = [ln.split("\t", 1)[1] for ln in status
                      if ln.startswith("D") and match_any(ln.split("\t", 1)[1], cfg["integrity"]["test_globs"])]
     skips = [ln[1:].strip() for ln in diff.splitlines() if SKIP_RE.match(ln)]
+    machinery = [f for f in files if match_any(f, ALWAYS_HUMAN)]
+    if "pyproject.toml" in files and any(
+            TOOL_CFG.match(ln) for ln in git(root, "diff", "-U0", f"{base}..HEAD", "--", "pyproject.toml").splitlines()
+            if not ln.startswith(("+++", "---"))):
+        machinery.append("pyproject.toml(ツール設定)")
+    # existing tests that lost lines (pure additions of new tests are fine)
+    tests_shrunk = []
+    for ln in status:
+        st, _, path = ln.partition("\t")
+        if st.startswith("M") and match_any(path, cfg["integrity"]["test_globs"]):
+            d = git(root, "diff", "--numstat", f"{base}..HEAD", "--", path).split()
+            if d and d[1].isdigit() and int(d[1]) > 0:
+                tests_shrunk.append(path)
     designs = [f for f in files if f.startswith("docs/design/") and f.endswith(".md") and "TEMPLATE" not in f]
     acs: list[str] = []
     for d in designs:
@@ -59,9 +79,13 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
                     if re.match(r"\s*- \[[ xX]\] ", ln)]
 
     t0 = time.time()
-    check = root / "scripts" / "check.sh"
-    if check.exists():
-        r = run(["bash", str(check), "full"], root, timeout=int(cfg["gate"]["timeout_sec"]) * 10)
+    # run the *base branch's* check.sh: a branch cannot weaken the check that judges it
+    base_check = git(root, "show", f"{base}:scripts/check.sh") if base else ""
+    if base_check:
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8") as f:
+            f.write(base_check.replace('cd "$(dirname "$0")/.."', f'cd "{root}"'))
+        r = run(["bash", f.name, "full"], root, timeout=int(cfg["gate"]["timeout_sec"]) * 10)
+        Path(f.name).unlink(missing_ok=True)
         check_ok = r.returncode == 0
         stages = [ln for ln in (r.stdout + r.stderr).splitlines() if re.match(r"== (ok|failed|missing):", ln)]
         tail = "\n".join((r.stdout + r.stderr).splitlines()[-30:]) if not check_ok else ""
@@ -87,6 +111,10 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
         reasons.append(f"L 規模({len(files)} ファイル)")
     if risky:
         reasons.append("リスクのあるパス: " + ", ".join(risky[:5]))
+    if machinery:
+        reasons.append("検証基盤の変更: " + ", ".join(machinery[:5]))
+    if tests_shrunk:
+        reasons.append("既存テストの行削除: " + ", ".join(tests_shrunk[:5]))
     if tests_deleted:
         reasons.append("テスト削除: " + ", ".join(tests_deleted[:5]))
     if skips:
@@ -157,6 +185,11 @@ def main() -> int:
     url = r.stdout.strip().splitlines()[-1]
     print(f"{url}  [{ev['label']}]" + (f" reasons: {' / '.join(ev['reasons'])}" if ev["reasons"] else ""))
     if ev["label"] == "evidence-ok" and par.get("auto_merge"):
+        # auto-merge only behind branch protection with a required status check (CI = check.sh full)
+        prot = run(["gh", "api", f"repos/{{owner}}/{{repo}}/branches/{ev['base']}/protection/required_status_checks"], root)
+        if prot.returncode != 0 or '"contexts":[]' in prot.stdout.replace(" ", ""):
+            print("auto-merge: skipped — base branch has no required status checks (set branch protection first)")
+            return 0
         m = run(["gh", "pr", "merge", url, "--auto", "--squash"], root)
         print("auto-merge: " + ("enabled (merges when required checks pass)" if m.returncode == 0
                                 else "not enabled — " + (m.stderr.strip() or m.stdout.strip())[:200]))

@@ -190,6 +190,16 @@ class KitTest(unittest.TestCase):
         self.assertEqual(ev["label"], "needs-human")
         self.assertTrue(any("auth/login.py" in r for r in ev["reasons"]))
 
+    def test_pr_cannot_weaken_its_own_checks(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("BROKEN\n")
+        # the branch "fixes" the failure by neutering check.sh
+        (self.root / "scripts/check.sh").write_text("#!/usr/bin/env bash\necho '== ok: tests (0s)'\n")
+        ev = self.pr_dry_run()
+        self.assertEqual(ev["label"], "needs-human")
+        self.assertTrue(any("check.sh full" in r for r in ev["reasons"]), ev)  # base check.sh still fails
+        self.assertTrue(any("検証基盤" in r for r in ev["reasons"]), ev)
+
     def test_update_never_touches_project_files(self):
         cm = self.root / "CLAUDE.md"
         cm.write_text("# mine\n")

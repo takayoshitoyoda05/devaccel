@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.1 (2026-11-18)
+- devaccel-pr: 「変更は自分のチェックを変えられない」を徹底。check.sh は base ブランチ版で実行。検証基盤(check.sh・.claude/・.github/・CLAUDE.md・conftest・ツール設定)の変更と、既存テストの行削除は常に needs-human。自動マージは必須ステータスチェックつきのブランチ保護がある時だけ。
+
 ## 0.3.0 (2026-11-18)
 - 並列開発(Anthropic 式): devaccel-pr スキルと `hooks/devaccel_pr.py`。PR 本文を証拠(check.sh full・実動作確認・受け入れ条件・規模)から機械的に組み立て、`evidence-ok` / `needs-human` を理由つきで付与。`parallel.auto_merge`(既定 off)で evidence-ok を自動マージ。
 - settings 生成: `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3`、`.claude/worktrees/` を gitignore。
