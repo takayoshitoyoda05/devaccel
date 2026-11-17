@@ -10,7 +10,10 @@ Declarative rules (sudo, .env reads, edits to the checks themselves) live in
 
 from __future__ import annotations
 
+import fnmatch
+import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -43,10 +46,6 @@ DENY: list[tuple[re.Pattern, str]] = [
         re.compile(r"(^|[\s=:/<>(){},])\.env(?!\.example\b)(\.[\w-]+)?(?=$|[\s/;&|)<>(){},*?\[\]])"),
         ".env には触れないでください(.env.example は可)。",
     ),
-    (  # globs that could expand to .env without spelling it: .e*, .en?, .en[v], {.e,...}
-        re.compile(r"(?<![\w.-])\.e[\w.-]*[*?\[{]"),
-        ".env を含みうるワイルドカードは使わないでください。",
-    ),
 ]
 
 ASK: list[tuple[re.Pattern, str]] = [
@@ -68,7 +67,50 @@ def _compile_extra(patterns: list, label: str) -> list[tuple[re.Pattern, str]]:
     return out
 
 
-def decide(command: str, cfg: dict) -> tuple[str, str] | None:
+_ENV_NAME = re.compile(r"^\.env(\.[\w.-]+)?$")
+_GLOB = re.compile(r"[*?\[{]")
+
+
+def _secret_files(directory: Path) -> list[str]:
+    try:
+        return [n for n in os.listdir(directory) if _ENV_NAME.match(n) and n != ".env.example"]
+    except OSError:
+        return []
+
+
+def _expands_to_secret(command: str, cwd: Path) -> str | None:
+    """Expand glob-like words against the real directory instead of guessing with regexes.
+
+    Returns "deny" if a glob/brace word can match an existing .env* file, "ask" if a
+    dot-word is built from $var / `cmd` expansion (cannot be resolved statically).
+    """
+    try:
+        words = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        words = command.split()
+    for w in words:
+        for part in re.split(r"[=:<>();&|]", w):
+            if not part:
+                continue
+            head, base = os.path.split(part)
+            if ("$" in base or "`" in base) and base.startswith("."):
+                return "ask"
+            if not _GLOB.search(base):
+                continue
+            names = _secret_files((cwd / head) if head else cwd)
+            alts = [base]
+            m = re.search(r"\{([^{}]*)\}", base)
+            if m:  # one level of brace expansion is enough for a heuristic
+                alts = [base[: m.start()] + a + base[m.end():] for a in m.group(1).split(",")]
+            if any(fnmatch.fnmatchcase(n, a) for n in names for a in alts if a):
+                return "deny"
+    return None
+
+
+def decide(command: str, cfg: dict, cwd: Path | None = None) -> tuple[str, str] | None:
+    hit = _expands_to_secret(command, cwd or Path.cwd())
+    if hit == "deny":
+        return "deny", "このワイルドカードは .env に展開されます。.env には触れないでください。"
     command = command.replace('"', "").replace("'", "").replace("\\", "")  # rm -rf "/" -> rm -rf /
     extra = cfg.get("guard", {})
     deny = DENY + _compile_extra(extra.get("deny_regex", []), "guard.deny_regex")
@@ -79,6 +121,8 @@ def decide(command: str, cfg: dict) -> tuple[str, str] | None:
     for rx, why in ask:
         if rx.search(command):
             return "ask", why
+    if hit == "ask":
+        return "ask", "変数展開でドットファイル名を組み立てています。対象を確認してください。"
     return None
 
 
@@ -87,7 +131,8 @@ def main() -> int:
     command = (data.get("tool_input") or {}).get("command", "")
     if not command:
         return 0
-    verdict = decide(command, load_config(project_root(data)))
+    root = project_root(data)
+    verdict = decide(command, load_config(root), Path(data.get("cwd") or root))
     if verdict:
         decision, why = verdict
         emit(

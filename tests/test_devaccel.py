@@ -25,9 +25,28 @@ def sh(cwd: Path, *cmd: str, env: dict | None = None, stdin: str = "") -> subpro
 
 
 class GuardTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp())
+        for n in (".env", ".env.local", ".env.example", ".envrc", "a.py"):
+            (cls.dir / n).write_text("x")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir)
+
     def verdict(self, cmd: str):
-        v = guard.decide(cmd, DEFAULTS)
+        v = guard.decide(cmd, DEFAULTS, self.dir)
         return v[0] if v else None
+
+    def test_glob_expansion(self):
+        for cmd in ["cat .?nv", "cat ./.?nv*", "cat .[e]nv", "cat .e*", "cat {.env,x}",
+                    "cat .*", "head -1 .env.l*", "cat ./.e{n,x}v"]:
+            self.assertEqual(self.verdict(cmd), "deny", cmd)
+        for cmd in ["cat $X", "ls *.py", "cat .envr?", "cat .env.example"]:
+            self.assertIsNone(self.verdict(cmd), cmd)
+        self.assertEqual(self.verdict("cat .e$X"), "ask")
+        self.assertEqual(self.verdict("cat .`echo env`"), "ask")
 
     def test_deny(self):
         for cmd in ["rm -rf /", "rm -rf ~", "rm -fr .", "rm -rf *", "cd x && rm -rf ..",
