@@ -73,9 +73,11 @@ REMOTE = re.compile(
 )
 GH = re.compile(r"^\s*(?:\w+=\S*\s+)*" + WRAP + r"gh\s")
 OUTPUT_CMDS = re.compile(r"\bgit\s+" + GITOPT + r"(diff|log|show|format-patch|difftool|grep|stash\s+show)\b")
-# matched on quote/backslash-stripped text, any path: a modified copy must not run
+# matched on quote/backslash-stripped text. The scripts run only in these exact forms; merging is human-only.
 PR_SCRIPT = re.compile(r"devaccel_(?:pr|land)\b")
-LAND_MERGE = re.compile(r"devaccel_land\b.*\s-+m")  # --merge or any abbreviation
+PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s|$)")
+LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-run)?\s*$")
+READERS = re.compile(r"^\s*(?:cat|head|tail|less|grep|rg|sed -n|wc|diff|ls|git (?:diff|log|show|status|add|commit))\b")
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
 PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
 GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
@@ -152,8 +154,14 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         if not branch or branch in _protected_branches(cwd, cfg):
             return "deny", f"デフォルトブランチ({branch or 'detached HEAD'})へは push できません。作業ブランチを切ってください。"
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
-    if LAND_MERGE.search(flat):
-        return "deny", "devaccel_land.py --merge(マージ)は人が実行します。検証だけなら --merge なしで。"
+    for s in SEP.split(FD.sub(" ", flat)):
+        if not PR_SCRIPT.search(s) or READERS.search(s):
+            continue
+        if "devaccel_land" in s and not LAND_RUN.search(s):
+            return "deny", ("devaccel_land.py は `python3 .claude/hooks/devaccel_land.py [--dry-run]` の形だけ。"
+                            "--merge(マージ)は人が端末で実行します。")
+        if "devaccel_pr" in s and not PR_RUN.search(s):  # its arguments are harmless; the path is not
+            return "deny", "devaccel_pr.py は `python3 .claude/hooks/devaccel_pr.py ...` の形で直接実行してください。"
     if PR_SCRIPT.search(flat) and not _pr_script_intact(cwd, project):
         return "deny", "devaccel_pr.py / devaccel_land.py(または依存)が lock と一致しません。改変されたスクリプトは実行できません。"
     for s in segs:  # --output / --ext-diff (incl. abbreviations) only matter for these subcommands

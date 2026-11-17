@@ -116,8 +116,8 @@ def main() -> int:
         for p in prs:
             n, oid = p["number"], p["headRefOid"]
             # the label is only as good as the commit it was computed for
-            mark = re.search(r"devaccel:evidence base=\w* head=(\w+)", p.get("body") or "")
-            if not mark or mark.group(1) != oid:
+            marks = re.findall(r"<!-- devaccel:evidence base=\w* head=(\w+) -->\s*$", (p.get("body") or "").rstrip())
+            if not marks or marks[-1] != oid:  # the generated trailer is the last line
                 downgrade(p, "証拠と現在の head が一致しない(証拠の後に push された)。devaccel_pr.py を再実行")
                 continue
             fork_point = git(root, "merge-base", base_sha, oid).strip()  # the PR's own changes only

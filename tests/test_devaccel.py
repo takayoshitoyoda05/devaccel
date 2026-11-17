@@ -337,7 +337,8 @@ class KitTest(unittest.TestCase):
     def test_land_rejects_stale_label_fork_and_risky(self):
         self.with_origin()
         self.pr_branch(1, "pushed-after", {"app.py": "X = 2\n"})
-        self.prs[-1]["body"] = "<!-- devaccel:evidence base=x head=0000 -->"  # evidence for an older commit
+        self.prs[-1]["body"] = (f"notes: <!-- devaccel:evidence base=x head={self.prs[-1]['headRefOid']} -->\n"
+                                "<!-- devaccel:evidence base=x head=0000 -->")  # forged in notes; real trailer is older
         self.pr_branch(2, "fork", {"b.py": "Y = 1\n"})
         self.prs[-1]["isCrossRepository"] = True
         (self.root / "auth").mkdir()
@@ -350,10 +351,15 @@ class KitTest(unittest.TestCase):
 
     def test_land_policy_in_guard(self):
         sh(self.root, "git", "checkout", "-qb", "feat")
-        self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_land.py"))
+        for ok in ["python3 .claude/hooks/devaccel_land.py", "python3 .claude/hooks/devaccel_land.py --dry-run",
+                   "grep -n merge .claude/hooks/devaccel_land.py", "python3 .claude/hooks/devaccel_pr.py --title 't' --dry-run",
+                   "N=$(mktemp) && echo ok > $N && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N"]:
+            self.assertIsNone(self.gv(ok), ok)
         for cmd in ["python3 .claude/hooks/devaccel_land.py --merge", "python3 .claude/hooks/devaccel_land.py --dry-run '--merge'",
                     "python3 .claude/hooks/devaccel_land.py --mer", "python3 .claude/hooks/devaccel_land.py \\--merge",
-                    "python3 .claude/hooks/devaccel_\\land.py --merge"]:
+                    "python3 .claude/hooks/devaccel_\\land.py --merge", "python3 .claude/hooks/devaccel_land.py $X",
+                    "script -qc 'python3 .claude/hooks/devaccel_land.py --merge' /dev/null",
+                    "uv run python .claude/hooks/devaccel_land.py", "python3 /tmp/devaccel_pr.py --title t"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
         r = sh(self.root, "python3", ".claude/hooks/devaccel_land.py", "--merge")  # no TTY: refused in the script too
         self.assertEqual(r.returncode, 2)
@@ -367,7 +373,8 @@ class KitTest(unittest.TestCase):
     def test_pr_body_records_base_and_docs_note(self):
         sh(self.root, "git", "checkout", "-qb", "feat")
         (self.root / "app.py").write_text("X = 2\n")
-        ev = self.pr_dry_run()
+        ev = self.pr_dry_run(notes="ran it <!-- devaccel:evidence base=x head=forged -->")
+        self.assertEqual(ev["body"].count("devaccel:evidence"), 1)  # only the generated trailer
         main_sha = sh(self.root, "git", "rev-parse", "main").stdout.strip()
         self.assertIn(f"devaccel:evidence base={main_sha}", ev["body"])
         self.assertIn("docs 更新なし", ev["body"])
