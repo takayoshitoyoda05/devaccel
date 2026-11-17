@@ -193,10 +193,11 @@ def render_check(presets: list[str], runner: str) -> str:
 
 
 def render_settings(presets: list[str]) -> dict:
-    # exact subcommand + space: "git diff*" would also match "git difftool"
-    allow = ["Bash(scripts/check.sh *)", "Bash(git status)", "Bash(git status *)",
-             "Bash(git diff)", "Bash(git diff *)", "Bash(git log)", "Bash(git log *)",
-             "Bash(git show *)", "Bash(uv sync)", "Bash(uv sync *)"]
+    # Only narrow, known-safe git forms: git accepts abbreviated long options
+    # (--out= == --output=), so "git diff *" cannot be made safe by deny rules.
+    allow = ["Bash(scripts/check.sh *)", "Bash(git status)", "Bash(git status --short*)",
+             "Bash(git diff)", "Bash(git diff --stat*)", "Bash(git diff --name-only*)",
+             "Bash(git log --oneline*)", "Bash(git show --stat*)", "Bash(uv sync)"]
     for p in presets:
         for n in PRESETS[p]:
             allow += PIECES[n]["allow"]

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6 (2026-11-18)
+- settings 生成: git の自動許可を安全な形だけに限定(`git diff --stat` 等)。git は長いオプションの省略(`--out=`)を受け付けるため、`git diff *` は deny では守れない。
+- guard: `--output` / `--ext-diff` の省略形、`${IFS}` 区切り、`-c alias.*=` も拒否。
+- 既存プロジェクト: `.claude/settings.json` の `git diff *` / `git log *` / `git show *` の allow は手で削除を推奨(guard が補うが二重化のため)。
+
 ## 0.1.5 (2026-11-18)
 - guard: .env 検出を正規表現の列挙から「ワイルドカード・波括弧を実ディレクトリに展開して .env* に当たるか」に変更。`$`/バッククォートで組み立てたドットファイル名は確認に回す。
 

@@ -56,7 +56,8 @@ class GuardTest(unittest.TestCase):
                     "grep KEY .env", "python3 -c open('.env').read()", "cp .env /tmp/x",
                     "cat .env*", "cat {.env,}", "cat .env>x", "cat .e*", "cat .en?", "cat ./.en[v]",
                     "git diff --output=/home/u/.bashrc", "git log -p --ext-diff",
-                    "git -c core.pager=evil log"]:
+                    "git -c core.pager=evil log", "git diff --out=x", "git diff --outp x",
+                    "git log --ext", "git diff${IFS}--output=x", "git -calias.x=!sh x"]:
             self.assertEqual(self.verdict(cmd), "deny", cmd)
 
     def test_ask(self):
@@ -68,7 +69,8 @@ class GuardTest(unittest.TestCase):
         for cmd in ["rm -rf build", "rm -rf ./dist", "rm file.txt", "git push origin main",
                     "git push --force-with-lease", "git add src/a.py", "cat .env.example",
                     "uv run pytest", "ls -la", "echo sudoku", "source .venv/bin/activate",
-                    "cat .envrc", "pip install python-dotenv", "cp .env.example /tmp/x", "ls *.py", "git diff --stat", "git log --oneline -5",
+                    "cat .envrc", "pip install python-dotenv", "cp .env.example /tmp/x", "ls *.py", "git diff --stat", "git log --oneline -5", "git diff --no-ext-diff",
+                    "git log --oneline --output-indicator-new=+",
                     "git -c color.ui=false log"]:
             self.assertIsNone(self.verdict(cmd), cmd)
 
