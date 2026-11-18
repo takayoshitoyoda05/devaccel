@@ -1671,3 +1671,14 @@ class R13JobsPlanTest(unittest.TestCase):
         self.assertEqual(b.plan_jobs(12, 0, {"parallel": {"max_jobs": 3}}, 64000, 64)[0], 3)  # project cap
         self.assertEqual(b.plan_jobs(12, 7, cfg, 1000, 1)[0], 7)      # explicit --jobs wins
         self.assertEqual(b.plan_jobs(12, 0, {"parallel": {"unit_mem_mb": 1000}}, 8000, 16)[0], 6)  # heavy project
+
+
+class R14ContextTest(ReqKit):
+    def test_batch_inlines_small_named_files_only_inside_repo(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        (self.root / "big.py").write_text("x = 1\n" * 5000)
+        ctx = b.context_files(self.root, "use `app.py` and `big.py` and `../../etc/passwd.txt` and `nope.py`")
+        self.assertIn("--- app.py", ctx)
+        self.assertNotIn("big.py", ctx)
+        self.assertNotIn("passwd", ctx)

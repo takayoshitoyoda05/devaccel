@@ -45,6 +45,22 @@ def split_tasks(text: str) -> tuple[str, list[str]]:
     return head, items
 
 
+def context_files(root: Path, text: str, max_files: int = 3, max_bytes: int = 8192) -> str:
+    """Inline small existing files the task text names (`path/like.py`): the unit starts with the types and
+    helpers it must use instead of spending turns reading them (and guessing wrong)."""
+    out, seen = [], set()
+    for m in re.finditer(r"`([\w./-]+\.[A-Za-z]{1,5})`", text):
+        rel = m.group(1)
+        p = (root / rel).resolve()
+        if rel in seen or root.resolve() not in p.parents or not p.is_file() or p.stat().st_size > max_bytes:
+            continue
+        seen.add(rel)
+        out.append(f"--- {rel}(参考: 現在の内容)\n" + p.read_text(encoding="utf-8", errors="replace"))
+        if len(out) >= max_files:
+            break
+    return ("\n\n" + "\n\n".join(out)) if out else ""
+
+
 def mem_available_mb() -> int:
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -95,6 +111,7 @@ def main() -> int:
                     help="max concurrent units (0 = project.json parallel.max_jobs, else decided from this machine)")
     ap.add_argument("--model", default="", help="unit model (default: the devaccel-unit agent's model)")
     ap.add_argument("--effort", default="", help="unit effort (default: the devaccel-unit agent's)")
+    ap.add_argument("--no-context", action="store_true", help="do not inline the files the tasks name")
     ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
     ap.add_argument("--dry-run", action="store_true", help="split and show the units only")
@@ -132,7 +149,8 @@ def main() -> int:
     t0 = time.time()
     copies = max(1, a.hedge)
     for i, it in enumerate(items, 1):
-        prompt = (head + "\n\n" if head else "") + it + (
+        ctx = "" if a.no_context else context_files(root, head + "\n" + it)
+        prompt = (head + "\n\n" if head else "") + it + ctx + (
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
             "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
             "コミットはしない(ゲートを通った作業ツリーを devaccel_batch がコミットする)。")
