@@ -104,7 +104,7 @@ install が `.claude/settings.json` にサンドボックス設定を書く。�
   "failIfUnavailable": true,
   "allowUnsandboxedCommands": false,
   "filesystem": {
-    "denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg"],
+    "denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker/config.json", "~/.kube", "~/.npmrc", "~/.pypirc"],
     "allowWrite": ["~/.cache/pip", "~/.cache/pyright-python", "~/.cache/ruff", "~/.cache/uv"]
   },
   "network": { "allowedDomains": ["files.pythonhosted.org", "github.com", "pypi.org", "registry.npmjs.org"] }
@@ -113,7 +113,7 @@ install が `.claude/settings.json` にサンドボックス設定を書く。�
 - `failIfUnavailable: true` のため、bubblewrap/socat が無いと Claude Code は起動しない(黙って保護なしで動くより安全)。協業者にも初回のインストールを案内する。
 - `allowUnsandboxedCommands: false` で、Claude がサンドボックス外での再実行を求める抜け道を閉じる。
 - フックと Read/Edit ツールはサンドボックスの外で動く(Read の秘密は permissions が担当)。
-- 読み取りは既定で広い。ほかに守りたい場所は `denyRead` に**パスを直接**足す(`~/**/x` のようなホーム全体のグロブは Bash のたびに $HOME を走査して数秒〜十数秒遅くなる)。
+- 読み取りは既定で広い。ほかに守りたい場所は `denyRead` に**パスを直接**足す(`~/**/x` のようなホーム全体のグロブは Bash のたびに $HOME を走査して数秒〜十数秒遅くなる)。そのため**他のプロジェクトの `.env` は守られない**(速度との引き換え。気になるなら秘密は `~/.config/<app>/` 等にまとめて直接指定)。`~/.config/gh` は PR 作成と push に必要なので読める(D12)。
 
 ## 開発
 
