@@ -76,9 +76,10 @@ REMOTE = re.compile(
 GH = re.compile(r"^\s*(?:\w+=\S*\s+)*" + WRAP + r"gh\s")
 OUTPUT_CMDS = re.compile(r"\bgit\s+" + GITOPT + r"(diff|log|show|format-patch|difftool|grep|stash\s+show)\b")
 # matched on quote/backslash-stripped text. The scripts run only in these exact forms; merging is human-only.
-PR_SCRIPT = re.compile(r"devaccel_(?:pr|land)\b")
+PR_SCRIPT = re.compile(r"devaccel_(?:pr|land|ship)\b")
 # no expansions or redirections: $(...) in an argument runs after the lock check (TOCTOU)
 PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s[^`$<>]*)?\s*$")
+SHIP_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_ship\.py(?:\s[^`$<>]*)?\s*$")  # pushes: lock-checked
 LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-run)?\s*$")
 # reads that cannot execute anything (no sed/less/rg: they have exec escapes)
 READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status))\s[^`$<>]*$")
@@ -92,7 +93,7 @@ GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|
                     r"gist|ssh-key|gpg-key|ruleset|cache|codespace|extension|alias)\b")
 LAUNCHER = re.compile(r"(?<![\w./-])(?:eval|exec|xargs|(?:ba|z|da)?sh\s+-\w*c|python3?\s+-c|perl\s+-e|"
                       r"node\s+-e|ruby\s+-e|find\b[^;&|\n]*-exec)\b")
-PR_FILES = ("devaccel_pr.py", "devaccel_land.py", "devaccel_common.py", "stop_gate.py")
+PR_FILES = ("devaccel_pr.py", "devaccel_land.py", "devaccel_ship.py", "devaccel_common.py", "stop_gate.py")
 
 
 def _segments(command: str) -> list[str]:
@@ -190,6 +191,8 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         if "devaccel_land" in s and not LAND_RUN.search(s):
             return "deny", ("devaccel_land.py は `python3 .claude/hooks/devaccel_land.py [--dry-run]` の形だけ。"
                             "--merge(マージ)は人が端末で実行します。")
+        if "devaccel_ship" in s and not SHIP_RUN.search(s):
+            return "deny", "devaccel_ship.py は `python3 .claude/hooks/devaccel_ship.py ...` の形で直接実行してください。"
         if "devaccel_pr" in s and not PR_RUN.search(s):  # its arguments are harmless; the path is not
             return "deny", "devaccel_pr.py は `python3 .claude/hooks/devaccel_pr.py ...` の形で直接実行してください。"
     if PR_SCRIPT.search(flat) and not _pr_script_intact(cwd, project):

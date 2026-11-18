@@ -44,7 +44,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `~/devaccel/protect.sh` | base ブランチの保護(人が実行、確認あり) |
 | `/devaccel-setup` | 初回生成(CLAUDE.md・verify-app・計測)。`--redetect` |
 | `/devaccel-tune` | ゲート記録と PR 振り分けから追加・削除・調整を提案(承認後に適用) |
-| `/devaccel-batch` | 独立した S/M が多数(目安 5 件以上・各数分以上)のとき、コンテキストパックつきで `/batch` を呼ぶ。小さな作業 4 件では逐次のほうが速く安かった(D14) |
+| `/devaccel-batch` | 大きな独立作業の束を、作業単位(haiku)で並列に実装し、`devaccel_ship.py --units` で統合して PR 1 本にする。既定は逐次(D14) |
 
 ## 導入されるもの
 
@@ -54,6 +54,8 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `.claude/hooks/stop_gate.py` | core | 終了時に `check.sh fast`。失敗段だけ返す・3 ラウンドで人に報告・L/テスト弱体化を表示 |
 | `.claude/skills/devaccel-{setup,tune,batch}` | core | 手動専用(説明は常駐しない) |
 | `.claude/skills/devaccel-pr` + `hooks/devaccel_pr.py` | core | 証拠つき PR と `evidence-ok` / `needs-human` の振り分け |
+| `hooks/devaccel_ship.py` | core | コミット・push・証拠つき PR を 1 コマンドで(`--units` で並列単位を統合) |
+| `agents/devaccel-unit.md` | core | 並列の作業単位(haiku・worktree・実装のみ) |
 | `hooks/devaccel_land.py` | core | 並列 PR を最新 base 上でまとめて再検証し、通ったものをマージ(人が実行) |
 | `hooks/devaccel_common.py`・`hooks/devaccel_report.py` | core | 共通処理(隔離実行を含む)・ゲート記録の要約(doctor / tune) |
 | `.worktreeinclude`・`docs/design/TEMPLATE.md`・`docs/adr/TEMPLATE.md` | project | worktree に持ち込むファイル・設計書と ADR のひな形 |
@@ -86,13 +88,13 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 
 検証ループ(ゲート・verify-app・仕様照合)で 1 本の作業を信頼できるものにし、それを並列に回して、人は振り分けられた PR だけを読む。
 
-1. 独立した S/M 作業の大きな束(目安 5 件以上)を `/devaccel-batch <一覧>` に渡す。コンテキストパックと単位向けの注意を付けて公式 `/batch` を呼ぶ(単位ごとに worktree で並列実装)。L は並列化せず design スキルで 1 本ずつ。
-2. 各単位は devaccel-pr スキルで PR を作る。本文はスクリプトが機械的に組み立てる証拠: `check.sh full` の結果、実動作確認の記録、受け入れ条件、変更規模。
+1. **既定は逐次**: 1 セッションで順に実装し、`devaccel-pr`(`devaccel_ship.py` で コミット・push・証拠つき PR を 1 コマンド)で 1 本にする。小さな作業 4 件では逐次のほうが並列より速く安かった(D14)。
+2. 大きな独立作業の束(逐次で 5 分を超えそう・4 件以上・ファイルの重なりなし)は `/devaccel-batch <一覧>`: 作業単位 `devaccel-unit`(haiku・worktree)が実装・テスト・コミットだけを並列に行い、親が `devaccel_ship.py --units` で統合(衝突した単位は外す)→ base の check.sh を 1 回 → PR 1 本。本文はスクリプトが機械的に組み立てる証拠: `check.sh full` の結果、実動作確認の記録、受け入れ条件、変更規模、統合した/外した単位。L は並列化せず design スキルで 1 本ずつ。
 3. ラベルで振り分け:
    - `evidence-ok`: 検査通過・実動作確認あり・S/M・リスクのあるパスなし → 証拠だけ見てマージ
    - `needs-human`: 理由つき(検査失敗、確認なし、L 規模、risky_paths、テスト削除/skip、ゲートの判断依頼、未チェックの受け入れ条件) → 差分を読む
 4. 任意: `.claude/project.json` の `"parallel": {"auto_merge": true}` で `evidence-ok` を自動マージ(GitHub 側で auto-merge を許可し、`check` ワークフローを必須チェックにしたブランチ保護が必要)。最初は off で振り分けの精度を見て、evidence-ok のリバートが出ない期間が続いてから。
-5. 押し出しの規則(guard が強制): push は作業ブランチから `git push origin HEAD` のみ(main/master・デフォルトブランチ・force・他リモート不可)。`gh` は直接使えず、PR は lock と一致する `devaccel_pr.py` だけが作る。サンドボックス内のコマンドは確認なしで動く(`autoAllowBashIfSandboxed`)ので、並列の単位が確認待ちで止まらない。**本当の境界は GitHub 側**: guard は文字列判定の best-effort(`bash -c` 等の経由も拒否するが、完全ではない)。デフォルトブランチを保護する(PR 必須・force push 禁止・`check` を必須チェック)のが最後の砦で、`~/devaccel/protect.sh`(人が実行、確認あり)で設定できる。Claude も同じアカウントで動くため「承認必須」は個人開発では自分を締め出すだけなので入れない。サーバーが保証するのは「main に直接入らない・CI が赤いものはマージできない」まで。プランによっては非公開リポジトリでブランチ保護が使えないので、その場合は guard と PR 判定のみが頼り。より厳密にするなら、push と PR 作成だけができる fine-grained token を使う。
+5. 押し出しの規則: push は作業ブランチから origin の同名ブランチへだけ(main/master・デフォルトブランチ・force・他リモート不可)。シェルの `git push origin HEAD` は guard が、`devaccel_ship.py` の push はスクリプト自身が同じ規則で検査する。`gh` は直接使えず、PR は lock と一致する `devaccel_pr.py` / `devaccel_ship.py` だけが作る。サンドボックス内のコマンドは確認なしで動く(`autoAllowBashIfSandboxed`)ので、並列の単位が確認待ちで止まらない。**本当の境界は GitHub 側**: guard は文字列判定の best-effort(`bash -c` 等の経由も拒否するが、完全ではない)。デフォルトブランチを保護する(PR 必須・force push 禁止・`check` を必須チェック)のが最後の砦で、`~/devaccel/protect.sh`(人が実行、確認あり)で設定できる。Claude も同じアカウントで動くため「承認必須」は個人開発では自分を締め出すだけなので入れない。サーバーが保証するのは「main に直接入らない・CI が赤いものはマージできない」まで。プランによっては非公開リポジトリでブランチ保護が使えないので、その場合は guard と PR 判定のみが頼り。より厳密にするなら、push と PR 作成だけができる fine-grained token を使う。
 6. **統合(land)**: 各 PR の証拠は分岐時点の base に対するもの。兄弟 PR が先に入ると古くなる(テキスト衝突、「単独では緑・合わせると赤」)。マージは `python3 .claude/hooks/devaccel_land.py --merge`(人が実行)で行う: `evidence-ok` の PR をコード → docs の順に最新 base へ一時 worktree で 1 本ずつ合わせ、そのつど base 側の `check.sh full` を実行。衝突・失敗した PR は理由つきで `needs-human` に落とし(昇格はしない)、通った PR を squash merge する(検証した木 = マージ後の木。途中で base が動いたら止まる)。`--merge` なしは検証と降格だけ、`--dry-run` は何も変えない。重なるファイルを持つ PR は最初に表示される。落ちた PR は担当の作業ツリーで `git merge origin/main` → push → devaccel-pr 再実行で直す(force push 不要)。
 7. 並列度は settings.json の `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`(既定 3)。単位(サブエージェント)のモデルは `CLAUDE_CODE_SUBAGENT_MODEL`(既定 `sonnet`。単位は親のキャッシュを共有しないので単価が効く。計画役のメインは自分のモデルのまま)。並列数だけトークンも増える(公式)。`/devaccel-tune` が PR の振り分け実績(件数・マージ・リバート)を見て閾値を調整する。
 

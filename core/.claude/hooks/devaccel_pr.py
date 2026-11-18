@@ -159,7 +159,8 @@ def _pytest_collected(check_text: str, workdir: Path, sandbox: bool, timeout: in
     return int(m2.group(1))
 
 
-def static_triage(root: Path, cfg: dict, base: str, ref: str) -> tuple[list[str], list[str], list[str]]:
+def static_triage(root: Path, cfg: dict, base: str, ref: str,
+                  units: int = 1) -> tuple[list[str], list[str], list[str]]:
     """Diff-only reasons (no execution). Shared with devaccel_land.py, which re-applies them."""
     rng = f"{base}..{ref}"
     files = [f for f in git(root, "diff", "--no-renames", "--name-only", rng).splitlines() if f]
@@ -181,7 +182,8 @@ def static_triage(root: Path, cfg: dict, base: str, ref: str) -> tuple[list[str]
             if not d or not d[1].isdigit() or int(d[1]) > 0:  # "-" (binary) counts as shrunk
                 tests_shrunk.append(path)
     reasons = []
-    if len(files) > scale["large_if_files_over"]:
+    # a PR integrating N parallel units may touch N small units' worth of files (capped at 15)
+    if len(files) > min(int(scale["large_if_files_over"]) * max(1, units), 15):
         reasons.append(f"L 規模({len(files)} ファイル)")
     if risky:
         reasons.append("リスクのあるパス: " + ", ".join(risky[:5]))
@@ -198,12 +200,12 @@ def static_triage(root: Path, cfg: dict, base: str, ref: str) -> tuple[list[str]
     return files, reasons, risky
 
 
-def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
+def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1) -> dict:
     head = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
     git(root, "fetch", "-q", "origin", base_branch)  # best effort: judge against the latest base
     base = (git(root, "merge-base", "HEAD", f"origin/{base_branch}").strip()
             or git(root, "merge-base", "HEAD", base_branch).strip())
-    files, static, risky = static_triage(root, cfg, base, "HEAD")
+    files, static, risky = static_triage(root, cfg, base, "HEAD", units)
     stat = git(root, "diff", "--shortstat", f"{base}..HEAD").strip()
     designs = [f for f in files if f.startswith("docs/design/") and f.endswith(".md") and "TEMPLATE" not in f]
     acs: list[str] = []
@@ -311,8 +313,12 @@ def main() -> int:
     ap.add_argument("--verify-notes", default="", help="file with what was run and observed")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
-
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
+    return open_pr(root, a.title, read_notes(a.verify_notes, root), a.dry_run)
+
+
+def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1) -> int:
+    """Build the evidence for HEAD, triage it, and create/update the PR (shared with devaccel_ship.py)."""
     cfg = load_config(trusted_root({"cwd": str(root)}))  # never the unit's own project.json
     par = cfg.get("parallel", {})
     if git(root, "status", "--porcelain", "--untracked-files=no").strip():
@@ -323,13 +329,12 @@ def main() -> int:
     if not head or head in protected:
         print(f"refusing to open a PR from {head or 'detached HEAD'}: use a work branch", file=sys.stderr)
         return 2
-    notes = read_notes(a.verify_notes, root)
-    ev = collect(root, cfg, cfg["scale"]["base_branch"], notes)
+    ev = collect(root, cfg, cfg["scale"]["base_branch"], notes, units)
     body = render(ev, notes)
     if SECRET.search(body):  # check output and acceptance criteria end up in the body too
         print("PR body looks like it contains a credential (check output / notes); refused", file=sys.stderr)
         return 2
-    if a.dry_run:
+    if dry_run:
         print(body)
         print(json.dumps({"label": ev["label"], "reasons": ev["reasons"]}, ensure_ascii=False))
         return 0
@@ -369,7 +374,7 @@ def main() -> int:
                      "--add-label", ev["label"], "--remove-label", other], root)
             url = existing["url"]
         else:
-            r = run(["gh", "pr", "create", "-R", repo, "--base", ev["base"], "--head", ev["head"], "--title", a.title,
+            r = run(["gh", "pr", "create", "-R", repo, "--base", ev["base"], "--head", ev["head"], "--title", title,
                      "--body-file", f.name, "--label", ev["label"]], root)
             url = r.stdout.strip().splitlines()[-1] if r.returncode == 0 else ""
     finally:

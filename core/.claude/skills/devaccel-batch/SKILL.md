@@ -1,6 +1,6 @@
 ---
 name: devaccel-batch
-description: 独立した S/M 作業の束を /batch で並列に実装し、各単位を証拠つき PR にする(人は land で統合を確かめてマージ)。
+description: 独立した作業の大きな束を、作業単位(devaccel-unit、haiku)で並列に実装し、親が機械的に統合して証拠つき PR を 1 本にする。
 disable-model-invocation: true
 ---
 
@@ -8,16 +8,15 @@ disable-model-invocation: true
 
 引数: やることの一覧(1 行 1 件)。
 
-## 使う条件
-- 独立した S/M が **多数**(目安 5 件以上、かつ各件が数分以上かかる規模)。実測では小さな作業 4 件で逐次 93 秒・$0.24、並列 129 秒・$0.80 と、並列のほうが遅く高かった(単位は親のキャッシュを共有せず、PR・検査の固定費がかかる)。迷ったら 1 セッションで順に。L は並列化しない(design スキルで 1 本ずつ)。
-- 編集ファイルが重なる作業は同じ単位にまとめる。重なりは land で衝突になる。
+## 使う条件(実測: docs/design.md D14)
+- **既定は逐次**(1 セッションで順に実装し devaccel-pr で 1 本)。小さな作業 4 件では逐次 93 秒・$0.24 に対し、単位ごとに PR を作る並列は 129 秒・$0.80 だった。
+- 並列にするのは: 逐次だと 5 分を超えそうで、4 件以上あり、編集ファイルが重ならないときだけ。L は並列化しない(design スキル)。
 
 ## 手順
-1. `git fetch origin`(古い base から始めると land で落ちる)。
-2. 各単位の **コンテキストパック** を作る: 編集するファイル / 読むべき参照 / 受け入れ条件 / 実行するテスト / 範囲外。README・docs は振る舞いを変えた単位自身が更新する。
-3. `/batch` を呼ぶ。各単位への指示に次を必ず埋め込む:
-   - 「Bash は単純なコマンドを 1 つずつ(`$(...)`・`$変数`・ループ・ヒアドキュメント・`cd` は使わない。単位では確認できず拒否される)。ファイルは Write/Edit で作る」
-   - 「最後に devaccel-pr スキルで PR にする」
-4. 終わったら PR の URL とラベルを一覧にし、ユーザーに次を伝える:
-   - 統合の確認とマージは人が端末で `python3 .claude/hooks/devaccel_land.py --merge`(evidence-ok を最新 base 上で 1 本ずつ再検証)。
-   - `needs-human` は理由を読む。衝突で落ちた単位は、その worktree で `git merge origin/<base>` → 解消 → push → devaccel-pr 再実行。
+1. `git fetch origin` → 作業ブランチを切る(`git switch -c batch/<名前> origin/<base>`)。
+2. 各単位の **コンテキストパック** を作る: 編集するファイル / 読むべき参照 / 受け入れ条件 / 実行するテスト / 範囲外。README・docs を変えるなら担当を 1 単位に決める。
+3. Agent ツールで `devaccel-unit` を **単位の数だけ同じメッセージで** 起動する(並列に走る)。各単位の返事の `branch:` を控える。
+4. `.devaccel/ship.md` に Write(1 行目 = 題名、以降 = 各単位の確認メモの要約)し、単独のコマンドで:
+   `python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md --units <branch1> <branch2> ...`
+   - 単位のブランチを `--no-ff` で統合(衝突した単位は外して報告)→ base の check.sh を 1 回 → push → PR 1 本。
+5. 統合後の差分を受け入れ条件と照合し、URL・ラベル・外した単位をユーザーに報告する。マージは人(`devaccel_land.py --merge` か GitHub)。

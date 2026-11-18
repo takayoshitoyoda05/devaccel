@@ -1,6 +1,6 @@
 # devaccel 要求仕様
 
-対象: devaccel 0.10.0(初版は 0.8.4 時点。0.9.0・0.10.0 の監査で追記)。作成 2026-11-18。
+対象: devaccel 0.11.0(初版は 0.8.4 時点。0.9.0・0.10.0 の監査で追記)。作成 2026-11-18。
 出典: README.md、docs/design.md(D1〜D15)、CHANGELOG.md、seed/CLAUDE.md、各 SKILL.md、kit/devaccel.py、core/.claude/hooks/*.py。tests/ は読まずに書いた(テストとの対応付けは別の担当が独立に行う)。
 
 ## 1. 前提
@@ -162,6 +162,11 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | PR-10 | 既存 PR が `needs-human` で、ブランチが最新の base を取り込んでいない間は、再実行しても `evidence-ok` に戻してはならない。 | 0.5.0 | integration(gh を偽装) |
 | PR-11 | `--dry-run` は GitHub を一切変更せず本文とラベルを出力しなければならず、`gh` の呼び出しは origin の設定から得た `-R owner/repo` に固定しなければならない。自動マージは既定で無効、有効でも `evidence-ok` かつ base に必須ステータスチェックがあるときだけ設定しなければならない。 | 0.3.1、0.4.0、D11 | unit(gh を偽装) |
 | PR-12 | 振り分けはリネーム・非 ASCII のパス・ファイル種別の変更・`.gitattributes` による差分抑止に影響されてはならない。ツール/テスト設定ファイル(`pyproject.toml`、`.gitattributes`、入れ子の ruff/pytest/pyright 設定ほか)の変更はすべて needs-human。pytest を使う check.sh で 1 件も passed が無ければ失敗扱い。PR 本文に認証情報らしき文字列が入るなら作成を拒否しなければならない。自動マージは検証した head に固定しなければならない。 | 0.10.0 監査 H2/H5 | unit |
+| SHIP-01 | `devaccel_ship.py` は 1 回の実行で、追跡済みの変更と `--paths` の新規ファイル(`-A` はしない)をコミットし、作業ブランチを origin へ push し、`devaccel_pr` と同じ証拠・振り分けで PR を作成/更新しなければならない。題名は `ship.md` の 1 行目、確認メモは 2 行目以降(`--verify-notes` と同じ制限)。 | 0.11.0 | unit |
+| SHIP-02 | ship は main/master/base/origin HEAD/detached では何もコミット・push してはならない。push 先は origin の同名ブランチだけで、force してはならない。`--paths` はリポジトリ内の相対パスに限る。 | 0.11.0 | unit |
+| SHIP-03 | `--units` は各単位のローカルブランチを `--no-ff` で統合し、衝突した単位は外して PR 本文に明記し、統合後の木に対して base の check.sh を 1 回だけ実行しなければならない。 | 0.11.0 | unit |
+| SHIP-04 | 統合した PR の L 規模判定は `large_if_files_over × 統合した単位数`(上限 15)でなければならない。他の振り分け規則は全差分のまま。 | 0.11.0 | unit |
+| SHIP-05 | guard は ship を `python3 .claude/hooks/devaccel_ship.py …` の単独実行・展開なし・lock 一致の場合だけ許可しなければならない(PR スクリプトと同じ扱い)。 | 0.11.0 | unit |
 
 ### 2.8 LAND(`devaccel_land.py`)
 

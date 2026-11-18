@@ -287,7 +287,7 @@ class SettingsTest(ReqKit):
         for d in ["github.com", "api.github.com", "pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]:
             self.assertIn(d, doms)
         self.assertIn("~/.cache/uv", st["sandbox"]["filesystem"]["allowWrite"])
-        self.assertEqual(st["env"]["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"], "3")
+        self.assertEqual(st["env"]["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"], "8")  # 0.11.0: implement-only units are cheap (haiku); waves of 3 slowed 4-unit batches
         self.assertEqual(st["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "sonnet")
 
 
@@ -1453,3 +1453,83 @@ class R5GuardTitleTest(ReqKit):
         for cmd in ["PYTHONPATH=.devaccel python3 .claude/hooks/devaccel_pr.py --title x",
                     "export PATH=x; python3 .claude/hooks/devaccel_pr.py --title x"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
+
+
+class R6ShipTest(ReqKit):
+    """SHIP-01..05 (0.11.0): one-command commit + push + evidence PR, and single-PR integration of units."""
+    land = td.KitTest.land
+
+    def notes(self, title: str = "Add thing", body: str = "ran it -> ok") -> str:
+        d = self.root / ".devaccel"
+        d.mkdir(exist_ok=True)
+        (d / "ship.md").write_text(f"{title}\n{body}\n")
+        return ".devaccel/ship.md"
+
+    def test_SHIP01_sequential_commit_push_pr(self):
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        (self.root / "new.py").write_text("Y = 1\n")
+        r, log = self.land("--file", self.notes(), "--paths", "new.py", script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pr create", log)
+        self.assertIn("--title Add thing", log)
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain", "--untracked-files=no").stdout.strip(), "")
+        self.assertIn("new.py", sh(self.root, "git", "show", "--name-only", "HEAD").stdout)
+        remote = sh(self.root, "git", "ls-remote", "origin", "refs/heads/feat").stdout.split()
+        self.assertEqual(remote[0], sh(self.root, "git", "rev-parse", "HEAD").stdout.strip())
+
+    def test_SHIP02_refuses_protected_branch_and_bad_paths(self):
+        self.with_origin()
+        before = sh(self.root, "git", "ls-remote", "origin", "refs/heads/main").stdout.split()[0]
+        (self.root / "app.py").write_text("X = 7\n")
+        r, log = self.land("--file", self.notes(), script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 2)
+        self.assertNotIn("pr create", log)
+        after = sh(self.root, "git", "ls-remote", "origin", "refs/heads/main").stdout.split()[0]
+        self.assertEqual(before, after)  # nothing pushed to main
+        sh(self.root, "git", "checkout", "-q", "--", "app.py")
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        r, _ = self.land("--file", self.notes(), "--paths", "../outside", script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 2)
+
+    def test_SHIP03_units_integrated_conflicts_skipped(self):
+        self.with_origin()
+        for name, files in [("u1", {"a.py": "A = 1\n"}), ("u2", {"b.py": "B = 1\n"}), ("u3", {"a.py": "A = 9\n"})]:
+            sh(self.root, "git", "checkout", "-qB", name, "main")
+            for f, t in files.items():
+                (self.root / f).write_text(t)
+                sh(self.root, "git", "add", f)
+            self.commit(name)
+        sh(self.root, "git", "checkout", "-qb", "batch/x", "main")
+        r, log = self.land("--file", self.notes("Batch"), "--units", "u1", "u2", "u3", "--dry-run",
+                           script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("統合した単位: u1, u2", r.stdout)
+        self.assertIn("u3 (conflict)", r.stdout)
+        self.assertTrue((self.root / "a.py").exists() and (self.root / "b.py").exists())
+
+    def test_SHIP04_large_threshold_scales_with_units(self):
+        """Integrating 3 units of 2 files each (6 files) is not 'L' when 3 units were merged; it is for 1 unit."""
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_pr
+        cfg = json.loads(json.dumps(DEFAULTS))
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        for i in range(6):
+            (self.root / f"m{i}.py").write_text("Z = 1\n")
+        self.commit("six")
+        base = sh(self.root, "git", "rev-parse", "main").stdout.strip()
+        one = devaccel_pr.static_triage(self.root, cfg, base, "HEAD", 1)[1]
+        three = devaccel_pr.static_triage(self.root, cfg, base, "HEAD", 3)[1]
+        self.assertTrue(any("L 規模" in x for x in one))
+        self.assertFalse(any("L 規模" in x for x in three))
+
+    def test_SHIP05_guard_forms(self):
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md --paths a.py"))
+        for cmd in ["python3 /tmp/devaccel_ship.py --file x", "true && python3 .claude/hooks/devaccel_ship.py --file x",
+                    "python3 .claude/hooks/devaccel_ship.py --file $(cat y)"]:
+            self.assertEqual(self.gv(cmd), "deny", cmd)
+        p = self.root / ".claude/hooks/devaccel_ship.py"
+        p.write_text(p.read_text() + "\n# hack\n")
+        self.assertEqual(self.gv("python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md"), "deny")

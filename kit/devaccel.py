@@ -250,7 +250,7 @@ def render_settings(presets: list[str]) -> dict:
              "Bash(git show --stat)", "Bash(uv sync)",
              # parallel-PR flow (guard enforces: work branch only, origin only, verified script)
              "Bash(git add *)", "Bash(git commit *)", "Bash(git push origin HEAD)",
-             "Bash(python3 .claude/hooks/devaccel_pr.py *)"]
+             "Bash(python3 .claude/hooks/devaccel_pr.py *)", "Bash(python3 .claude/hooks/devaccel_ship.py *)"]
     for p in presets:
         for n in PRESETS[p]:
             allow += PIECES[n]["allow"]
@@ -265,7 +265,7 @@ def render_settings(presets: list[str]) -> dict:
         # parallel subagents (/batch units) multiply token use: cap concurrency (official default 20)
         # subagents (/batch units, Explore) default to sonnet: units start cold (no shared cache),
         # so per-unit price dominates. The planner/main session keeps your model.
-        "env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3", "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
+        "env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "8", "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
         "sandbox": sandbox,
         "permissions": {
             "allow": allow,
