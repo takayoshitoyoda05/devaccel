@@ -82,6 +82,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | DOC-01 | doctor は problem が 1 つ以上あれば終了コード 1、無ければ `OK` と 0 を返し、導入先のファイルを変更してはならない。 | README | unit |
 | DOC-02 | doctor は core ファイルの欠落と手編集(lock とのハッシュ不一致)を problem として報告しなければならない。 | D9 | unit |
 | DOC-03 | doctor は guard / stop_gate / `SubagentStop` の未配線を problem(終了コード 1)とし、`SubagentStop` には追記すべき設定を示さなければならない。 | 0.6.0, 0.9.0 | unit |
+| DOC-09 | doctor は devaccel の core(`.claude/hooks`・`.claude/skills`・lock)が未コミットなら problem にしなければならない(/batch の worktree は HEAD から作られ、ロックと合わずに PR 手順が拒否される)。 | 0.9.0 | unit |
 | DOC-04 | doctor は次を problem として報告しなければならない: サンドボックス無効、bubblewrap / socat の欠如、`~/` で始まりグロブ `**` を含む `denyRead`、`Read(/uv.lock)`・`Read(/.venv/**)`・`Read(/.claude/worktrees/**)` の deny、`Bash(git push*)` の ask、許可ドメインに `api.github.com` が無いこと。 | 0.2.0、0.4.0、0.6.4、0.7.2、0.8.1 | unit |
 | DOC-05 | doctor は次を problem として報告しなければならない: `check.sh` の欠如・実行不可、`.claude/state/` と `.devaccel/` が gitignore されていないこと、`CLAUDE.md` の行数が `budget.claude_md_max_lines` を超えていること、Python プリセットで ruff・pyright・pytest が見つからないこと。 | 0.7.1、D10 | unit |
 | DOC-06 | doctor は未記入の `devaccel:fill` 目印を表示し、記入済みの `devaccel:filled` を未記入と判定してはならない。 | 0.1.3 | unit |

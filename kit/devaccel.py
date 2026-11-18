@@ -519,6 +519,10 @@ def cmd_doctor(root: Path) -> int:
        'replace with explicit paths (~/.ssh, ~/.aws, ~/.gnupg, ~/.netrc, ... see render_settings, CHANGELOG 0.8.2)')
     ok(not bad_denies, f"settings deny {bad_denies} breaks git/uv/worktrees under the sandbox",
        "remove them from .claude/settings.json (CHANGELOG 0.7.2)")
+    dirty_core = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--", ".claude/hooks",
+                                 ".claude/skills", ".claude/devaccel.lock"], capture_output=True, text=True).stdout.strip()
+    ok(not dirty_core, "devaccel core files are not committed: /batch worktrees start from HEAD, so their "
+       "scripts would not match the lock and the PR step is refused", "commit .claude/ (e.g. after update.sh)")
     if "stop_gate.py" not in json.dumps(wired.get("SubagentStop", [])):
         problems.append("SubagentStop is not wired: the gate does not run inside /batch units. Add to hooks:\n"
                      + json.dumps({"SubagentStop": render_settings(["python"])["hooks"]["SubagentStop"]}))

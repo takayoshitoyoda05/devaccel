@@ -7,6 +7,7 @@
 - テスト 34 → 84 本(`tests/test_requirements.py`)。各テストは、対応するコードをわざと壊すと失敗することを確認済み(65 通り)。空振りしていたテスト 2 本を修正。
 - 食い違いの修正: 単位ではコミット済み・未マージの変更も検査、enforce で検査できなかった場合を表示・記録、`DEVACCEL_GATE_MODE` は対話セッションだけ、land は本体の設定を読む、install は衝突を全部調べてから書く、update は新しく core になるパスの利用者ファイルを上書きしない、`SubagentStop` 未配線は doctor の problem。
 - guard: PR スクリプトの実行に展開・リダイレクトを禁止(ロック照合後の差し替え対策)。
+- doctor: devaccel の core が未コミットなら problem(/batch の worktree は HEAD から作られ、ロックと合わず PR 手順が拒否される。リリース前スモークで発見)。
 - python3 の最低版を 3.10 に(CI で 3.10 と 3.12)。スモークの Bash 遅延の上限を 2 秒に。
 
 ## 0.8.4 (2026-11-18)

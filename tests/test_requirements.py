@@ -439,6 +439,11 @@ class DoctorTest(ReqKit):
         self.assertEqual(rc, 1, out)
         self.assertTrue(any(ln.startswith("✗ ") and msg in ln for ln in out.splitlines()), (msg, out))
 
+    def test_DOC_09_uncommitted_core(self):
+        """DOC-09: core files changed but not committed (e.g. right after update.sh) is a problem."""
+        self.mutate(".claude/hooks/devaccel_report.py", lambda p: p.write_text(p.read_text() + "\n"))
+        self.assertProblem("core files are not committed")
+
     def test_DOC01_clean_ok_problem_rc1_and_read_only(self):
         """DOC-01: clean install -> `OK` and rc 0, files untouched; any problem -> rc 1."""
         before = tree_hash(self.root)
@@ -450,7 +455,7 @@ class DoctorTest(ReqKit):
         (self.root / ".claude/hooks/devaccel_report.py").unlink()
         rc, out = self.doctor()
         self.assertEqual(rc, 1, out)
-        self.assertIn("1 problem(s)", out)
+        self.assertIn("core file missing", out)  # (also reported as uncommitted core: DOC-09)
 
     def test_DOC02_missing_and_hand_edited_core(self):
         """DOC-02: a missing core file and a hand-edited one are problems."""
