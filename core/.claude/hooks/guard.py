@@ -219,11 +219,16 @@ def _compile_extra(patterns: list, label: str) -> list[tuple[re.Pattern, str]]:
 
 # A plain quoted commit message is data, not a command ("Add push docs" must not trip the push rule).
 # Only messages without $ or backticks are blanked: those would be expanded by the shell.
-_COMMIT_MSG = re.compile(r"""(\bgit\s+commit\b[^;&|]*?(?:-m|--message)[= ]?\s*)("[^"$`\\]*"|'[^']*')""")
+# Only when the WHOLE command is one plain `git commit [flags] -m "msg" [flags]`: blanking a quoted span
+# inside a longer command would let `echo 'git commit -m ' ; sudo x ; echo '` hide the middle command.
+_COMMIT_MSG = re.compile(r"""\s*git\s+commit((?:\s+-[A-Za-z-]+)*)\s+(?:-m|--message)[= ]?\s*"""
+                         r"""("[^"$`\\\n]*"|'[^'\n]*')((?:\s+-[A-Za-z-]+)*)\s*""")
 
 
 def decide(command: str, cfg: dict, cwd: Path | None = None, project: Path | None = None) -> tuple[str, str] | None:
-    command = _COMMIT_MSG.sub(lambda m: m.group(1) + '"msg"', command)
+    m = _COMMIT_MSG.fullmatch(command)
+    if m:
+        command = f'git commit{m.group(1)} -m "msg"{m.group(3)}'
     flat = command.replace('"', "").replace("'", "").replace("\\", "")  # rm -rf "/" -> rm -rf /
     extra = cfg.get("guard", {})
     for rx, why in DENY + _compile_extra(extra.get("deny_regex", []), "guard.deny_regex"):

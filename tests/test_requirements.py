@@ -869,7 +869,10 @@ class GuardReqTest(unittest.TestCase):
         messages that merely mention push/gh/eval/sudo."""
         for cmd in ["rm -Rf /", "rm -rf ${HOME}", "rm -rf ~/*", "rm -fR $HOME/*",
                     "git -c diff.external=/tmp/x.sh diff", "git -c core.hooksPath=/tmp/h commit -m x",
-                    'git commit -m "$(git push origin main)"']:
+                    'git commit -m "$(git push origin main)"',
+                    "echo 'git commit -m ' ; sudo reboot ; echo '",
+                    'git commit -m "x" && git push origin main',
+                    "git commit -m 'a' ; rm -rf /"]:
             self.assertEqual(self.v(cmd), "deny", cmd)
         for cmd in ['git commit -m "Add push docs"', 'git commit -m "use eval in parser"',
                     "git commit -m 'explain gh pr flow'", 'git commit -m "remove sudo usage"',
