@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.3 (2026-11-18)
+- devaccel_batch: 単位のセッションを軽く(`--strict-mcp-config` で MCP なし、`--tools` で 6 つ、`--disable-slash-commands`)。毎ターン送る文脈が約 6 割減り、12 件で 64〜77 秒・$0.058〜0.07(素の Claude Code 逐次 176 秒・$0.60 の約 2.3〜2.75 倍速・約 1/9)。フック・サンドボックス・CLAUDE.md はそのまま。
+- `--speculate`(遅れた単位に予備): 効果が出なかったため既定は無効。
+
 ## 0.12.2 (2026-11-18)
 - ship の固定費を約 12 秒 → 約 8 秒: push を証拠づくり(HEAD のスナップショットと base の check)と並行、gh のラベル作成と既存 PR の照会も並行(push 後に古ければ照会し直す)。段階ごとの秒数を `DEVACCEL_TIMING=1` で表示。
 - devaccel_batch: `--effort`、`--strong K`(長い K 件を sonnet)、参照ファイルの埋め込み(課題文が `` `path` `` で名指す 8 KB 以下のファイルを最大 3 つ。`--no-context` で無効)。計測の結果、既定は haiku・effort low のまま(D17)。

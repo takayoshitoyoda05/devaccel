@@ -115,8 +115,9 @@ def main() -> int:
                     help="run the K longest tasks (by text length, a proxy for size) on sonnet; the slowest unit "
                          "sets the wall clock")
     ap.add_argument("--no-context", action="store_true", help="do not inline the files the tasks name")
-    ap.add_argument("--no-speculate", action="store_true",
-                    help="don't start a backup copy of a straggling unit once half the units have passed")
+    ap.add_argument("--speculate", action="store_true",
+                    help="start a backup copy of a straggling unit once half the units have passed (measured: the "
+                         "original usually finishes first, so off by default)")
     ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
     ap.add_argument("--dry-run", action="store_true", help="split and show the units only")
@@ -225,7 +226,7 @@ def main() -> int:
             running.append(u)
         time.sleep(0.5)
         passed = sorted(x["secs"] for x in done if x.get("status") == "ok")
-        if not a.no_speculate and len(passed) * 2 >= len(items) and len(running) < limit:
+        if a.speculate and len(passed) * 2 >= len(items) and len(running) < limit:
             med = passed[len(passed) // 2]
             for u in list(running):  # a straggler gets one backup copy; the first copy to pass wins
                 late = time.time() - u["t"] > max(1.4 * med, med + 15)
