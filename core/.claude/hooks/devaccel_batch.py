@@ -6,7 +6,9 @@ Run it yourself from a terminal (or `! python3 ...` in Claude Code). Inside Clau
 the nested `claude` cannot reach the API.
 
 usage: python3 .claude/hooks/devaccel_batch.py TASKS.md --branch batch/NAME [--title T] [--jobs N]
-                                              [--model M] [--keep] [--dry-run]
+                                              [--model M] [--hedge K] [--keep] [--dry-run]
+  --hedge K: run each task K times in separate worktrees; the first copy that passes the gate is used and
+             the slower copies are stopped (cuts tail latency; each copy is gated the same way).
   TASKS.md: optional common paragraph, then items starting with "1. ", "2. ", ... (one unit each).
 Verification is unchanged: each unit's session ends with the enforcing gate (check.sh fast, confined);
 a unit is integrated only if it committed work AND the gate log shows a pass for its branch; ship then
@@ -66,6 +68,7 @@ def main() -> int:
     ap.add_argument("--title", default="")
     ap.add_argument("--jobs", type=int, default=0, help="max concurrent units (0 = all)")
     ap.add_argument("--model", default="", help="unit model (default: the devaccel-unit agent's model)")
+    ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
     ap.add_argument("--dry-run", action="store_true", help="split and show the units only")
     a = ap.parse_args()
@@ -100,55 +103,27 @@ def main() -> int:
     start = f"origin/{base}" if git(root, "rev-parse", "-q", "--verify", f"origin/{base}").strip() else base
     units = []
     t0 = time.time()
+    copies = max(1, a.hedge)
     for i, it in enumerate(items, 1):
-        br = f"unit/{slug}-{i}"
-        wt = root / ".claude" / "worktrees" / f"{slug}-{i}"
-        r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", br, str(wt), start],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
-            return 1
         prompt = (head + "\n\n" if head else "") + it + (
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
             "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
             "コミットはしない(ゲートを通った作業ツリーを devaccel_batch がコミットする)。")
         cmd = ["claude", "-p", prompt, "--model", model, "--effort", effort, "--append-system-prompt", rules.strip(),
                "--output-format", "json", "--permission-mode", "acceptEdits"]
-        units.append({"i": i, "branch": br, "wt": wt, "cmd": cmd})
+        for k in range(1, copies + 1):  # --hedge: the same task in k worktrees; the first to pass the gate wins
+            tag = f"{slug}-{i}" + (f"h{k}" if copies > 1 else "")
+            br, wt = f"unit/{tag}", root / ".claude" / "worktrees" / tag
+            r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", br, str(wt), start],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+                return 1
+            units.append({"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd})
 
-    running, done = [], []
-    pending = list(units)
-    limit = a.jobs or len(units)
-    while pending or running:
-        while pending and len(running) < limit:
-            u = pending.pop(0)
-            u["t"] = time.time()
-            env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # anchor: <root>/.claude/worktrees path
-            u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      stdin=subprocess.DEVNULL, text=True, env=env)
-            running.append(u)
-        time.sleep(0.5)
-        for u in list(running):
-            if u["p"].poll() is not None:
-                out, err = u["p"].communicate()
-                u["secs"] = round(time.time() - u["t"])
-                try:
-                    u["json"] = json.loads(out)
-                except ValueError:
-                    u["json"] = {"is_error": True, "result": (out + err)[-300:]}
-                running.remove(u)
-                done.append(u)
-
-    ok, lines, cost = [], [], 0.0
-    log = root / ".devaccel" / f"batch-{slug}.log"
-    log.parent.mkdir(exist_ok=True)
-    full = []
-    for u in sorted(done, key=lambda x: x["i"]):
-        j = u["json"]
-        cost += float(j.get("total_cost_usd") or 0)
-        full.append(f"=== unit {u['i']} ({u['branch']}, {u['secs']}s)\n{j.get('result', '')}\n")
-        # commit the tree the gate verified, using the git dir WE created (the worktree's .git file is
-        # agent-writable), with hooks/fsmonitor off; new files only if they don't look like secrets/state
+    def settle(u: dict) -> str:
+        """Commit the tree the gate verified (our own git dir; hooks/fsmonitor off; no secrets/state files),
+        then: ok only if there is a commit AND the gate logged a pass for this branch."""
         wt = u["wt"]
         gd = ["--git-dir", str(root / ".git" / "worktrees" / wt.name), "--work-tree", str(wt)]
         safe = ["git", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", *gd]
@@ -162,17 +137,66 @@ def main() -> int:
                         "commit", "-q", "--no-verify", "-m",
                         f"unit {u['i']}: " + " ".join(items[u["i"] - 1].split())[3:70]], capture_output=True)
         commits = git(root, "rev-list", "--count", f"{start}..{u['branch']}").strip()
-        gated = gate_passed(root, u["branch"], u["t"])
-        status = "ok" if commits not in ("", "0") and gated else (
-            "no commit" if commits in ("", "0") else "gate not passed")
+        if commits in ("", "0"):
+            return "no commit"
+        return "ok" if gate_passed(root, u["branch"], u["t"]) else "gate not passed"
+
+    running, done, won = [], [], {}
+    pending = list(units)
+    limit = a.jobs or len(units)
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # anchor: <root>/.claude/worktrees path
+    while pending or running:
+        while pending and len(running) < limit:
+            u = pending.pop(0)
+            if u["i"] in won:
+                continue
+            u["t"] = time.time()
+            u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
+            running.append(u)
+        time.sleep(0.5)
+        for u in list(running):
+            if u["p"].poll() is None:
+                continue
+            out, err = u["p"].communicate()
+            u["secs"] = round(time.time() - u["t"])
+            try:
+                u["json"] = json.loads(out)
+            except ValueError:
+                u["json"] = {"is_error": True, "result": (out + err)[-300:]}
+            running.remove(u)
+            u["status"] = settle(u) if u["i"] not in won else "superseded"
+            done.append(u)
+            if u["status"] == "ok" and u["i"] not in won:
+                won[u["i"]] = u
+                for v in list(running):  # stop the slower copies of the same task
+                    if v["i"] == u["i"]:
+                        try:
+                            os.killpg(v["p"].pid, 15)
+                        except OSError:
+                            pass
+
+    ok, lines, cost = [], [], 0.0
+    log = root / ".devaccel" / f"batch-{slug}.log"
+    log.parent.mkdir(exist_ok=True)
+    full = []
+    for u in sorted(done, key=lambda x: (x["i"], x["k"])):
+        j = u["json"]
+        cost += float(j.get("total_cost_usd") or 0)  # (stopped copies report no cost: an underestimate)
+        full.append(f"=== unit {u['i']}/{u['k']} ({u['branch']}, {u['secs']}s, {u['status']})\n{j.get('result', '')}\n")
+        if copies > 1 and won.get(u["i"]) is not u:
+            continue
         summary = " ".join((j.get("result") or "").split())[:160]
-        lines.append(f"- unit {u['i']} ({u['branch']}, {u['secs']}s): {status} — {summary}")
-        if status == "ok":
-            ok.append(u["branch"])
+        lines.append(f"- unit {u['i']} ({u['branch']}, {u['secs']}s): {u['status']} — {summary}")
+    for i in range(1, len(items) + 1):
+        if i in won:
+            ok.append(won[i]["branch"])
+        elif copies > 1:
+            lines.append(f"- unit {i}: no copy passed the gate")
     log.write_text("\n".join(full), encoding="utf-8")
     print("\n".join(lines))
     print(f"(full unit reports: {log.relative_to(root)})")
-    print(f"units: {len(ok)}/{len(units)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
+    print(f"units: {len(ok)}/{len(items)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
 
     if not a.keep:
         for u in units:
