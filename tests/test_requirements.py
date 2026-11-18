@@ -1692,3 +1692,17 @@ class R15TaskLintTest(unittest.TestCase):
         good = ("1. 集計: `src/x/agg.py` に `total(rows: list[int]) -> int` を追加。空なら 0、負数は ValueError。"
                 "テストは `tests/test_agg.py`。既存ファイルは変えない。")
         self.assertEqual(b.task_warnings(good), [])
+
+
+class R16PrConfinementTest(unittest.TestCase):
+    def test_pr_base_check_is_confined_outside_claude_code(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_pr as p
+        from unittest import mock
+        cfg = {"gate": {"sandbox": True}}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDECODE", None)
+            self.assertTrue(p.need_confinement(cfg))
+            self.assertFalse(p.need_confinement({"gate": {"sandbox": False}}))
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}), mock.patch("shutil.which", return_value=None):
+            self.assertFalse(p.need_confinement(cfg))  # inside Claude Code's sandbox: already confined

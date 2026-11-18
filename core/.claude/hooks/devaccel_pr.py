@@ -58,6 +58,22 @@ def run(cmd: list[str], cwd: Path, timeout: int = 600, env: dict | None = None) 
 DOCS = ["*.md", "**/*.md", "docs/**"]
 
 
+def need_confinement(cfg: dict) -> bool:
+    """Branch code must not run with the user's full rights. Inside Claude Code's sandbox (an agent running
+    ship/pr) a nested bwrap cannot start and the code is already confined, so it runs as is; anywhere else
+    (devaccel_batch run by a human in a terminal) it is confined, and fails closed if bwrap can't run."""
+    if not cfg["gate"].get("sandbox", True):
+        return False
+    if os.environ.get("CLAUDECODE"):
+        import shutil
+        bw = shutil.which("bwrap")
+        probe = subprocess.run([bw, "--unshare-pid", "--ro-bind", "/", "/", "true"], capture_output=True,
+                               stdin=subprocess.DEVNULL) if bw else None
+        if probe is None or probe.returncode != 0:
+            return False
+    return True
+
+
 def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
                    sandbox: bool = False) -> tuple[bool, list[str], str, float]:
     """Run the *base branch's* check.sh full in workdir: a branch cannot weaken the check that judges it."""
@@ -218,7 +234,8 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1)
     # judge the commit, not the working tree: untracked/ignored files (a stray conftest.py) must not count
     with tempfile.TemporaryDirectory(prefix="devaccel-pr-") as snap:
         if export_head(root, Path(snap)):
-            check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, Path(snap))
+            check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, Path(snap),
+                                                                sandbox=need_confinement(cfg))
         else:  # never judge an empty or partial tree as passing
             check_ok, stages, tail, check_secs = False, ["== failed: snapshot (HEAD を取り出せない)"], "", 0.0
     base_sha = (git(root, "rev-parse", "-q", "--verify", f"origin/{base_branch}").strip()
