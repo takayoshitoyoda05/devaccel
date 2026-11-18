@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.7.2 (2026-11-18)
+- **修正(0.6.0 の退行)**: `Read(/.venv/**)` と `Read(/uv.lock)` の deny を削除。サンドボックスでは Read deny がファイルシステムの読み取り禁止になり、git(マージ時の stash)や uv が uv.lock を読めず失敗した。Read deny は秘密情報専用とする。既存プロジェクトは settings.json から手で削除(doctor が警告)。
+
 ## 0.7.1 (2026-11-18)
 - /batch の単位が PR まで届かなかった件(0/3)の修正: `.claude/` 配下への Write は常に確認が要るため、PR メモとコミットメッセージの置き場を `.devaccel/`(gitignore、install が追記、doctor が点検)へ。seed CLAUDE.md に「Bash は単純なコマンドを 1 つずつ、ファイルは Write/Edit」(単位がヒアドキュメントや for ループでテストを書こうとして拒否されていた)。
 

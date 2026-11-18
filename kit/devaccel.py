@@ -259,10 +259,9 @@ def render_settings(presets: list[str]) -> dict:
                      "Read(./.env)", "Read(./.env.*)", "Edit(./.env)", "Edit(./.env.*)",
                      "Bash(git * --out*)", "Bash(git * --ext*)", "Bash(gh *)",
                      "Bash(git push --force*)", "Bash(git push -f *)", "Bash(git push * --force*)",
-                     "Bash(git remote add *)", "Bash(git remote set-url *)",
-                     # token hygiene: never worth reading. NOT .claude/worktrees/**: a Read deny also
-                     # blocks Edit there, and /batch units work inside .claude/worktrees/<unit>/ (0.6.4)
-                     "Read(/.venv/**)", "Read(/uv.lock)"],
+                     "Bash(git remote add *)", "Bash(git remote set-url *)"],
+            # no "token hygiene" Read denies: with the sandbox they become filesystem denyRead, which broke
+            # Edit in worktrees (0.6.4) and git/uv on uv.lock (0.7.2). Read denies are for secrets only.
         },
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [
@@ -424,6 +423,13 @@ def hooks_wired(settings: Path) -> bool:
     return "hooks/guard.py" in text and "hooks/stop_gate.py" in text
 
 
+def _perms(root: Path) -> dict:
+    try:
+        return json.loads((root / ".claude/settings.json").read_text()).get("permissions", {})
+    except (OSError, ValueError):
+        return {}
+
+
 def cmd_doctor(root: Path) -> int:
     problems, notes = [], []
 
@@ -492,6 +498,10 @@ def cmd_doctor(root: Path) -> int:
         wired = json.loads((root / ".claude/settings.json").read_text()).get("hooks", {})
     except (OSError, ValueError):
         wired = {}
+    bad_denies = [r for r in ("Read(/uv.lock)", "Read(/.venv/**)", "Read(/.claude/worktrees/**)")
+                  if r in json.dumps(_perms(root))]
+    ok(not bad_denies, f"settings deny {bad_denies} breaks git/uv/worktrees under the sandbox",
+       "remove them from .claude/settings.json (CHANGELOG 0.7.2)")
     if "stop_gate.py" not in json.dumps(wired.get("SubagentStop", [])):
         notes.append("SubagentStop is not wired: the gate does not run inside /batch units. Add to hooks:\n"
                      + json.dumps({"SubagentStop": render_settings(["python"])["hooks"]["SubagentStop"]}))
