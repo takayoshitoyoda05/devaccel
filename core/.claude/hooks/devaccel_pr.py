@@ -93,6 +93,12 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
                 return False, ["== failed: check.sh full (bwrap がないので隔離できない)"], "", 0.0
             cmd, env = wrapped
         env["DEVACCEL_ROOT"] = str(workdir)
+        # the collection cross-check runs alongside the check (full mode writes no sources; ~1 s saved)
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=1)
+        pending = (pool.submit(_pytest_collected, base_check, workdir, sandbox, int(cfg["gate"]["timeout_sec"]))
+                   if "pytest" in base_check else None)
+        pool.shutdown(wait=False)
         r = run(cmd, workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10, env=env)
     except subprocess.TimeoutExpired:
         return False, ["== failed: check.sh full (timeout)"], "timeout", round(time.time() - t0, 1)
@@ -105,7 +111,7 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
         # cross-check with a separate collection: a test that prints a fake summary and os._exit(0)s,
         # or one that stops pytest early, leaves "ran" != "collected"
         ran = _pytest_ran("\n".join(out))
-        collected = _pytest_collected(base_check, workdir, sandbox, int(cfg["gate"]["timeout_sec"]))
+        collected = pending.result() if pending is not None else None
         if collected is None or (collected > 0 and ran != collected):
             ok = False
             stages.append(f"== failed: tests (ran {ran} of {collected} collected)")
@@ -219,7 +225,16 @@ def static_triage(root: Path, cfg: dict, base: str, ref: str,
 
 def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1) -> dict:
     head = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
-    git(root, "fetch", "-q", "origin", base_branch)  # best effort: judge against the latest base
+    # best effort: judge against the latest base. The fetch overlaps the snapshot export (which needs only HEAD)
+    fetch = subprocess.Popen(["git", "-C", str(root), "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+                              "fetch", "-q", "origin", base_branch], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    snap_dir = tempfile.TemporaryDirectory(prefix="devaccel-pr-")
+    exported = export_head(root, Path(snap_dir.name))
+    try:
+        fetch.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        fetch.kill()
     base = (git(root, "merge-base", "HEAD", f"origin/{base_branch}").strip()
             or git(root, "merge-base", "HEAD", base_branch).strip())
     files, static, risky = static_triage(root, cfg, base, "HEAD", units)
@@ -233,8 +248,8 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1)
                     if re.match(r"\s*- \[[ xX]\] ", ln)]
 
     # judge the commit, not the working tree: untracked/ignored files (a stray conftest.py) must not count
-    with tempfile.TemporaryDirectory(prefix="devaccel-pr-") as snap:
-        if export_head(root, Path(snap)):
+    with snap_dir as snap:
+        if exported:
             check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, Path(snap),
                                                                 sandbox=need_confinement(cfg))
         else:  # never judge an empty or partial tree as passing
