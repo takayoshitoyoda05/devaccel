@@ -46,6 +46,8 @@ DEFAULTS: dict = {
     # max_jobs 0 = decide per machine at run time (memory and CPUs); unit_mem_mb = per-unit estimate
     # (claude -p + its confined check; depends on the project's tools)
     "parallel": {"auto_merge": False, "max_jobs": 0, "unit_mem_mb": 300},
+    # sessions: when Claude stops with uncommitted code changes, ask once to open the evidence PR (devaccel-pr)
+    "pr": {"auto": True},
 }
 
 MODES = ("off", "observe", "enforce")

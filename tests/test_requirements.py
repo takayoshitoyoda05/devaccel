@@ -1944,3 +1944,29 @@ class R25PromptCaptureTest(ReqKit):
         head, items = b.split_tasks("共通\n## 1. a\nx\n## 2. b\n**3.** c\n4. d\n")
         self.assertEqual(head, "共通")
         self.assertEqual(len(items), 4)
+
+
+class R26PrNudgeTest(ReqKit):
+    """PR-13: a session that stops with uncommitted code changes is asked once to open the evidence PR."""
+
+    def setUp(self):
+        super().setUp()
+        self.set_cfg({"pr": {"auto": True}})
+
+    def test_nudges_once_per_state_and_not_for_docs_or_dotfiles(self):
+        (self.root / "app.py").write_text("X = 2\n")
+        out = self.stop()
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("devaccel-pr", out["reason"])
+        self.assertNotIn("decision", self.stop())  # same state again: the user may not want a PR
+        (self.root / "app.py").write_text("X = 3\n")
+        self.assertEqual(self.stop().get("decision"), "block")  # new changes: ask again
+        sh(self.root, "git", "checkout", "-q", "--", "app.py")
+        (self.root / "README.md").write_text("doc\n")
+        (self.root / ".bashrc").write_text("x\n")
+        self.assertNotIn("decision", self.stop())
+
+    def test_can_be_turned_off(self):
+        self.set_cfg({"pr": {"auto": False}})
+        (self.root / "app.py").write_text("X = 2\n")
+        self.assertNotIn("decision", self.stop())

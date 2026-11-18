@@ -180,7 +180,8 @@ def notices(root: Path, cfg: dict, items: list[tuple[str, str]], base: str) -> l
 
 
 # One state file per session/unit: parallel /batch units never read-modify-write a shared file.
-SESSION_DEFAULT = {"ok": "", "seen": "", "fail": "", "reason": "", "escalated": "", "streak": 0, "noticed": []}
+SESSION_DEFAULT = {"ok": "", "seen": "", "fail": "", "reason": "", "escalated": "", "streak": 0, "noticed": [],
+                   "pr_nudged": ""}
 
 
 def _state_path(root: Path, sid: str) -> Path:
@@ -227,6 +228,29 @@ def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[
         relevant += [("C", p) for p in sorted(branch_files(root, base_ref(root, cfg["scale"]["base_branch"])))
                      if p not in seen_paths and not match_any(p, gate["ignore"]) and (root / p).exists()]
     return relevant
+
+
+def pr_nudge(root: Path, cfg: dict, sess: dict) -> dict | None:
+    """Sessions only: uncommitted code changes at the end of a turn -> ask once to open the evidence PR.
+    Once per state: stopping again without changes (the user said no PR, or it was only a question) passes."""
+    if not cfg["pr"].get("auto", True):
+        return None
+    branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    if branch and match_any(branch, cfg["gate"]["skip_branches"]):
+        return None
+    code = [p for _s, p in relevant_paths(root, cfg["gate"], cfg, False)
+            if not any(part.startswith(".") for part in Path(p).parts)]  # not dotfiles or tool state
+    if not code:
+        return None
+    sig = signature(root, [("M", p) for p in code])
+    if sess["pr_nudged"] == sig:
+        return None
+    sess["pr_nudged"] = sig
+    return {"decision": "block", "reason": (
+        "[devaccel] 未コミットのコード変更があります(" + ", ".join(code[:5]) + (" ほか" if len(code) > 5 else "")
+        + ")。コードを変える依頼が終わったなら、devaccel-pr スキルで証拠つき PR にしてから終えてください。"
+        "ユーザーが PR 不要と言った・途中経過の相談中・まだ作業が残っている場合は、そのまま続けるか終えてよい"
+        "(同じ状態で止まれば、もう止めません)。")}
 
 
 # ---------- main ----------
@@ -289,7 +313,16 @@ def main() -> int:
                 != git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
     mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
     CTX.update({"scope": "unit" if unit else "session", "mode": mode})
-    if mode == "off" or not is_git_repo(root):
+    if not is_git_repo(root):
+        return 0
+    if mode == "off":
+        if not unit:
+            sid = str(data.get("session_id") or "default")
+            sess = load_session(anchor, sid)
+            nudge = pr_nudge(root, cfg, sess)
+            if nudge:
+                emit(nudge)
+                save_session(anchor, sid, sess)
         return 0
 
     branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
@@ -378,6 +411,10 @@ def main() -> int:
             log_event(anchor, {"session": sid, "branch": branch, "mode": mode, "scope": "unit" if unit else "session",
                                "result": "notice", "notes": [m for _, m in fresh]})
 
+    if result == "pass" and not unit and "decision" not in reply:
+        nudge = pr_nudge(root, cfg, sess)
+        if nudge:
+            reply = {**nudge, **({"systemMessage": reply["systemMessage"]} if "systemMessage" in reply else {})}
     emit(reply)  # the decision goes out first; a state-write problem must not swallow a block
     save_session(anchor, sid, sess)
     return 0

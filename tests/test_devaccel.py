@@ -89,6 +89,11 @@ class KitTest(unittest.TestCase):
             '#!/usr/bin/env bash\necho "== stage: tests"\n'
             'if grep -q BROKEN app.py; then echo "boom"; echo "== failed: tests (0s)"; exit 1; fi\n'
             'echo "== ok: tests (0s)"\n')
+        # the gate tests judge the check; the end-of-turn PR nudge has its own tests (R26)
+        pj = self.root / ".claude/project.json"
+        cfg = json.loads(pj.read_text())
+        cfg["pr"] = {"auto": False}
+        pj.write_text(json.dumps(cfg))
         sh(self.root, "git", "add", "-A")
         sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", "init")
 
