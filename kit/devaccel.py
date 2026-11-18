@@ -580,6 +580,19 @@ def cmd_doctor(root: Path) -> int:
                      "allow it, add to .claude/settings.json: permissions.allow \"Bash(python3 .claude/hooks/"
                      "devaccel_batch.py *)\" and sandbox.excludedCommands [\"python3 .claude/hooks/devaccel_batch.py *\"]"
                      " (it then runs outside the sandbox without a prompt; units stay sandboxed)")
+    try:  # every session pays for plugin skill/agent listings and connector tool names at start (D17)
+        user = json.loads((Path.home() / ".claude/settings.json").read_text())
+        local = json.loads((root / ".claude/settings.local.json").read_text()) if \
+            (root / ".claude/settings.local.json").exists() else {}
+    except (OSError, ValueError):
+        user, local = {}, {}
+    on = [p for p, v in (user.get("enabledPlugins") or {}).items()
+          if v and (local.get("enabledPlugins") or {}).get(p) is not False]
+    if on or not local.get("disableClaudeAiConnectors"):
+        notes.append("session start cost: plugins " + (", ".join(on) or "none") + " and claude.ai connectors load in "
+                     "every session here. If this project doesn't use them, .claude/settings.local.json (personal, "
+                     "not committed) with {\"enabledPlugins\": {\"<plugin>\": false}, \"disableClaudeAiConnectors\": "
+                     "true} cut the start of each session ~27% in the measurement (README)")
     if sb.get("enabled") and not sb.get("autoAllowBashIfSandboxed"):
         notes.append("sandbox.autoAllowBashIfSandboxed is off: /batch units will stop on permission prompts")
     try:  # parallel sizing for devaccel_batch (decided per machine at run time)
