@@ -24,16 +24,18 @@ import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from devaccel_common import check_script_for, git, load_config, match_any, trusted_root  # noqa: E402
+sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
+from devaccel_common import check_script_for, confined, git, load_config, match_any, trusted_root  # noqa: E402
 from stop_gate import SKIP_RE  # noqa: E402
 
 # "Changes can't modify their own checks": touching the verification machinery always
 # needs a human, whatever project.json says (project.json itself is in this list).
+# Any change to a tool/test configuration file needs a human (pyproject.toml always: [tool.*] edits can
+# silently narrow what lint/types/tests check; keyword matching missed that).
+_CFG = ["conftest.py", "pytest.ini", ".pytest.ini", "setup.cfg", "tox.ini", "pyrightconfig.json", "ruff.toml",
+        ".ruff.toml", "pyproject.toml", ".gitattributes", "noxfile.py", ".coveragerc", "mypy.ini", ".mypy.ini"]
 ALWAYS_HUMAN = ["scripts/check.sh", ".claude/**", ".github/**", "CLAUDE.md", "AGENTS.md",
-                "**/conftest.py", "conftest.py", "pytest.ini", "setup.cfg", "tox.ini",
-                "pyrightconfig.json", "ruff.toml", ".ruff.toml"]
-TOOL_CFG = re.compile(r"^[+-].*(\[tool\.|ruff|pyright|pytest|addopts|exclude|ignore)", re.I)
+                *_CFG, *[f"**/{n}" for n in _CFG]]
 
 SECRET = re.compile(r"gh[opsu]_[A-Za-z0-9]{36}|github_pat_\w+|-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}")
 NOTES_MAX = 4096
@@ -55,7 +57,8 @@ def run(cmd: list[str], cwd: Path, timeout: int = 600, env: dict | None = None) 
 DOCS = ["*.md", "**/*.md", "docs/**"]
 
 
-def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path) -> tuple[bool, list[str], str, float]:
+def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
+                   sandbox: bool = False) -> tuple[bool, list[str], str, float]:
     """Run the *base branch's* check.sh full in workdir: a branch cannot weaken the check that judges it."""
     t0 = time.time()
     base_check = git(root, "show", f"{base_ref}:scripts/check.sh") if base_ref else ""
@@ -65,8 +68,14 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path) -> tuple
         script = check_script_for(base_check)
         f.write(script or "echo '== failed: check.sh (unrecognised cd line)'; exit 1\n")
     try:
-        r = run(["bash", f.name, "full"], workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10,
-                env={**os.environ, "DEVACCEL_ROOT": str(workdir)})
+        cmd, env = ["bash", f.name, "full"], {**os.environ}
+        if sandbox:  # land runs PR code on the human's machine: confine it (the PR script itself is sandboxed)
+            wrapped = confined(["bash", "-c", Path(f.name).read_text(encoding="utf-8"), "check.sh", "full"], workdir)
+            if wrapped is None:
+                return False, ["== failed: check.sh full (bwrap がないので隔離できない)"], "", 0.0
+            cmd, env = wrapped
+        env["DEVACCEL_ROOT"] = str(workdir)
+        r = run(cmd, workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10, env=env)
     except subprocess.TimeoutExpired:
         return False, ["== failed: check.sh full (timeout)"], "timeout", round(time.time() - t0, 1)
     finally:
@@ -80,31 +89,31 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path) -> tuple
 def static_triage(root: Path, cfg: dict, base: str, ref: str) -> tuple[list[str], list[str], list[str]]:
     """Diff-only reasons (no execution). Shared with devaccel_land.py, which re-applies them."""
     rng = f"{base}..{ref}"
-    files = [f for f in git(root, "diff", "--name-only", rng).splitlines() if f]
-    diff = git(root, "diff", "-U0", rng)
-    status = git(root, "diff", "--name-status", rng).splitlines()
+    files = [f for f in git(root, "diff", "--no-renames", "--name-only", rng).splitlines() if f]
+    # --text/--no-textconv/--no-ext-diff: a branch's .gitattributes ("-diff") must not hide test edits
+    diff = git(root, "diff", "--no-renames", "--text", "--no-textconv", "--no-ext-diff", "-U0", rng)
+    status = git(root, "diff", "--no-renames", "--name-status", rng).splitlines()
     scale, tg = cfg["scale"], cfg["integrity"]["test_globs"]
     risky = [f for f in files if match_any(f, scale["risky_paths"])]
     tests_deleted = [ln.split("\t", 1)[1] for ln in status
                      if ln.startswith("D") and match_any(ln.split("\t", 1)[1], tg)]
     skips = [ln[1:].strip() for ln in diff.splitlines() if SKIP_RE.match(ln)]
     machinery = [f for f in files if match_any(f, ALWAYS_HUMAN)]
-    if "pyproject.toml" in files and any(
-            TOOL_CFG.match(ln) for ln in git(root, "diff", "-U0", rng, "--", "pyproject.toml").splitlines()
-            if not ln.startswith(("+++", "---"))):
-        machinery.append("pyproject.toml(ツール設定)")
+    odd = [ln.partition("\t")[2] for ln in status if ln[:1] not in ("A", "M", "D")]  # type changes etc.
     tests_shrunk = []  # existing tests that lost lines (pure additions of new tests are fine)
     for ln in status:
         st, _, path = ln.partition("\t")
         if st.startswith("M") and match_any(path, tg):
-            d = git(root, "diff", "--numstat", rng, "--", path).split()
-            if d and d[1].isdigit() and int(d[1]) > 0:
+            d = git(root, "diff", "--no-renames", "--text", "--numstat", rng, "--", path).split()
+            if not d or not d[1].isdigit() or int(d[1]) > 0:  # "-" (binary) counts as shrunk
                 tests_shrunk.append(path)
     reasons = []
     if len(files) > scale["large_if_files_over"]:
         reasons.append(f"L 規模({len(files)} ファイル)")
     if risky:
         reasons.append("リスクのあるパス: " + ", ".join(risky[:5]))
+    if odd:
+        reasons.append("種類の変わったファイル(シンボリックリンク等): " + ", ".join(odd[:5]))
     if machinery:
         reasons.append("検証基盤の変更: " + ", ".join(machinery[:5]))
     if tests_shrunk:

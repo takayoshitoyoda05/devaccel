@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
 from devaccel_common import load_config, project_root  # noqa: E402
 
 

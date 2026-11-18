@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
 from devaccel_common import git, load_config, match_any, trusted_root  # noqa: E402
 from devaccel_pr import DOCS, github_repo, run, run_base_check, static_triage  # noqa: E402
 
@@ -131,7 +131,7 @@ def main() -> int:
                 run(["git", "merge", "--abort"], wt)
                 downgrade(p, "base(と先行 PR)と衝突: " + (", ".join(bad[:5]) or m.stderr.strip()[:200]))
                 continue
-            ok, stages, tail, secs = run_base_check(root, cfg, base_sha, wt)
+            ok, stages, tail, secs = run_base_check(root, cfg, base_sha, wt, sandbox=bool(cfg["gate"].get("sandbox", True)))
             if not ok:
                 run(["git", "reset", "-q", "--hard", "HEAD~1"], wt)
                 downgrade(p, "統合後に `check.sh full` が失敗(単独では緑): "

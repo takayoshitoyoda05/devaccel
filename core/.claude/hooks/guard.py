@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
 from devaccel_common import emit, load_config, read_stdin_json, trusted_root  # noqa: E402
 
 # rm with both -r and -f aimed at a broad target (/, ~, $HOME, *, ., .., .git)

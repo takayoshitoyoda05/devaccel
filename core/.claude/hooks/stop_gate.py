@@ -18,9 +18,10 @@ import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
 from devaccel_common import (  # noqa: E402
     check_script_for,
+    confined,
     emit,
     git,
     is_git_repo,
@@ -91,7 +92,8 @@ def branch_files(root: Path, base: str) -> set[str]:
 # ---------- check.sh ----------
 
 
-def run_check(root: Path, timeout: int, anchor: Path | None = None) -> tuple[str, int, str, float]:
+def run_check(root: Path, timeout: int, anchor: Path | None = None,
+              sandbox: bool = True) -> tuple[str, int, str, float]:
     """Returns (result, returncode, output, seconds). result: pass|fail|timeout|missing.
     Runs the anchor's (main checkout's) check.sh against root, so a worktree cannot weaken its gate."""
     script = (anchor or root) / "scripts" / "check.sh"
@@ -102,11 +104,19 @@ def run_check(root: Path, timeout: int, anchor: Path | None = None) -> tuple[str
     text = check_script_for(script.read_text(encoding="utf-8", errors="replace"))
     if text is None:
         return "missing", 0, "scripts/check.sh: unrecognised cd line (see CHECK_HEAD)", 0.0
+    cmd, env = ["bash", "-c", text, "check.sh", "fast"], {**os.environ}
+    if sandbox:  # check.sh runs tests the agent wrote: never with the user's full rights (hooks are unsandboxed)
+        protect = [root / ".claude", root / "scripts" / "check.sh"]
+        wrapped = confined(cmd, root, protect)
+        if wrapped is None:
+            return "missing", 0, "bubblewrap (bwrap) が無いので check.sh を隔離して実行できません(gate.sandbox)", 0.0
+        cmd, env = wrapped
+    env["DEVACCEL_ROOT"] = str(root)
     try:
         r = subprocess.run(
-            ["bash", "-c", text, "check.sh", "fast"],
+            cmd,
             cwd=root,
-            env={**os.environ, "DEVACCEL_ROOT": str(root)},
+            env=env,
             capture_output=True,
             text=True, errors="replace",
             timeout=timeout,
@@ -198,6 +208,17 @@ def save_session(root: Path, sid: str, sess: dict) -> None:
         f.unlink(missing_ok=True)
 
 
+def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[str, str]]:
+    """What the gate judges: uncommitted changes, plus (in a unit) committed-but-unmerged work,
+    since units commit before stopping (devaccel-pr)."""
+    relevant = [it for it in changed_paths(root) if not match_any(it[1], gate["ignore"])]
+    if unit:
+        seen_paths = {p for _s, p in relevant}
+        relevant += [("C", p) for p in sorted(branch_files(root, base_ref(root, cfg["scale"]["base_branch"])))
+                     if p not in seen_paths and not match_any(p, gate["ignore"]) and (root / p).exists()]
+    return relevant
+
+
 # ---------- main ----------
 
 
@@ -218,12 +239,7 @@ def main() -> int:
     if branch and match_any(branch, gate["skip_branches"]):
         return 0
 
-    items = changed_paths(root)
-    relevant = [it for it in items if not match_any(it[1], gate["ignore"])]
-    if unit:  # units commit before stopping (devaccel-pr): committed-but-unmerged work is checked too
-        seen_paths = {p for _s, p in relevant}
-        relevant += [("C", p) for p in sorted(branch_files(root, base_ref(root, cfg["scale"]["base_branch"])))
-                     if p not in seen_paths and not match_any(p, gate["ignore"]) and (root / p).exists()]
+    relevant = relevant_paths(root, gate, cfg, unit)
     if not relevant:
         return 0
 
@@ -247,9 +263,9 @@ def main() -> int:
         save_session(anchor, sid, sess)
         return 0
     # the hook itself is killed by Claude Code at its settings timeout (120 s): stay below it
-    result, _rc, output, secs = run_check(root, min(int(gate["timeout_sec"]), 110), anchor)
+    result, _rc, output, secs = run_check(root, min(int(gate["timeout_sec"]), 110), anchor, bool(gate.get("sandbox", True)))
     # fast mode may auto-format: remember the tree as it is *after* the check
-    relevant = [it for it in changed_paths(root) if not match_any(it[1], gate["ignore"])]
+    relevant = relevant_paths(root, gate, cfg, unit)  # same definition as before the run (else sigs never match)
     sig = signature(root, relevant)
     sess["seen"] = sig
     base = base_ref(root, cfg["scale"]["base_branch"])

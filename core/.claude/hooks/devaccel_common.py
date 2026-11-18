@@ -1,6 +1,6 @@
 # devaccel core — DO NOT EDIT. Tune behavior in .claude/project.json instead.
 # update.sh refuses to run if this file was modified by hand.
-"""Shared helpers for devaccel hooks (python3 stdlib only, 3.8+)."""
+"""Shared helpers for devaccel hooks (python3 stdlib only, 3.10+)."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ DEFAULTS: dict = {
         # Measured: an interactive gate costs wall time with no accuracy gain (docs/design.md D14/D15).
         "mode": "off",  # off | observe | enforce
         "unit_mode": "enforce",
+        "sandbox": True,  # run check.sh under bubblewrap (hooks are outside Claude Code's sandbox)
         "timeout_sec": 60,
         "fast_budget_sec": 15,
         "max_rounds": 3,
@@ -118,7 +119,8 @@ def load_config(root: Path) -> dict:
 def git(root: Path, *args: str, check: bool = False) -> str:
     try:
         r = subprocess.run(
-            ["git", "-C", str(root), *args],
+            # literal UTF-8 paths (no "\\303..." quoting) and no rename pairing: triage must see every path
+            ["git", "-c", "core.quotePath=false", "-c", "diff.renames=false", "-C", str(root), *args],
             capture_output=True,
             text=True, errors="replace",
             timeout=15,
@@ -155,6 +157,44 @@ def check_script_for(text: str) -> str | None:
     if re.search(r"^\s*cd\s", text, re.M):
         return None  # some other cd: it would leave the tree we were asked to check
     return text  # no cd at all: runs in the cwd we set
+
+
+# ---------- confinement for code we did not write (tests in a unit's tree, PR code in land) ----------
+HOME = Path.home()
+SECRET_PATHS = [".ssh", ".aws", ".gnupg", ".config/gh", ".git-credentials", ".netrc", ".claude", ".claude.json",
+                ".docker", ".kube", ".npmrc", ".pypirc", ".config/gcloud", ".azure"]
+CACHE_PATHS = [".cache/uv", ".cache/pip", ".cache/pyright-python", ".cache/ruff", ".local/share/uv"]
+ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TZ", "UV_CACHE_DIR", "UV_PYTHON", "XDG_CACHE_HOME")
+
+
+def confined(cmd: list[str], tree: Path, protect: list[Path] | None = None) -> tuple[list[str], dict] | None:
+    """Wrap cmd in bubblewrap: whole filesystem read-only, only `tree` (minus `protect`) and tool caches
+    writable, secrets hidden, minimal environment. Hooks run outside Claude Code's sandbox, so check.sh
+    (which runs tests the agent wrote) must not run with the user's full rights. None = bwrap unavailable."""
+    import shutil
+    bw = shutil.which("bwrap")
+    if not bw:
+        return None
+    tree = tree.resolve()
+    args = [bw, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--die-with-parent"]
+    for rel in CACHE_PATHS:
+        p = HOME / rel
+        p.mkdir(parents=True, exist_ok=True)
+        args += ["--bind", str(p), str(p)]
+    args += ["--bind", str(tree), str(tree)]  # after --tmpfs /tmp: trees under /tmp stay visible
+    for p in protect or []:
+        if p.exists():
+            args += ["--ro-bind", str(p), str(p)]
+    for rel in SECRET_PATHS:
+        p = HOME / rel
+        if p.is_dir():
+            args += ["--tmpfs", str(p)]
+        elif p.exists():
+            args += ["--ro-bind", "/dev/null", str(p)]
+    for p in list(tree.glob(".env")) + list(tree.glob(".env.*")):
+        args += ["--ro-bind", "/dev/null", str(p)]
+    env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
+    return args + ["--"] + cmd, env
 
 
 def state_dir(root: Path) -> Path:

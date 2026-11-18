@@ -124,7 +124,7 @@ class ReqKit(unittest.TestCase):
 
     def counting_check(self, extra: str = "") -> Path:
         """A check.sh that counts its runs (outside the repo) and fails on BROKEN in app.py."""
-        cnt = self.tmp / "runs"
+        cnt = self.root / ".git" / "devaccel-runs"  # inside the tree: check.sh runs under bwrap (GATE sandbox)
         self.set_check(f'echo x >> "{cnt}"\necho "== stage: tests"\n{extra}'
                        'if grep -q BROKEN app.py; then echo "== failed: tests (0s)"; exit 1; fi\n'
                        'echo "== ok: tests (0s)"\n')
@@ -409,6 +409,100 @@ class InstallUpdateTest(ReqKit):
 
 
 # ====================================================================== DOCTOR / PROTECT
+class ConfinementTest(ReqKit):
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap required")
+    def test_GATE17_check_runs_confined(self):
+        """GATE-17: check.sh (tests the agent wrote) runs under bwrap: no writes outside the tree, the main
+        checkout's .claude is read-only, secrets in env are not passed."""
+        outside = self.tmp / "escaped"
+        probe = self.root / ".git" / "probe"
+        self.set_check(f'touch "{outside}" 2>/dev/null; echo "tok=${{GH_TOKEN:-none}}" > "{probe}"\n'
+                       f'touch .claude/hooks/pwn 2>/dev/null\necho "== stage: tests"\necho "== ok: tests (0s)"\n')
+        (self.root / "app.py").write_text("X = 5\n")
+        r = sh(self.root, "python3", ".claude/hooks/stop_gate.py",
+               env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce", "GH_TOKEN": "secret123"},
+               stdin=json.dumps({"session_id": "c", "cwd": str(self.root)}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(outside.exists(), "check.sh wrote outside the tree")
+        self.assertFalse((self.root / ".claude/hooks/pwn").exists(), "check.sh wrote into .claude")
+        self.assertEqual(probe.read_text().strip(), "tok=none")
+
+
+class TriageEvasionTest(ReqKit):
+    """PR-04 / PR-05: renames, non-ASCII paths, config files and .gitattributes must not slip through."""
+
+    def dry(self) -> dict:
+        nf = self.tmp / "n.txt"
+        nf.write_text("ran it")
+        self.commit("change")
+        r = sh(self.root, "python3", ".claude/hooks/devaccel_pr.py", "--title", "t", "--verify-notes", str(nf),
+               "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def setUp(self):
+        ReqKit.setUp(self)
+        (self.root / "tests").mkdir(exist_ok=True)
+        (self.root / "tests/test_app.py").write_text("def test_a():\n    assert 1\n")
+        (self.root / "pyproject.toml").write_text('[project]\nname = "p"\nversion = "0"\n\n'
+                                                   '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        self.commit("base")
+        sh(self.root, "git", "checkout", "-qb", "feat")
+
+    def assertHuman(self, why: str) -> None:
+        ev = self.dry()
+        self.assertEqual(ev["label"], "needs-human", (why, ev))
+
+    def test_PR04_renamed_test_is_a_deletion(self):
+        sh(self.root, "git", "mv", "tests/test_app.py", "attic.txt")
+        self.assertHuman("test renamed away")
+
+    def test_PR04_renamed_machinery(self):
+        sh(self.root, "git", "mv", ".claude/settings.json", "settings.old")
+        self.assertHuman("settings.json renamed away")
+
+    def test_PR04_non_ascii_paths(self):
+        (self.root / ".github/workflows").mkdir(parents=True, exist_ok=True)
+        (self.root / ".github/workflows/é.yml").write_text("on: push\n")
+        self.assertHuman("non-ASCII workflow")
+
+    def test_PR05_pyproject_tool_change(self):
+        p = self.root / "pyproject.toml"
+        p.write_text(p.read_text().replace('testpaths = ["tests"]', 'testpaths = ["src"]'))
+        self.assertHuman("pyproject [tool] change")
+
+    def test_PR05_gitattributes_hides_skip(self):
+        (self.root / ".gitattributes").write_text("* -diff\n")
+        (self.root / "tests/test_app.py").write_text("import pytest\n\n\n@pytest.mark.skip\ndef test_a():\n    assert 1\n")
+        self.assertHuman(".gitattributes + skip")
+
+    def test_PR04_benign_change_stays_ok(self):
+        (self.root / "app.py").write_text("X = 2\n")
+        self.assertEqual(self.dry()["label"], "evidence-ok")
+
+
+class UnitCommittedTest(ReqKit):
+    def test_GATE06_committed_unit_escalates_once_then_stops(self):
+        """GATE-06 with committed-but-unmerged work: block x3, escalate once, then let the unit stop
+        (the same tree is not re-blocked forever); a passing committed tree is not re-checked."""
+        self.set_check('echo "== stage: tests"\nif grep -q BROKEN app.py; then echo "== failed: tests (0s)"; exit 1; fi\n'
+                       'echo "== ok: tests (0s)"\n')
+        wt = self.worktree()
+        (wt / "app.py").write_text("BROKEN\n")
+        self.commit("broken", cwd=wt)
+        decisions = [self.gate(wt, agent="u")[0] for _ in range(6)]
+        self.assertEqual([d.get("decision") for d in decisions[:4]], ["block"] * 4)
+        self.assertIn("systemMessage", decisions[3])  # 4th failure = escalation
+        self.assertEqual(decisions[4], {})
+        self.assertEqual(decisions[5], {})
+        (wt / "app.py").write_text("X = 3\n")
+        self.commit("fixed", cwd=wt)
+        self.assertEqual(self.gate(wt, agent="u")[0], {})
+        self.assertEqual(self.gate(wt, agent="u")[0], {})
+        passes = [e for e in self.log() if e.get("session") == "u" and e.get("result") == "pass"]
+        self.assertEqual(len(passes), 1)  # passed once, not re-run on the next stop
+
+
 class DoctorTest(ReqKit):
     def mutate(self, rel: str, fn):
         p = self.root / rel
