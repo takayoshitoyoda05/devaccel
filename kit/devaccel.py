@@ -235,7 +235,9 @@ def render_settings(presets: list[str]) -> dict:
         sandbox["filesystem"]["allowWrite"] = writes
     return {
         # parallel subagents (/batch units) multiply token use: cap concurrency (official default 20)
-        "env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3"},
+        # subagents (/batch units, Explore) default to sonnet: units start cold (no shared cache),
+        # so per-unit price dominates. The planner/main session keeps your model.
+        "env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3", "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
         "sandbox": sandbox,
         "permissions": {
             "allow": allow,

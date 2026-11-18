@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.6.3 (2026-11-18)
+- settings 生成: `CLAUDE_CODE_SUBAGENT_MODEL=sonnet`(/batch の単位・Explore などサブエージェントの既定モデル)。既存プロジェクトは settings.json の env に手で追加。
+
 ## 0.6.2 (2026-11-18)
 - ゲート・PR スクリプト・bench: check.sh を別の木に向けるとき、パスをシェル本文に埋め込まず環境変数 `DEVACCEL_ROOT` で渡す(worktree 名によるコマンド注入の対策)。
 
