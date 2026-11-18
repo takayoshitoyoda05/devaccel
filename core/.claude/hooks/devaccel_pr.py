@@ -383,7 +383,7 @@ def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1) -
         print(r.stderr.strip() or r.stdout.strip(), file=sys.stderr)
         return 1
     print(f"{url}  [{ev['label']}]" + (f" reasons: {' / '.join(ev['reasons'])}" if ev["reasons"] else ""))
-    if ev["label"] == "evidence-ok" and par.get("auto_merge"):
+    if ev["label"] == "evidence-ok" and par.get("auto_merge") and units <= 1:  # integrated batches: human merges
         # auto-merge only behind branch protection with a required status check (CI = check.sh full)
         prot = run(["gh", "api", f"repos/{repo}/branches/{ev['base']}/protection/required_status_checks"], root)
         if prot.returncode != 0 or '"contexts":[]' in prot.stdout.replace(" ", ""):

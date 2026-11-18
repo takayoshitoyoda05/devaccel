@@ -42,16 +42,21 @@ def protected(root: Path, cfg: dict) -> set[str]:
     return names
 
 
-def integrate(root: Path, units: list[str]) -> tuple[list[str], list[str]]:
+def integrate(root: Path, units: list[str], current: str) -> tuple[list[str], list[str]]:
+    """Merge each unit branch. Only units that actually change the tree count (the count scales the
+    L-size threshold, so duplicates, the current branch, or no-op branches must not inflate it)."""
     merged, skipped = [], []
-    for b in units:
-        if not git(root, "rev-parse", "-q", "--verify", f"refs/heads/{b}").strip():
-            skipped.append(f"{b} (no such local branch)")
+    for b in dict.fromkeys(units):  # de-duplicated, order kept
+        if b == current or not git(root, "rev-parse", "-q", "--verify", f"refs/heads/{b}").strip():
+            skipped.append(f"{b} (not a separate local branch)")
             continue
+        before = git(root, "rev-parse", "HEAD^{tree}").strip()
         m = sh(root, *IDENT, "merge", "--no-ff", "--no-edit", "-m", f"integrate {b}", b)
         if m.returncode != 0:
             sh(root, "merge", "--abort")
             skipped.append(f"{b} (conflict)")
+        elif git(root, "rev-parse", "HEAD^{tree}").strip() == before:
+            skipped.append(f"{b} (no changes)")
         else:
             merged.append(b)
     return merged, skipped
@@ -78,7 +83,7 @@ def main() -> int:
         print("--file: line 1 must be the PR title", file=sys.stderr)
         return 2
 
-    merged, skipped = integrate(root, a.units) if a.units else ([], [])
+    merged, skipped = integrate(root, a.units, head) if a.units else ([], [])
     for p in a.paths:
         if Path(p).is_absolute() or ".." in Path(p).parts:
             print(f"--paths: {p} must be relative to the repo", file=sys.stderr)

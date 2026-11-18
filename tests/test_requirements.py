@@ -1508,6 +1508,12 @@ class R6ShipTest(ReqKit):
         self.assertIn("統合した単位: u1, u2", r.stdout)
         self.assertIn("u3 (conflict)", r.stdout)
         self.assertTrue((self.root / "a.py").exists() and (self.root / "b.py").exists())
+        sh(self.root, "git", "checkout", "-qB", "noop", "main")
+        sh(self.root, "git", "checkout", "-qB", "batch/y", "main")
+        r, _ = self.land("--file", self.notes("Batch2"), "--units", "u2", "u2", "noop", "batch/y", "--dry-run",
+                         script="devaccel_ship.py")
+        self.assertIn("統合した単位: u2 /", r.stdout)  # counted once; no-op and current branch excluded
+        self.assertIn("noop (no changes)", r.stdout)
 
     def test_SHIP04_large_threshold_scales_with_units(self):
         """Integrating 3 units of 2 files each (6 files) is not 'L' when 3 units were merged; it is for 1 unit."""

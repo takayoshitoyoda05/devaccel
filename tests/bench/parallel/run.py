@@ -1,11 +1,14 @@
-"""Sequential vs parallel (/devaccel-batch) on the same 4 independent tasks (kit-side; ~$3-6 of quota).
+"""Sequential vs parallel on the same independent tasks (kit-side; costs quota).
 
-A: one session implements the 4 tasks in order, then opens one evidence PR (devaccel-pr).
-B: /devaccel-batch runs them as parallel units (one PR each), then devaccel_land.py verifies them together.
-Measured: wall clock until "ready to merge", cost, held-out tests on the integrated result.
+Arms (choose with --arms):
+  seq_old   one session, implements in order, then the old 5-6 turn PR flow (notes, add, commit, push, PR script)
+  seq_ship  one session, implements in order, then devaccel-pr (one-command devaccel_ship.py)
+  par       /devaccel-batch: devaccel-unit (haiku) units implement only, parent integrates with ship --units -> 1 PR
+Measured per arm: wall clock until the PR exists, cost (+ per-model breakdown), turns, PR labels,
+held-out tests on the integrated result. Each arm's PRs/branches/worktrees are cleaned up afterwards.
 
-usage: python3 tests/bench/parallel/run.py --trial <trusted project with devaccel installed and a GitHub origin>
-Leaves the PRs open (close them afterwards); never merges.
+usage: python3 tests/bench/parallel/run.py --trial <trusted project, devaccel installed, GitHub origin>
+           [--tasks tasks.md] [--heldout heldout/test_par_heldout.py] [--arms seq_ship,par] [--reps 1]
 """
 
 from __future__ import annotations
@@ -20,6 +23,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TAIL = "確認は不要なので、そのまま最後まで進めて。"
+OLD_PR = ("最後に次の手順で PR を 1 本作って: 確認メモを `.devaccel/pr-notes.md` に Write → `git add <変更したパス>` → "
+          "コミットメッセージを `.devaccel/commit-msg.txt` に Write → `git commit -F .devaccel/commit-msg.txt` → "
+          "`git push origin HEAD` → `python3 .claude/hooks/devaccel_pr.py --title \"<要約>\" --verify-notes "
+          ".devaccel/pr-notes.md`。各コマンドは単独で実行する。")
 
 
 def sh(cmd: list[str], cwd: Path, timeout: int = 3600) -> subprocess.CompletedProcess:
@@ -42,8 +49,7 @@ def open_prs(trial: Path) -> list[dict]:
     return json.loads(r.stdout or "[]")
 
 
-def grade(trial: Path, branches: list[str]) -> dict:
-    """Merge the given branches onto main in a scratch worktree and run the held-out tests there."""
+def grade(trial: Path, branches: list[str], heldout: Path) -> dict:
     wt = Path(sh(["mktemp", "-d"], trial).stdout.strip()) / "g"
     sh(["git", "fetch", "-q", "origin"], trial)
     sh(["git", "worktree", "add", "-q", "--detach", str(wt), "origin/main"], trial)
@@ -54,55 +60,76 @@ def grade(trial: Path, branches: list[str]) -> dict:
             if m.returncode != 0:
                 conflicts.append(b)
                 sh(["git", "merge", "--abort"], wt)
-        shutil.copy(HERE / "heldout" / "test_par_heldout.py", wt / "tests" / "test_par_heldout.py")
+        shutil.copy(heldout, wt / "tests" / heldout.name)
         sh(["uv", "sync", "-q"], wt)
-        r = sh(["uv", "run", "pytest", "-q", "tests/test_par_heldout.py"], wt)
+        r = sh(["uv", "run", "pytest", "-q", f"tests/{heldout.name}"], wt)
         last = (r.stdout.strip().splitlines() or [""])[-1]
         return {"heldout": last, "heldout_ok": r.returncode == 0, "merge_conflicts": conflicts}
     finally:
         sh(["git", "worktree", "remove", "--force", str(wt)], trial)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--trial", type=Path, required=True)
-    ap.add_argument("--model", default="claude-sonnet-5-5")
-    a = ap.parse_args()
-    trial = a.trial.expanduser().resolve()
-    tasks = (HERE / "tasks.md").read_text(encoding="utf-8")
-    out = HERE / "results.jsonl"
+def cleanup(trial: Path, prs: list[dict]) -> None:
+    for p in prs:
+        sh(["gh", "pr", "close", str(p["number"]), "-c", "bench run; closed automatically"], trial)
+        sh(["git", "push", "-q", "origin", "--delete", p["headRefName"]], trial)
+    for line in sh(["git", "worktree", "list", "--porcelain"], trial).stdout.splitlines():
+        if line.startswith("worktree ") and "/.claude/worktrees/" in line:
+            sh(["git", "worktree", "remove", "--force", line.split(" ", 1)[1]], trial)
+    sh(["git", "checkout", "-q", "main"], trial)
+    for b in sh(["git", "branch", "--format=%(refname:short)"], trial).stdout.split():
+        if b != "main":
+            sh(["git", "branch", "-D", b], trial)
+    for b in sh(["git", "ls-remote", "--heads", "origin"], trial).stdout.split():
+        if b.startswith("refs/heads/") and b != "refs/heads/main" and ("worktree-agent" in b or "bench" in b):
+            sh(["git", "push", "-q", "origin", "--delete", b[len("refs/heads/"):]], trial)
+    sh(["git", "fetch", "-q", "--prune"], trial)
+
+
+def usage(j: dict) -> dict:
+    return {m: {"cost": round(u.get("costUSD", 0), 3), "out": u.get("outputTokens"),
+                "cache_read": u.get("cacheReadInputTokens"), "cache_write": u.get("cacheCreationInputTokens")}
+            for m, u in (j.get("modelUsage") or {}).items()}
+
+
+def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dict:
     sh(["git", "checkout", "-q", "main"], trial)
     sh(["git", "pull", "-q"], trial)
     before = {p["number"] for p in open_prs(trial)}
-
-    # A: sequential in one session, one PR at the end
-    sh(["git", "checkout", "-q", "-B", "seq/par-bench", "main"], trial)
-    j, wall = claude(tasks + "\n上の 4 件を 1 つのセッションで順番に実装し(各件ごとにコミット)、"
-                     "最後に devaccel-pr スキルで PR を 1 本作って。" + TAIL, trial, a.model)
+    if arm == "par":
+        prompt = "/devaccel-batch " + tasks + "\n" + TAIL
+    else:
+        sh(["git", "checkout", "-q", "-B", f"bench/{arm}", "main"], trial)
+        how = OLD_PR if arm == "seq_old" else "最後に devaccel-pr スキルで PR を 1 本作って。"
+        prompt = tasks + "\n上の各件を 1 つのセッションで順番に実装し、" + how + TAIL
+    j, wall = claude(prompt, trial, model)
     new = [p for p in open_prs(trial) if p["number"] not in before]
-    rec_a = {"arm": "sequential", "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"),
-             "turns": j.get("num_turns"), "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new],
-             **grade(trial, [p["headRefName"] for p in new])}
-    sh(["git", "checkout", "-q", "main"], trial)
-    before |= {p["number"] for p in new}
+    rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "turns": j.get("num_turns"),
+           "models": usage(j), "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new],
+           "result_tail": (j.get("result") or "")[-300:], **grade(trial, [p["headRefName"] for p in new], heldout)}
+    cleanup(trial, new)
+    return rec
 
-    # B: parallel units via /devaccel-batch, then land (verify only) over all evidence-ok PRs
-    j, wall = claude("/devaccel-batch " + tasks + "\n" + TAIL, trial, a.model)
-    t0 = time.time()
-    land = sh(["python3", ".claude/hooks/devaccel_land.py", "--dry-run"], trial)
-    land_s = time.time() - t0
-    new = [p for p in open_prs(trial) if p["number"] not in before]
-    rec_b = {"arm": "parallel", "wall_s": round(wall + land_s), "batch_s": round(wall), "land_s": round(land_s),
-             "cost_usd": j.get("total_cost_usd"), "turns": j.get("num_turns"),
-             "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new],
-             "land": land.stdout.strip().splitlines()[-6:],
-             **grade(trial, [p["headRefName"] for p in new])}
-    sh(["git", "checkout", "-q", "main"], trial)
-    with out.open("a", encoding="utf-8") as f:
-        for rec in (rec_a, rec_b):
-            rec["ts"] = dt.datetime.now().isoformat(timespec="seconds")
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            print(json.dumps(rec, ensure_ascii=False))
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trial", type=Path, required=True)
+    ap.add_argument("--tasks", type=Path, default=HERE / "tasks.md")
+    ap.add_argument("--heldout", type=Path, default=HERE / "heldout" / "test_par_heldout.py")
+    ap.add_argument("--arms", default="seq_old,seq_ship,par")
+    ap.add_argument("--reps", type=int, default=1)
+    ap.add_argument("--model", default="claude-sonnet-5-5")
+    a = ap.parse_args()
+    trial = a.trial.expanduser().resolve()
+    tasks = a.tasks.read_text(encoding="utf-8")
+    out = HERE / "results.jsonl"
+    for rep in range(a.reps):
+        for arm in a.arms.split(","):
+            rec = run_arm(arm, trial, tasks, a.heldout.resolve(), a.model)
+            rec.update({"rep": rep, "tasks": a.tasks.name, "ts": dt.datetime.now().isoformat(timespec="seconds")})
+            with out.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(json.dumps(rec, ensure_ascii=False), flush=True)
     return 0
 
 
