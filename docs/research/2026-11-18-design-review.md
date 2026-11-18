@@ -1,5 +1,7 @@
 # 設計案の批判的レビュー(casual-template)
 
+> **注記(公開時)**: devaccel 設計時の調査メモ(2026-11-18、AI による調査)。未検証の主張や「要原典確認」の記述を含み、その後の実測(docs/design.md D14/D15)で覆った前提もある。設計判断の正は docs/design.md と docs/requirements.md。
+
 作成日: 2026-11-18。レビューと提案のみ。実装はしていない。
 根拠: `survey-4axes.md`(以下「サーベイ」)と `casual-template-proposal.md`(以下「前回提案」)。公式資料を最優先にした。
 

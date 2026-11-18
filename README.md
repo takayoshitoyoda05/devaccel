@@ -1,5 +1,7 @@
 # devaccel
 
+> **English summary**: devaccel is a small, distributable Claude Code kit for personal and light professional Python work (WSL/Linux). It keeps interactive sessions close to vanilla Claude Code (measured), and adds a safety net only where nobody is watching: a verification gate inside `/batch` worktree units, evidence-based PRs triaged into `evidence-ok` / `needs-human`, and a local merge queue (`devaccel_land.py`) that re-verifies parallel PRs together before a human merges. Docs are in Japanese; see `docs/requirements.md` for what it guarantees and what it deliberately does not.
+
 Claude Code を **少ないトークンで、正確に、速く** 回すための、プロジェクト配布型キット(Python 中心 / WSL・Linux)。
 研究用の重装備版(claude-ml-template)とは独立。設計の理由は [docs/design.md](docs/design.md)。
 
@@ -8,7 +10,7 @@ Claude Code を **少ないトークンで、正確に、速く** 回すため�
 - 小さい作業には何も挟まない。L 規模だけ設計書と仕様照合。
 - 配布後は各プロジェクトで育てる(`project.json` / `/devaccel-tune`)。
 
-**正直な現状(2026-11 の実測、各 2 回)**: 小さな機能追加 3 課題・罠つき難課題 3 課題とも、素の Claude Code と正確さは同等(隠しテスト全通過)。対話時の手間は 0.6 系で時間 2〜3 倍だったものが、0.8.3 でほぼ同等(時間 約 37〜40 秒 対 39 秒、コスト +4〜10%)。価値の主張は「人が見ていない並列・PR 経路での信頼」(単位内ゲート、証拠つき PR、振り分け、land)。計測は `tests/bench/`、記録は docs/design.md D14。
+**正直な現状(2026-11 の実測、各 2 回)**: 小さな機能追加 3 課題・罠つき難課題 3 課題とも、素の Claude Code と正確さは同等(隠しテスト全通過)。対話時の手間は 0.6 系で時間 2〜3 倍だったものが、0.8.3 でほぼ同等(時間 約 37〜40 秒 対 39 秒、コスト +4〜10%)。価値の主張は「人が見ていない並列・PR 経路での信頼」(単位内ゲート、証拠つき PR、振り分け、land)。計測は `tests/bench/`、記録は docs/design.md D14。ベンチとリリース前スモークの対象(試験用プロジェクト)は非公開のため、そのままでは再現できない(`--trial` に自分の小さな Python CLI を指定し、`tests/bench/tasks` を合わせれば同じ手順で測れる)。
 
 **速くするための任意の手段**(既定にはしていない): 小さい作業は `/effort low`(実測で時間・コストとも数 % 減、罠のある課題での正確さは未確認)。Opus 系なら `/fast`(サブスクの枠外で追加課金)。
 
@@ -17,7 +19,7 @@ Claude Code を **少ないトークンで、正確に、速く** 回すため�
 ## 使い方
 
 ```bash
-git clone <this repo> ~/devaccel && cd ~/devaccel && git checkout <tag>   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.9.0   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
