@@ -1630,3 +1630,15 @@ class R10ForgedLinkTest(ReqKit):
         d, _ = self.gate(wt, agent="u9")
         self.assertEqual(d.get("decision"), "block")
         self.assertFalse(marker.exists())
+
+
+class R11NestedGitTest(ReqKit):
+    def test_gate_blocks_nested_git_inside_unit_worktree(self):
+        """A unit that creates a nested repo inside its worktree (so git discovery finds that one) is blocked."""
+        wt = self.root / ".claude" / "worktrees" / "u5"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "u5", str(wt))
+        inner = wt / "sub"
+        sh(wt, "git", "init", "-q", str(inner))
+        (inner / "x.py").write_text("X = 1\n")
+        d, _ = self.gate(inner, agent="u5")
+        self.assertEqual(d.get("decision"), "block")

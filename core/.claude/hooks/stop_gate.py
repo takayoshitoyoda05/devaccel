@@ -234,7 +234,7 @@ CTX: dict = {}  # for the error log: what we knew when it failed
 
 def main() -> int:
     data = read_stdin_json()
-    CTX.update({"session": str(data.get("agent_id") or data.get("session_id") or "")})
+    CTX.update({"session": str(data.get("agent_id") or data.get("session_id") or ""), "cwd": str(data.get("cwd") or "")})
     root = project_root(data)  # what is checked (may be a /batch worktree)
     anchor = trusted_root(data)  # config and check.sh come from here, not from the worktree
     cfg = load_config(anchor)
@@ -246,10 +246,14 @@ def main() -> int:
     cwd = str(data.get("cwd") or "")
     if "/.claude/worktrees/" in cwd + "/":
         unit = True
-        wt_top = Path(str(Path(cwd).resolve()).split("/.claude/worktrees/")[0]) / ".claude" / "worktrees" / \
-            str(Path(cwd).resolve()).split("/.claude/worktrees/")[1].split("/")[0]
-        # broken or redirected .git link: no git runs here (a forged git dir could carry commands)
-        if "/.claude/worktrees/" not in str(root) + "/" or not worktree_link_ok(wt_top, anchor):
+        rc = str(Path(cwd).resolve()) + "/"
+        parts = rc.split("/.claude/worktrees/", 1)
+        name = parts[1].split("/")[0] if len(parts) == 2 else ""
+        wt_top = Path(parts[0]) / ".claude" / "worktrees" / name if name else None
+        # the tree git actually uses must BE this worktree (no nested .git) and its link must point at the
+        # anchor's own worktree dir (read as a file); otherwise block — never run git in a forged checkout
+        if (wt_top is None or root.resolve() != wt_top.resolve()
+                or not worktree_link_ok(wt_top, anchor)):
             # a unit must not escape its gate by breaking .git: block like a failure, escalate after max_rounds
             sid = str(data.get("agent_id") or data.get("session_id") or "default")
             sess = load_session(anchor, sid)
@@ -379,6 +383,10 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:  # never break the session because of the gate itself, but leave a trace
         print(f"[devaccel] stop_gate internal error: {e}", file=sys.stderr)
+        if CTX.get("scope") == "unit" or "/.claude/worktrees/" in str(CTX.get("cwd", "")):
+            # unattended unit: fail closed (a crash must not let unverified work through)
+            emit({"decision": "block", "reason": f"[devaccel] ゲートの内部エラーで検査できませんでした: {e}。"
+                                                 "作業ツリーを元の形に戻してから終了してください。"})
         try:
             log_event(trusted_root(None), {**CTX, "result": "error", "error": repr(e)[:300]})
         except Exception:
