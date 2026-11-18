@@ -508,8 +508,12 @@ def cmd_doctor(root: Path) -> int:
 
     try:
         cfg = json.loads((root / ".claude/project.json").read_text())
-        mode = cfg.get("gate", {}).get("mode", "observe")
-        notes.append(f"gate.mode={mode}")
+        gate_cfg = cfg.get("gate", {})
+        mode = gate_cfg.get("mode", "off")
+        notes.append(f"gate: session={mode} unit={gate_cfg.get('unit_mode', 'enforce')}")
+        if mode == "observe":
+            notes.append("gate.mode=observe runs check.sh every turn without blocking: \"off\" is the default "
+                         "since 0.8.0 (measured: no accuracy gain interactively; /batch units use unit_mode)")
     except (OSError, ValueError) as e:
         problems.append(f".claude/project.json unreadable: {e}")
         cfg = {}
@@ -547,7 +551,7 @@ def cmd_doctor(root: Path) -> int:
     if rep.exists():
         r = subprocess.run([sys.executable, str(rep)], cwd=root, capture_output=True, text=True,
                            env={**os.environ, "CLAUDE_PROJECT_DIR": str(root)})
-        notes += [ln for ln in r.stdout.splitlines() if ln.startswith(("gate runs", "promotion"))]
+        notes += [ln for ln in r.stdout.splitlines() if ln.startswith("gate runs")]
 
     for n in notes:
         print("· " + n)

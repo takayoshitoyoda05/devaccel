@@ -36,7 +36,7 @@ def sh(cmd: list[str], cwd: Path, timeout: int = 900, env: dict | None = None) -
                           stdin=subprocess.DEVNULL)
 
 
-CONDS = ("vanilla", "devaccel", "devaccel-noverify", "devaccel-gateonly")
+CONDS = ("vanilla", "devaccel", "devaccel-nosandbox", "devaccel-enforce")
 
 
 def prepare(cond: str, trial: Path, ref: str) -> Path:
@@ -55,13 +55,10 @@ def prepare(cond: str, trial: Path, ref: str) -> Path:
         cm = (d / "CLAUDE.md").read_text(encoding="utf-8")
         (d / "CLAUDE.md").write_text(cm.split("\n## 進め方")[0].rstrip() + "\n", encoding="utf-8")
         sh(["git", "-c", "user.email=b@b", "-c", "user.name=bench", "commit", "-qam", "vanilla"], d)
-    elif cond != "devaccel":
-        cm = (d / "CLAUDE.md").read_text(encoding="utf-8")
-        if cond == "devaccel-noverify":  # without the verify-app rule
-            cm = "\n".join(ln for ln in cm.splitlines() if "verify-app" not in ln) + "\n"
-        else:  # gateonly: no process/verification text, hooks and settings stay
-            cm = cm.split("\n## 進め方")[0].rstrip() + "\n"
-        (d / "CLAUDE.md").write_text(cm, encoding="utf-8")
+    elif cond == "devaccel-nosandbox":  # isolate the sandbox's cost
+        st = json.loads((d / ".claude/settings.json").read_text(encoding="utf-8"))
+        st.get("sandbox", {})["enabled"] = False
+        (d / ".claude/settings.json").write_text(json.dumps(st, indent=2), encoding="utf-8")
         sh(["git", "-c", "user.email=b@b", "-c", "user.name=bench", "commit", "-qam", cond], d)
     sh(["uv", "sync", "-q"], d)
     return d
@@ -116,7 +113,8 @@ def main() -> int:
         t0 = time.time()
         keep = ("PATH", "HOME", "USER", "LANG", "TERM", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "UV_CACHE_DIR")
         env = {k: v for k, v in os.environ.items() if k in keep}  # no stray tokens from this shell
-        env["DEVACCEL_GATE_MODE"] = "enforce"  # the gate as intended in steady state
+        if cond == "devaccel-enforce":  # the interactive gate forced on (pre-0.8 behaviour, for comparison)
+            env["DEVACCEL_GATE_MODE"] = "enforce"
         r = sh(["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", a.model,
                 "--max-turns", str(a.max_turns), "--permission-mode", "acceptEdits",
                 "--allowedTools", *ALLOWED], d, timeout=3600, env=env)

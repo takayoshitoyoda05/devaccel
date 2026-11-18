@@ -190,7 +190,8 @@ def main() -> int:
     anchor = trusted_root(data)  # config and check.sh come from here, not from the worktree
     cfg = load_config(anchor)
     gate = cfg["gate"]
-    mode = gate["mode"]
+    unit = root != anchor  # a /batch unit's worktree: nobody is watching, so the gate matters here
+    mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
     if mode == "off" or not is_git_repo(root):
         return 0
 
@@ -220,6 +221,7 @@ def main() -> int:
         "session": sid,
         "branch": branch,  # devaccel_pr counts escalations for its own branch
         "mode": mode,
+        "scope": "unit" if unit else "session",
         "result": result,
         "secs": round(secs, 1),
         "files": len(relevant),

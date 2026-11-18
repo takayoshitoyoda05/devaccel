@@ -29,7 +29,7 @@ PR の振り分け(直近 30 件):
 2. **削除**候補: 一度も発火していない規則、発火しても結果を変えていない規則、現行モデルなら不要そうな指示(モデル世代が変わったら全行を再評価)。
 3. **調整**: would_block / escalate が多い段は誤検知か本当の問題かをユーザーと確認。遅い段(stage avg secs)は fast から外す・絞る案。
 4. **振り分けの評価**: `evidence-ok` で後にリバート・不具合が出たものがあれば、その原因を検出できる段(check / verify-app / risky_paths)を足す。`needs-human` ばかりなら理由の内訳を見て閾値を見直す。自動マージは、evidence-ok のリバートが 0 の期間が続いてから提案する。
-5. **昇格**: observe で `promote.min_runs` 以上、誤検知が `promote.max_false_positives` 以下なら `gate.mode: enforce` を提案。
+5. **単位ゲート**: `scope: unit` の block / escalate を見て、誤ブロック(段の誤検知)か本当の問題かを確認。誤検知が続く段は直すか fast から外す案。
 6. **ゲートや検査を緩める変更**(段の削除、mode を下げる、max_rounds を上げる、ignore を広げる)は、理由を明示し、必ずユーザーの明示的な承認を得る。
 
 ## 出力

@@ -3,7 +3,7 @@
 Claude Code を **少ないトークンで、正確に、速く** 回すための、プロジェクト配布型キット(Python 中心 / WSL・Linux)。
 研究用の重装備版(claude-ml-template)とは独立。設計の理由は [docs/design.md](docs/design.md)。
 
-- 常駐するのは短い `CLAUDE.md`(約30行)とスキル説明 2 行だけ。自作エージェントは 0。
+- 常駐するのは短い `CLAUDE.md`(約15行)とスキル説明 3 行だけ。自作エージェントは 0。対話セッションには検証の儀式を挟まない(実測で効かなかった)。
 - 正確さは LLM の審査ではなく **機械ゲート + 実際に動かす確認** で担保する。
 - 小さい作業には何も挟まない。L 規模だけ設計書と仕様照合。
 - 配布後は各プロジェクトで育てる(`project.json` / `/devaccel-tune`)。
@@ -26,8 +26,9 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 |---|---|
 | `~/devaccel/update.sh` | core を最新に。core が手編集されていたら止まって差分を表示 |
 | `~/devaccel/doctor.sh` | 改変・配線・ツール・CLAUDE.md 行数・ゲート統計の点検 |
-| `/devaccel-setup` | 初回生成(CLAUDE.md・verify-app・計測)。`--redetect` / `--codex on\|off` |
-| `/devaccel-tune` | ゲート記録から追加・削除・昇格を提案(承認後に適用) |
+| `/devaccel-setup` | 初回生成(CLAUDE.md・verify-app・計測)。`--redetect` |
+| `/devaccel-tune` | ゲート記録と PR 振り分けから追加・削除・調整を提案(承認後に適用) |
+| `/devaccel-batch` | 独立した S/M が 4 件以上のとき、コンテキストパックつきで `/batch` を呼ぶ |
 
 前提: python3 ≥ 3.8、git、bash。Python プリセットは uv・ruff・pyright・pytest(`uv add --dev ruff pyright pytest`)。
 
@@ -37,7 +38,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 |---|---|---|
 | `.claude/hooks/guard.py` | core | うっかりの破壊的 Bash(広範囲 rm -rf、sudo、force push、curl\|sh、git の --output 等)を拒否/確認。秘密は扱わない |
 | `.claude/hooks/stop_gate.py` | core | 終了時に `check.sh fast`。失敗段だけ返す・3 ラウンドで人に報告・L/テスト弱体化を表示 |
-| `.claude/skills/devaccel-{setup,tune}` | core | 手動専用(説明は常駐しない) |
+| `.claude/skills/devaccel-{setup,tune,batch}` | core | 手動専用(説明は常駐しない) |
 | `.claude/skills/devaccel-pr` + `hooks/devaccel_pr.py` | core | 証拠つき PR と `evidence-ok` / `needs-human` の振り分け |
 | `hooks/devaccel_land.py` | core | 並列 PR を最新 base 上でまとめて再検証し、通ったものをマージ(人が実行) |
 | `CLAUDE.md` | project | 進め方(S/M/L)と検証の作法 |
@@ -52,8 +53,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 
 ## ゲート(`.claude/project.json` の `gate`)
 
-- `mode`: `off` / `observe`(記録のみ・既定)/ `enforce`(ブロック)。
-  observe で `promote.min_runs` 回以上動かし、誤検知が無ければ `/devaccel-tune` で enforce へ。
+- 置き場所で既定が違う(0.8.0): 対話セッション `mode` = `off`(人が見ている。実測で正確さの上積みなし・時間だけ増えた)、/batch の単位(worktree)`unit_mode` = `enforce`(誰も見ていない。失敗段を返して直させ、3 回でユーザーへ)。値は `off` / `observe`(記録のみ)/ `enforce`。
 - 個人で一時的に変える: `.claude/settings.local.json` に `{"env": {"DEVACCEL_GATE_MODE": "off"}}`(doctor が表示)。
 - `spike/*` ブランチ、docs だけの変更、前回から変化のないターンでは走らない。
 - 失敗段の修正が `max_rounds`(3)回続いたら、Claude は修正をやめてユーザーに判断を仰ぐ。
@@ -62,7 +62,6 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 
 - settings.json の `allow` は信頼ダイアログ承認後に有効(deny/ask とフックは常に有効)。
 - 既存の `.claude/settings.json` があるプロジェクトでは マージしない。install が表示するフック 2 行を自分で追記する。
-- Codex 併用時(`/devaccel-setup --codex on`)、Codex には Stop フックが無いので担保は AGENTS.md の指示と CI のみ。
 - チーム利用: `scripts/check.sh`・`.claude/`・`.github/workflows/` を CODEOWNERS とブランチ保護で守ると、ゲートを緩める変更に人の承認が必要になる。
 - セッション途中でモデルを変えない、スキルに `model:` を書かない(キャッシュが作り直しになる)。
 
@@ -70,7 +69,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 
 検証ループ(ゲート・verify-app・仕様照合)で 1 本の作業を信頼できるものにし、それを並列に回して、人は振り分けられた PR だけを読む。
 
-1. 独立した S/M 作業の束を `/batch <指示>` に渡す(公式機能。作業を単位に分け、単位ごとに worktree で並列実装)。L は並列化せず design スキルで 1 本ずつ。
+1. 独立した S/M 作業の束(4 件以上)を `/devaccel-batch <一覧>` に渡す。コンテキストパックと単位向けの注意を付けて公式 `/batch` を呼ぶ(単位ごとに worktree で並列実装)。L は並列化せず design スキルで 1 本ずつ。
 2. 各単位は devaccel-pr スキルで PR を作る。本文はスクリプトが機械的に組み立てる証拠: `check.sh full` の結果、実動作確認の記録、受け入れ条件、変更規模。
 3. ラベルで振り分け:
    - `evidence-ok`: 検査通過・実動作確認あり・S/M・リスクのあるパスなし → 証拠だけ見てマージ

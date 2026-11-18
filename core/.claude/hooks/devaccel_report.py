@@ -46,10 +46,6 @@ def summarize(root: Path) -> list[str]:
         notes = collections.Counter(n for e in events if e.get("result") == "notice" for n in e.get("notes", []))
         for n, c in notes.most_common(3):
             out.append(f"notice x{c}: {n[:100]}")
-        promote = cfg["gate"]["promote"]
-        if cfg["gate"]["mode"] == "observe" and len(runs) >= promote["min_runs"]:
-            out.append(f"promotion: {len(runs)} runs >= {promote['min_runs']}; "
-                       f"review would_block={res.get('would_block', 0)} for false positives, then consider enforce")
     cm = root / "CLAUDE.md"
     if cm.exists():
         n = len(cm.read_text(encoding="utf-8").splitlines())

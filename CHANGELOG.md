@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0 (2026-11-18)
+実測(D14)にもとづき、検証を「人が見ていない境界」に絞る(D15)。
+- ゲート: 対話セッションの既定を `off`、/batch の単位(worktree)は新設の `gate.unit_mode`(既定 `enforce`)。記録に `scope`。`promote`(observe→enforce の昇格)を削除。既存プロジェクトの `observe` には doctor が off を案内。
+- seed CLAUDE.md を 15 行に(進め方・検証は 6 行)。S/M の作法、ゲートの説明、/batch・PR・Bash の注意を削除。
+- 新スキル `devaccel-batch`(手動): 4 件以上の独立 S/M を、コンテキストパックと単位向けの注意(Bash は単純に・最後に devaccel-pr)を付けて `/batch` に渡す。
+- verify-app の起動条件を「PR の前、または入口を通るテストが無い変更」に。
+- Codex 併用オプションを削除。
+- bench: devaccel 条件で enforce を強制しない。`devaccel-nosandbox` / `devaccel-enforce` 条件を追加。
+
 ## 0.7.2 (2026-11-18)
 - **修正(0.6.0 の退行)**: `Read(/.venv/**)` と `Read(/uv.lock)` の deny を削除。サンドボックスでは Read deny がファイルシステムの読み取り禁止になり、git(マージ時の stash)や uv が uv.lock を読めず失敗した。Read deny は秘密情報専用とする。既存プロジェクトは settings.json から手で削除(doctor が警告)。
 

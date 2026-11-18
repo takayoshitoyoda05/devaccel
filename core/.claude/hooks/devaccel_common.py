@@ -15,13 +15,15 @@ from pathlib import Path
 DEFAULTS: dict = {
     "presets": [],
     "gate": {
-        "mode": "observe",  # off | observe | enforce
+        # interactive sessions (a human is watching): off. /batch units (worktrees, unattended): enforce.
+        # Measured: an interactive gate costs wall time with no accuracy gain (docs/design.md D14/D15).
+        "mode": "off",  # off | observe | enforce
+        "unit_mode": "enforce",
         "timeout_sec": 60,
         "fast_budget_sec": 15,
         "max_rounds": 3,
         "skip_branches": ["spike/*"],
         "ignore": ["docs/**", "*.md", ".claude/state/**", "**/__pycache__/**", "*.pyc"],
-        "promote": {"min_runs": 10, "max_false_positives": 0},
     },
     "scale": {
         "large_if_files_over": 3,
@@ -108,7 +110,7 @@ def load_config(root: Path) -> dict:
     # Personal override (put in .claude/settings.local.json "env"). Shown by doctor.
     override = os.environ.get("DEVACCEL_GATE_MODE")
     if override in MODES:
-        cfg = _merge(cfg, {"gate": {"mode": override}})
+        cfg = _merge(cfg, {"gate": {"mode": override, "unit_mode": override}})
     return cfg
 
 

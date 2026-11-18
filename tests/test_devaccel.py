@@ -178,6 +178,21 @@ class KitTest(unittest.TestCase):
         st = json.loads((self.root / ".claude/settings.json").read_text())
         self.assertIn("stop_gate.py", json.dumps(st["hooks"]["SubagentStop"]))
 
+    def test_gate_defaults_off_in_session_enforce_in_units(self):
+        (self.root / "app.py").write_text("BROKEN\n")
+        r = sh(self.root, "python3", ".claude/hooks/stop_gate.py", env={"CLAUDE_PROJECT_DIR": str(self.root)},
+               stdin=json.dumps({"session_id": "s", "cwd": str(self.root)}))
+        self.assertEqual(r.stdout.strip(), "")  # interactive: off by default, check.sh not even run
+        self.assertFalse((self.root / ".claude/state/gate-log.jsonl").exists())
+        sh(self.root, "git", "checkout", "-q", "--", "app.py")
+        wt = self.tmp / "wt2"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "unit2", str(wt))
+        (wt / "app.py").write_text("BROKEN\n")
+        r = sh(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"), env={"CLAUDE_PROJECT_DIR": str(self.root)},
+               stdin=json.dumps({"session_id": "s", "agent_id": "u", "cwd": str(wt)}))
+        self.assertEqual(json.loads(r.stdout or "{}").get("decision"), "block", r.stdout + r.stderr)
+        self.assertIn('"scope": "unit"', (self.root / ".claude/state/gate-log.jsonl").read_text())
+
     def test_gate_ignores_docs_only(self):
         (self.root / "README.md").write_text("BROKEN\n")
         self.assertEqual(self.stop(), {})

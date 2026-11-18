@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # devaccel-setup
 
-引数: なし = 初回セットアップ / `--redetect` = 構成変化の差分だけ提案 / `--codex on|off` = Codex 併用の切替
+引数: なし = 初回セットアップ / `--redetect` = 構成変化の差分だけ提案
 
 現状:
 !`python3 .claude/hooks/devaccel_report.py 2>/dev/null; ls pyproject.toml uv.lock requirements*.txt setup.py package.json Makefile Cargo.toml go.mod AGENTS.md 2>/dev/null; cat .claude/project.json 2>/dev/null | head -40`
@@ -25,14 +25,9 @@ disable-model-invocation: true
    - `missing` の段があればツール導入を提案。
    - **check.sh が空(`no checks configured`、Python 以外)なら**: package.json の scripts / Makefile / Cargo.toml / go.mod などから lint・型・テストのコマンドを読み、`stage <名前> <コマンド>` の段と settings.json の allow を差分で提案する。空のままではゲートが何でも通す。
 5. **verify-app スキル**: 実行形態を判定(CLI / API / ライブラリ / バッチ)し、`.claude/skills/verify-app/SKILL.md` の `devaccel:fill` を埋める。中身は「起動・確認コマンド」と「落とし穴」に限る。**書いたら1回実際に実行して通ることを確かめる。**
-6. **Codex**: 併用するか聞く。on なら `--codex on` の手順を実行。
-7. **ゲート**: `gate.mode` は `observe` のまま。昇格は運用後に `/devaccel-tune` で判断する、と伝える。
-8. 最後に変更ファイル一覧と「コミットしてください」を示す。
+6. **ゲート**: 対話セッションでは既定 off(人が見ている)、/batch の単位では enforce(`gate.unit_mode`)と伝える。
+7. 最後に変更ファイル一覧と「コミットしてください」を示す。
 
 ## --redetect
 - 依存・ディレクトリ構成の変化から、**check.sh の段 / settings.json の allow / project.json の値** の変更案だけを出す。
 - CLAUDE.md の人が書いた文章は再生成しない(コマンド節の差し替え提案のみ可)。
-
-## --codex on|off
-- on: CLAUDE.md の本文を `AGENTS.md` に移し、CLAUDE.md は `@AGENTS.md` と Claude 固有の行(スキル参照・ゲート)だけにする。Codex には Stop フックが無いので、Codex 側の担保は AGENTS.md の検証指示と CI だけになる、と伝える。
-- off: 逆の操作。AGENTS.md を CLAUDE.md に戻す。
