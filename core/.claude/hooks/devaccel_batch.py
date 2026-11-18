@@ -108,8 +108,10 @@ def main() -> int:
         if r.returncode != 0:
             print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
             return 1
-        prompt = (head + "\n\n" if head else "") + it + ("\n\nこの 1 件だけを実装し、`scripts/check.sh fast` を通して終了する。"
-                                                         "コミットはしない(検査済みの作業ツリーを devaccel_batch がコミットする)。")
+        prompt = (head + "\n\n" if head else "") + it + (
+            "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
+            "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
+            "コミットはしない(ゲートを通った作業ツリーを devaccel_batch がコミットする)。")
         cmd = ["claude", "-p", prompt, "--model", model, "--effort", effort, "--append-system-prompt", rules.strip(),
                "--output-format", "json", "--permission-mode", "acceptEdits"]
         units.append({"i": i, "branch": br, "wt": wt, "cmd": cmd})
