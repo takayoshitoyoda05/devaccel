@@ -1586,3 +1586,23 @@ class R8TrustAnchorTest(ReqKit):
         self.assertNotEqual(self.anchor(wt), str(evil))
         self.assertEqual(self.anchor(wt), str(self.root))
         self.assertEqual(self.anchor(wt, {"DEVACCEL_TRUSTED_ROOT": str(evil)}), str(self.root))  # no env override
+
+
+class R9BatchSafetyTest(ReqKit):
+    def test_batch_never_autocommits_secrets_or_state(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        for f in [".env", "sub/.env.local", "certs/key.pem", "id_ed25519", ".claude/settings.json", ".devaccel/x",
+                  "pkg/__pycache__/m.pyc", ".netrc"]:
+            self.assertTrue(b.SKIP_NEW.search(f), f)
+        for f in ["src/kakeibo/new.py", "tests/test_new.py", "docs/envelope.md", "keys.py"]:
+            self.assertFalse(b.SKIP_NEW.search(f), f)
+
+    def test_git_helper_ignores_planted_fsmonitor(self):
+        """devaccel's git calls disable fsmonitor/hooks: a planted core.fsmonitor never runs on status."""
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_common as c
+        marker = self.tmp / "pwned"
+        sh(self.root, "git", "config", "core.fsmonitor", f"touch {marker}; echo")
+        c.git(self.root, "status", "--porcelain")
+        self.assertFalse(marker.exists())

@@ -51,7 +51,8 @@ MODES = ("off", "observe", "enforce")
 
 def _git_out(cwd: Path, *args: str) -> str:
     try:
-        r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, errors="replace", timeout=5)
+        r = subprocess.run(["git", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-C", str(cwd), *args],
+                           capture_output=True, text=True, errors="replace", timeout=5)
         return r.stdout.strip() if r.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -157,7 +158,10 @@ def git(root: Path, *args: str, check: bool = False) -> str:
     try:
         r = subprocess.run(
             # literal UTF-8 paths (no "\\303..." quoting) and no rename pairing: triage must see every path
-            ["git", "-c", "core.quotePath=false", "-c", "diff.renames=false", "-C", str(root), *args],
+            # no fsmonitor/hooks: a worktree's .git file is agent-writable and could point at a git dir whose
+            # config runs commands on `git status`
+            ["git", "-c", "core.quotePath=false", "-c", "diff.renames=false", "-c", "core.fsmonitor=",
+             "-c", "core.hooksPath=/dev/null", "-C", str(root), *args],
             capture_output=True,
             text=True, errors="replace",
             timeout=15,

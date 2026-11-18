@@ -29,6 +29,9 @@ sys.path.append(str(Path(__file__).resolve().parent))
 from devaccel_common import git, load_config  # noqa: E402
 
 ITEM = re.compile(r"^\s*(\d+)\.\s+", re.M)
+# never auto-committed from a unit's tree (secrets, keys, devaccel/Claude state)
+SKIP_NEW = re.compile(r"(^|/)(\.env(\..*)?|.*\.(pem|key|p12|pfx)|id_(rsa|ed25519|ecdsa)(\.pub)?|\.netrc)$"
+                      r"|^\.claude/|^\.devaccel/|(^|/)__pycache__/")
 
 
 def split_tasks(text: str) -> tuple[str, list[str]]:
@@ -142,13 +145,20 @@ def main() -> int:
         j = u["json"]
         cost += float(j.get("total_cost_usd") or 0)
         full.append(f"=== unit {u['i']} ({u['branch']}, {u['secs']}s)\n{j.get('result', '')}\n")
-        # commit exactly the tree the gate verified (the gate checks uncommitted and committed work alike)
+        # commit the tree the gate verified, using the git dir WE created (the worktree's .git file is
+        # agent-writable), with hooks/fsmonitor off; new files only if they don't look like secrets/state
         wt = u["wt"]
-        if git(wt, "status", "--porcelain").strip():
-            subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True)
-            subprocess.run(["git", "-C", str(wt), "-c", "user.name=devaccel-batch", "-c",
-                            "user.email=devaccel-batch@localhost", "commit", "-q", "-m",
-                            f"unit {u['i']}: " + " ".join(items[u["i"] - 1].split())[3:70]], capture_output=True)
+        gd = ["--git-dir", str(root / ".git" / "worktrees" / wt.name), "--work-tree", str(wt)]
+        safe = ["git", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", *gd]
+        subprocess.run([*safe, "add", "-u"], capture_output=True)
+        new = subprocess.run([*safe, "ls-files", "--others", "--exclude-standard", "-z"],
+                             capture_output=True, text=True).stdout.split("\0")
+        keep = [f for f in new if f and not SKIP_NEW.search(f)]
+        if keep:
+            subprocess.run([*safe, "add", "--", *keep], capture_output=True)
+        subprocess.run([*safe, "-c", "user.name=devaccel-batch", "-c", "user.email=devaccel-batch@localhost",
+                        "commit", "-q", "--no-verify", "-m",
+                        f"unit {u['i']}: " + " ".join(items[u["i"] - 1].split())[3:70]], capture_output=True)
         commits = git(root, "rev-list", "--count", f"{start}..{u['branch']}").strip()
         gated = gate_passed(root, u["branch"], u["t"])
         status = "ok" if commits not in ("", "0") and gated else (
