@@ -158,7 +158,11 @@ def main() -> int:
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
             "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
             "コミットはしない(ゲートを通った作業ツリーを devaccel_batch がコミットする)。")
+        # lean session: no MCP servers, only the tools a unit uses, no skill/command listing. That context is
+        # resent every turn (measured ~31K -> ~12K tokens); hooks, sandbox and CLAUDE.md still apply
         cmd = ["claude", "-p", prompt, "--model", "sonnet" if i in strong else model, "--effort", effort,
+               "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+               "--tools", "Read", "Edit", "Write", "Bash", "Grep", "Glob", "--disable-slash-commands",
                "--append-system-prompt", rules.strip(),
                "--output-format", "json", "--permission-mode", "acceptEdits"]
         for k in range(1, copies + 1):  # --hedge: the same task in k worktrees; the first to pass the gate wins
