@@ -499,7 +499,10 @@ class KitTest(unittest.TestCase):
                     "source x.sh && python3 .claude/hooks/devaccel_pr.py --title x",
                     "python3() { sh; }; python3 .claude/hooks/devaccel_pr.py --title x",
                     "hash -p /tmp/py python3; python3 .claude/hooks/devaccel_pr.py --title x",
-                    "true && python3 .claude/hooks/devaccel_pr.py --title x", "N=$(mktemp) && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N", "cat .claude/hooks/devaccel_land.py\npython3 x --merge"]:
+                    "true && python3 .claude/hooks/devaccel_pr.py --title x",
+                    'python3 .claude/hooks/devaccel_pr.py --title "$(cp x .claude/hooks/devaccel_pr.py)"',
+                    "python3 .claude/hooks/devaccel_pr.py --title `id`",
+                    "python3 .claude/hooks/devaccel_pr.py --title x > .claude/hooks/devaccel_pr.py", "N=$(mktemp) && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N", "cat .claude/hooks/devaccel_land.py\npython3 x --merge"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
         r = sh(self.root, "python3", ".claude/hooks/devaccel_land.py", "--merge")  # no TTY: refused in the script too
         self.assertEqual(r.returncode, 2)

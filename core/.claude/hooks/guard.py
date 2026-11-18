@@ -75,10 +75,11 @@ GH = re.compile(r"^\s*(?:\w+=\S*\s+)*" + WRAP + r"gh\s")
 OUTPUT_CMDS = re.compile(r"\bgit\s+" + GITOPT + r"(diff|log|show|format-patch|difftool|grep|stash\s+show)\b")
 # matched on quote/backslash-stripped text. The scripts run only in these exact forms; merging is human-only.
 PR_SCRIPT = re.compile(r"devaccel_(?:pr|land)\b")
-PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s|$)")
+# no expansions or redirections: $(...) in an argument runs after the lock check (TOCTOU)
+PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s[^`$<>]*)?\s*$")
 LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-run)?\s*$")
 # reads that cannot execute anything (no sed/less/rg: they have exec escapes)
-READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status|add))\s[^`$<>]*$")
+READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status))\s[^`$<>]*$")
 LAND_MERGE = re.compile(r"devaccel_land.*\s-+m", re.S)  # defense in depth, anywhere in the command
 PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # env changes before running the PR/land script could shadow python3 or its imports (PATH, PYTHONPATH, ...)
