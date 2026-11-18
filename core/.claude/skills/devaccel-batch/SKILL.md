@@ -14,8 +14,8 @@ disable-model-invocation: true
 
 ## 手順
 1. `git fetch origin` → 作業ブランチを切る(`git switch -c batch/<名前> origin/<base>`)。
-2. 各単位の **コンテキストパック** を作る: 編集するファイル / 読むべき参照 / 受け入れ条件 / 実行するテスト / 範囲外。README・docs を変えるなら担当を 1 単位に決める。
-3. Agent ツールで `devaccel-unit` を **単位の数だけ同じメッセージで** 起動する(並列に走る)。各単位の返事の `branch:` を控える。
+2. **親は薄く**: 親はコードを読まない(読むのは単位)。依頼文を単位ごとに分け、各単位に「その件の文面そのまま + 編集してよいファイル + 範囲外」だけを渡す。README・docs を変えるなら担当を 1 単位に決める。親の手数とコンテキストがコストの大半を占める(実測: 単位 4 つで $0.04、親 $0.33)。
+3. Agent ツールで `devaccel-unit` を **単位の数だけ同じメッセージで** 起動する(並列に走る)。各単位の返事の `branch:` を控える。返事の要約以外は読み込まない。
 4. `.devaccel/ship.md` に Write(1 行目 = 題名、以降 = 各単位の確認メモの要約)し、単独のコマンドで:
    `python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md --units <branch1> <branch2> ...`
    - 単位のブランチを `--no-ff` で統合(衝突した単位は外して報告)→ base の check.sh を 1 回 → push → PR 1 本。

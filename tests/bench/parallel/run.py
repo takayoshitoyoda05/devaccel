@@ -5,6 +5,7 @@ Arms (choose with --arms):
   seq_ship  one session, implements in order, then devaccel-pr (one-command devaccel_ship.py)
   par       /devaccel-batch as a user would call it (the skill may choose sequential for small work)
   par_force /devaccel-batch, told to always run devaccel-unit (haiku) units in parallel, then ship --units
+  <arm>_haiku  the same arm with the session itself on haiku (e.g. seq_ship_haiku, par_force_haiku)
 Measured per arm: wall clock until the PR exists, cost (+ per-model breakdown), turns, PR labels,
 held-out tests on the integrated result. Each arm's PRs/branches/worktrees are cleaned up afterwards.
 
@@ -50,7 +51,7 @@ def open_prs(trial: Path) -> list[dict]:
     return json.loads(r.stdout or "[]")
 
 
-def grade(trial: Path, branches: list[str], heldout: Path) -> dict:
+def grade(trial: Path, branches: list[str], heldout: Path, patch: Path | None = None) -> dict:
     wt = Path(sh(["mktemp", "-d"], trial).stdout.strip()) / "g"
     sh(["git", "fetch", "-q", "origin"], trial)
     sh(["git", "worktree", "add", "-q", "--detach", str(wt), "origin/main"], trial)
@@ -61,6 +62,8 @@ def grade(trial: Path, branches: list[str], heldout: Path) -> dict:
             if m.returncode != 0:
                 conflicts.append(b)
                 sh(["git", "merge", "--abort"], wt)
+        if patch is not None:  # the integrated diff, for the blind quality review
+            patch.write_text(sh(["git", "diff", "origin/main", "HEAD"], wt).stdout, encoding="utf-8")
         shutil.copy(heldout, wt / "tests" / heldout.name)
         sh(["uv", "sync", "-q"], wt)
         r = sh(["uv", "run", "pytest", "-q", f"tests/{heldout.name}"], wt)
@@ -97,19 +100,28 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
     sh(["git", "checkout", "-q", "main"], trial)
     sh(["git", "pull", "-q"], trial)
     before = {p["number"] for p in open_prs(trial)}
-    if arm in ("par", "par_force"):
+    if arm.endswith("_haiku"):  # the whole session (parent) on haiku; units are haiku anyway
+        model = "claude-haiku-5-5"
+        arm_base = arm[: -len("_haiku")]
+    else:
+        arm_base = arm
+    if arm_base in ("par", "par_force"):
         force = ("\n計測のため、使う条件(件数・規模)にかかわらず、必ず devaccel-unit を単位の数だけ並列に起動して実装し、"
-                 "ship --units で統合して。" if arm == "par_force" else "")
+                 "ship --units で統合して。" if arm_base == "par_force" else "")
         prompt = "/devaccel-batch " + tasks + force + "\n" + TAIL
     else:
         sh(["git", "checkout", "-q", "-B", f"bench/{arm}", "main"], trial)
-        how = OLD_PR if arm == "seq_old" else "最後に devaccel-pr スキルで PR を 1 本作って。"
+        how = OLD_PR if arm_base == "seq_old" else "最後に devaccel-pr スキルで PR を 1 本作って。"
         prompt = tasks + "\n上の各件を 1 つのセッションで順番に実装し、" + how + TAIL
     j, wall = claude(prompt, trial, model)
     new = [p for p in open_prs(trial) if p["number"] not in before]
     rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "turns": j.get("num_turns"),
            "models": usage(j), "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new],
-           "result_tail": (j.get("result") or "")[-300:], **grade(trial, [p["headRefName"] for p in new], heldout)}
+           "result_tail": (j.get("result") or "")[-300:]}
+    patch = HERE / "patches" / f"{dt.datetime.now():%m%d-%H%M%S}-{arm}.patch"
+    patch.parent.mkdir(exist_ok=True)
+    rec.update(grade(trial, [p["headRefName"] for p in new], heldout, patch))
+    rec["patch"] = patch.name
     cleanup(trial, new)
     return rec
 
