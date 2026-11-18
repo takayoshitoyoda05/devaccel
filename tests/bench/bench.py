@@ -36,7 +36,8 @@ def sh(cmd: list[str], cwd: Path, timeout: int = 900, env: dict | None = None) -
                           stdin=subprocess.DEVNULL)
 
 
-CONDS = ("vanilla", "devaccel", "devaccel-nosandbox", "devaccel-enforce")
+CONDS = ("vanilla", "devaccel", "devaccel-nosandbox", "devaccel-enforce", "devaccel-effortlow", "devaccel-onecheck")
+ONECHECK = "- 検査は `scripts/check.sh fast` を 1 回だけ回す(ruff・pyright・pytest を個別に回さない)。\n"
 
 
 def prepare(cond: str, trial: Path, ref: str) -> Path:
@@ -55,6 +56,10 @@ def prepare(cond: str, trial: Path, ref: str) -> Path:
         cm = (d / "CLAUDE.md").read_text(encoding="utf-8")
         (d / "CLAUDE.md").write_text(cm.split("\n## 進め方")[0].rstrip() + "\n", encoding="utf-8")
         sh(["git", "-c", "user.email=b@b", "-c", "user.name=bench", "commit", "-qam", "vanilla"], d)
+    elif cond == "devaccel-onecheck":  # one CLAUDE.md line: run the combined check once
+        cm = (d / "CLAUDE.md").read_text(encoding="utf-8").rstrip("\n") + "\n" + ONECHECK
+        (d / "CLAUDE.md").write_text(cm, encoding="utf-8")
+        sh(["git", "-c", "user.email=b@b", "-c", "user.name=bench", "commit", "-qam", cond], d)
     elif cond == "devaccel-nosandbox":  # isolate the sandbox's cost
         st = json.loads((d / ".claude/settings.json").read_text(encoding="utf-8"))
         st.get("sandbox", {})["enabled"] = False
@@ -115,7 +120,8 @@ def main() -> int:
         env = {k: v for k, v in os.environ.items() if k in keep}  # no stray tokens from this shell
         if cond == "devaccel-enforce":  # the interactive gate forced on (pre-0.8 behaviour, for comparison)
             env["DEVACCEL_GATE_MODE"] = "enforce"
-        r = sh(["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", a.model,
+        effort = ["--effort", "low"] if cond == "devaccel-effortlow" else []
+        r = sh(["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", a.model, *effort,
                 "--max-turns", str(a.max_turns), "--permission-mode", "acceptEdits",
                 "--allowedTools", *ALLOWED], d, timeout=3600, env=env)
         wall = round(time.time() - t0)
@@ -138,7 +144,7 @@ def main() -> int:
                     tools[key] = tools.get(key, 0) + 1
         u = j.get("usage") or {}
         rec = {"task": task, "cond": cond, "rep": rep, "ref": ref[:8], "model": a.model, "wall_s": wall,
-               "turns": j.get("num_turns"), "cost_usd": j.get("total_cost_usd"), "is_error": j.get("is_error"),
+               "turns": j.get("num_turns"), "api_ms": j.get("duration_api_ms"), "cost_usd": j.get("total_cost_usd"), "is_error": j.get("is_error"),
                "subtype": j.get("subtype"), "in": u.get("input_tokens"), "out": u.get("output_tokens"),
                "cache_read": u.get("cache_read_input_tokens"), "cache_write": u.get("cache_creation_input_tokens"),
                "tools": tools,
