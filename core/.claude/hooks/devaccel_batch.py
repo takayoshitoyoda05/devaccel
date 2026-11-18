@@ -236,6 +236,7 @@ def main() -> int:
     notes.parent.mkdir(exist_ok=True)
     title = a.title or f"batch: {len(ok)} units ({slug})"
     notes.write_text(title + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[timing] units phase {round(time.time() - t0)}s", flush=True)
     r = subprocess.run([sys.executable, str(Path(__file__).with_name("devaccel_ship.py")), "--file",
                         str(notes.relative_to(root)), "--branch", a.branch, "--units", *ok], cwd=root)
     return r.returncode

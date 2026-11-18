@@ -317,7 +317,15 @@ def main() -> int:
     return open_pr(root, a.title, read_notes(a.verify_notes, root), a.dry_run)
 
 
-def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1) -> int:
+def stamp(label: str, t0: float) -> float:
+    """Phase timing to stderr when DEVACCEL_TIMING is set (benchmarks)."""
+    now = time.time()
+    if os.environ.get("DEVACCEL_TIMING"):
+        print(f"[timing] {label} {now - t0:.1f}s", file=sys.stderr, flush=True)
+    return now
+
+
+def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1, before_publish=None) -> int:
     """Build the evidence for HEAD, triage it, and create/update the PR (shared with devaccel_ship.py)."""
     cfg = load_config(trusted_root({"cwd": str(root)}))  # never the unit's own project.json
     par = cfg.get("parallel", {})
@@ -329,7 +337,9 @@ def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1) -
     if not head or head in protected:
         print(f"refusing to open a PR from {head or 'detached HEAD'}: use a work branch", file=sys.stderr)
         return 2
+    t = time.time()
     ev = collect(root, cfg, cfg["scale"]["base_branch"], notes, units)
+    t = stamp("evidence (snapshot + base check + triage)", t)
     body = render(ev, notes)
     if SECRET.search(body):  # check output and acceptance criteria end up in the body too
         print("PR body looks like it contains a credential (check output / notes); refused", file=sys.stderr)
@@ -339,6 +349,11 @@ def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1) -
         print(json.dumps({"label": ev["label"], "reasons": ev["reasons"]}, ensure_ascii=False))
         return 0
 
+    if before_publish is not None:  # e.g. ship's push, run in parallel with the evidence
+        rc = before_publish()
+        t = stamp("waited for push", t)
+        if rc != 0:
+            return rc
     repo = github_repo(root)
     if not repo:
         print("origin is not a github.com repository", file=sys.stderr)
@@ -379,6 +394,7 @@ def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1) -
             url = r.stdout.strip().splitlines()[-1] if r.returncode == 0 else ""
     finally:
         Path(f.name).unlink(missing_ok=True)
+    stamp("labels + PR create/update", t)
     if r.returncode != 0:
         print(r.stderr.strip() or r.stdout.strip(), file=sys.stderr)
         return 1

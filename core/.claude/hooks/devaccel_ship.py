@@ -20,13 +20,14 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+import time
 import sys
 from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (planted modules are refused by guard _pr_script_intact)
 from devaccel_common import git, load_config, trusted_root  # noqa: E402
-from devaccel_pr import SECRET, open_pr, read_notes  # noqa: E402
+from devaccel_pr import SECRET, open_pr, read_notes, stamp  # noqa: E402
 
 IDENT = ["-c", "user.name=devaccel-ship", "-c", "user.email=devaccel-ship@localhost"]
 
@@ -98,7 +99,9 @@ def main() -> int:
         print("--file: line 1 must be the PR title", file=sys.stderr)
         return 2
 
+    t = time.time()
     merged, skipped = integrate(root, a.units, head) if a.units else ([], [])
+    t = stamp("integrate units", t)
     for p in a.paths:
         if Path(p).is_absolute() or ".." in Path(p).parts:
             print(f"--paths: {p} must be relative to the repo", file=sys.stderr)
@@ -122,17 +125,23 @@ def main() -> int:
         print("notes look like they contain a credential; refused", file=sys.stderr)
         return 2
 
-    if not a.dry_run:
-        url = git(root, "config", "--get", "remote.origin.url").strip()
-        if not url:
-            print("no origin remote", file=sys.stderr)
-            return 2
-        p = subprocess.run(["git", "-C", str(root), "push", "origin", f"HEAD:refs/heads/{head}"],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        if p.returncode != 0:
-            print("push failed: " + (p.stderr.strip() or p.stdout.strip())[:300], file=sys.stderr)
+    t = stamp("add + commit", t)
+    if a.dry_run:
+        return open_pr(root, title, notes, True, units=max(1, len(merged)))
+    if not git(root, "config", "--get", "remote.origin.url").strip():
+        print("no origin remote", file=sys.stderr)
+        return 2
+    # push runs while the evidence is computed (they don't depend on each other); the PR waits for it
+    push = subprocess.Popen(["git", "-C", str(root), "push", "origin", f"HEAD:refs/heads/{head}"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+
+    def wait_push() -> int:
+        out, err = push.communicate()
+        if push.returncode != 0:
+            print("push failed: " + (err.strip() or out.strip())[:300], file=sys.stderr)
             return 1
-    return open_pr(root, title, notes, a.dry_run, units=max(1, len(merged)))
+        return 0
+    return open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
 
 
 if __name__ == "__main__":

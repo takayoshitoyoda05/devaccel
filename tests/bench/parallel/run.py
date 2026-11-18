@@ -110,6 +110,7 @@ def run_fanout(trial: Path, extra: list[str] | None = None) -> tuple[dict, float
     import re
     import sys
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    env["DEVACCEL_TIMING"] = "1"
     t0 = time.time()
     r = subprocess.run([sys.executable, ".claude/hooks/devaccel_batch.py", str(TASKS_PATH), "--branch",
                         "batch/fanout-bench", *(extra or [])], cwd=trial, capture_output=True, text=True, env=env,
@@ -117,7 +118,7 @@ def run_fanout(trial: Path, extra: list[str] | None = None) -> tuple[dict, float
     wall = time.time() - t0
     m = re.search(r"units: (\d+)/(\d+) ok, \d+s, \$([\d.]+)", r.stdout)
     return {"total_cost_usd": float(m.group(3)) if m else None, "num_turns": 0,
-            "result": (r.stdout + r.stderr)[-600:]}, wall
+            "result": (r.stdout + r.stderr)[-2500:]}, wall
 
 
 def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dict:
