@@ -89,7 +89,8 @@ def cleanup(trial: Path, prs: list[dict]) -> None:
         if b != "main":
             sh(["git", "branch", "-D", b], trial)
     for b in sh(["git", "ls-remote", "--heads", "origin"], trial).stdout.split():
-        if b.startswith("refs/heads/") and b != "refs/heads/main" and ("worktree-agent" in b or "bench" in b):
+        if b.startswith("refs/heads/") and b != "refs/heads/main" and any(k in b for k in ("worktree-agent", "bench",
+                                                                                               "unit/", "batch/")):
             sh(["git", "push", "-q", "origin", "--delete", b[len("refs/heads/"):]], trial)
     sh(["git", "fetch", "-q", "--prune"], trial)
 
@@ -100,10 +101,40 @@ def usage(j: dict) -> dict:
             for m, u in (j.get("modelUsage") or {}).items()}
 
 
+TASKS_PATH: Path | None = None
+
+
+def run_fanout(trial: Path) -> tuple[dict, float]:
+    """devaccel_batch.py: deterministic fan-out, no LLM parent (run as a human would, outside Claude Code)."""
+    import os
+    import re
+    import sys
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    t0 = time.time()
+    r = subprocess.run([sys.executable, ".claude/hooks/devaccel_batch.py", str(TASKS_PATH), "--branch",
+                        "batch/fanout-bench"], cwd=trial, capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL, timeout=3600)
+    wall = time.time() - t0
+    m = re.search(r"units: (\d+)/(\d+) ok, \d+s, \$([\d.]+)", r.stdout)
+    return {"total_cost_usd": float(m.group(3)) if m else None, "num_turns": 0,
+            "result": (r.stdout + r.stderr)[-600:]}, wall
+
+
 def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dict:
     sh(["git", "checkout", "-q", "main"], trial)
     sh(["git", "pull", "-q"], trial)
     before = {p["number"] for p in open_prs(trial)}
+    if arm == "fanout":
+        j, wall = run_fanout(trial)
+        new = [p for p in open_prs(trial) if p["number"] not in before]
+        rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "turns": 0, "models": {},
+               "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new], "result_tail": j["result"]}
+        patch = HERE / "patches" / f"{dt.datetime.now():%m%d-%H%M%S}-{arm}.patch"
+        patch.parent.mkdir(exist_ok=True)
+        rec.update(grade(trial, [p["headRefName"] for p in new], heldout, patch))
+        rec["patch"] = patch.name
+        cleanup(trial, new)
+        return rec
     if arm.endswith("_haiku"):  # the whole session (parent) on haiku; units are haiku anyway
         model = "claude-haiku-5-5"
         arm_base = arm[: -len("_haiku")]
@@ -144,6 +175,8 @@ def main() -> int:
     CAP = a.cap
     trial = a.trial.expanduser().resolve()
     tasks = a.tasks.read_text(encoding="utf-8")
+    global TASKS_PATH
+    TASKS_PATH = a.tasks.resolve()
     out = HERE / "results.jsonl"
     for rep in range(a.reps):
         for arm in a.arms.split(","):

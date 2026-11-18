@@ -62,6 +62,12 @@ def trusted_root(data: dict | None = None) -> Path:
     (a /batch unit) can edit its own copies of those, so they are never read from there."""
     env = os.environ.get("CLAUDE_PROJECT_DIR")
     if env:
+        # a session started inside a linked worktree (devaccel_batch fan-out: `claude -p` per unit) has its
+        # project dir = the worktree; the trust anchor is still the main checkout behind the common .git
+        git_dir = _git_out(Path(env), "rev-parse", "--path-format=absolute", "--git-dir")
+        common = _git_out(Path(env), "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if git_dir and common and git_dir != common and common.endswith("/.git"):
+            return Path(common).parent
         return Path(env)
     cwd = Path(data["cwd"]) if data and data.get("cwd") else Path.cwd()
     common = _git_out(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
