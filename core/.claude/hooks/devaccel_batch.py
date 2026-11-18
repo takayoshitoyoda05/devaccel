@@ -111,6 +111,9 @@ def main() -> int:
                     help="max concurrent units (0 = project.json parallel.max_jobs, else decided from this machine)")
     ap.add_argument("--model", default="", help="unit model (default: the devaccel-unit agent's model)")
     ap.add_argument("--effort", default="", help="unit effort (default: the devaccel-unit agent's)")
+    ap.add_argument("--strong", type=int, default=0,
+                    help="run the K longest tasks (by text length, a proxy for size) on sonnet; the slowest unit "
+                         "sets the wall clock")
     ap.add_argument("--no-context", action="store_true", help="do not inline the files the tasks name")
     ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
@@ -148,13 +151,15 @@ def main() -> int:
     units = []
     t0 = time.time()
     copies = max(1, a.hedge)
+    strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong)])
     for i, it in enumerate(items, 1):
         ctx = "" if a.no_context else context_files(root, head + "\n" + it)
         prompt = (head + "\n\n" if head else "") + it + ctx + (
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
             "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
             "コミットはしない(ゲートを通った作業ツリーを devaccel_batch がコミットする)。")
-        cmd = ["claude", "-p", prompt, "--model", model, "--effort", effort, "--append-system-prompt", rules.strip(),
+        cmd = ["claude", "-p", prompt, "--model", "sonnet" if i in strong else model, "--effort", effort,
+               "--append-system-prompt", rules.strip(),
                "--output-format", "json", "--permission-mode", "acceptEdits"]
         for k in range(1, copies + 1):  # --hedge: the same task in k worktrees; the first to pass the gate wins
             tag = f"{slug}-{i}" + (f"h{k}" if copies > 1 else "")

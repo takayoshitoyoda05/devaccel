@@ -128,7 +128,8 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
     if arm.startswith("fanout"):
         extra = {"fanout_hedge": ["--hedge", "2"], "fanout_sonnet": ["--model", "sonnet"],
                  "fanout_med": ["--effort", "medium"], "fanout_high": ["--effort", "high"],
-                 "fanout_noctx": ["--no-context"]}.get(arm)
+                 "fanout_noctx": ["--no-context"], "fanout_strong1": ["--strong", "1"],
+                 "fanout_strong2": ["--strong", "2"]}.get(arm)
         j, wall = run_fanout(trial, extra)
         new = [p for p in open_prs(trial) if p["number"] not in before]
         rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "turns": 0, "models": {},
