@@ -189,7 +189,8 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         # allowlist, not a denylist: the script runs alone (only plain reads may share the command)
         return "deny", "devaccel のスクリプトは単独のコマンドで実行してください(環境変数・cd・関数定義などと並べない)。スクリプトを読むだけなら Read ツールを使う。"
     if PR_SCRIPT.search(flat) and PIPE.search(flat) and not all(READERS.search(s) for s in segs_flat):
-        return "deny", "devaccel_pr/land を名指しするコマンドで、他のコマンドへのパイプは使えません。"
+        return "deny", ("devaccel のスクリプトを名指しするコマンドで、他のコマンドへのパイプは使えません"
+                        "(出力は短いのでそのまま実行する)。")
     for s in segs_flat:
         if not PR_SCRIPT.search(s) or READERS.search(s):
             continue
@@ -282,13 +283,28 @@ def capture_prompt(data: dict, root: Path) -> None:
                 best = text
     except OSError:
         best = ""
-    if out.is_symlink() or (out.parent.exists() and out.parent.is_symlink()):
-        return
-    if best:
+    # no symlink anywhere on the way, checked atomically by the kernel (O_NOFOLLOW on the dir and the file):
+    # a sandboxed session must not turn this unsandboxed write into a write elsewhere
+    import os
+    try:
         out.parent.mkdir(exist_ok=True)
-        out.write_text(best, encoding="utf-8")
-    else:
-        out.unlink(missing_ok=True)
+        dfd = os.open(out.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        if best:
+            fd = os.open(out.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(best)
+        else:
+            try:
+                os.unlink(out.name, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
 
 
 def main() -> int:

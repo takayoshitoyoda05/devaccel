@@ -153,7 +153,12 @@ def main() -> int:
             print("push failed: " + (err.strip() or out.strip())[:300], file=sys.stderr)
             return 1
         return 0
-    return open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
+    rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
+    if rc == 0:  # used: a later ship must never reuse these notes (a failed Write would ship stale ones)
+        nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
+        if root.resolve() in nf.resolve().parents and not nf.is_symlink():
+            nf.unlink(missing_ok=True)
+    return rc
 
 
 if __name__ == "__main__":

@@ -401,7 +401,8 @@ class KitTest(unittest.TestCase):
             'case "$1 $2" in\n'
             '  "pr list") cat "$FAKE_GH_PRS";;\n'
             '  "pr view") if [ -n "$FAKE_GH_VIEW" ]; then echo "$FAKE_GH_VIEW"; else exit 1; fi;;\n'
-            '  "pr create") echo https://github.com/o/r/pull/9;;\n'
+            '  "pr create") for a in "$@"; do [ -n "$bf" ] && { cat "$a" >> "$FAKE_GH_LOG"; bf=; }; '
+            '[ "$a" = --body-file ] && bf=1; done; echo https://github.com/o/r/pull/9;;\n'
             'esac\n')
         (self.bin / "gh").chmod(0o755)
         self.prs: list[dict] = []

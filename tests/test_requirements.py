@@ -1775,11 +1775,13 @@ class R18BatchEndToEndTest(R6ShipTest):
         self.assertNotIn("BROKEN", sh(self.root, "git", "show", "batch/t:app.py").stdout)
         self.assertEqual(sh(self.root, "git", "diff", "main", "batch/t", "--", ".claude").stdout, "")
         self.assertIn("check fail", r.stdout)
-        body = (self.root / ".devaccel/ship.md").read_text() + (self.root / ".devaccel/batch-t.log").read_text()
+        body = log + (self.root / ".devaccel/batch-t.log").read_text()  # the PR body (fake gh logs it) + log
+        self.assertEqual(list((self.root / ".devaccel").glob("*-pr.md")), [])  # used notes are removed
         for out in (r.stdout, body):
             self.assertNotIn("\x1b", out)
             self.assertNotIn("\x07", out)
-            self.assertNotIn("<!--", out)
+        self.assertNotIn("<!--", r.stdout)
+        self.assertEqual(body.count("<!--"), 1)  # only devaccel's own evidence marker
         self.assertIn("`", body)  # unit text sits in code spans in the PR body
         self.assertIn("@\u200bsomeone", body)
         self.assertEqual(sh(self.root, "git", "worktree", "list").stdout.count("\n"), 1)  # worktrees removed
@@ -1810,7 +1812,8 @@ class R19BatchHelpersTest(unittest.TestCase):
 
     def test_secret_and_config_names_are_never_committed(self):
         for f in [".env", ".ENV", "prod.env", ".env.local", "conf/.env", "key.PEM", "credentials.json", ".npmrc",
-                  ".aws/credentials", "id_ed25519", "x/secrets.yaml", ".claude/project.json", "CLAUDE.md"]:
+                  ".aws/credentials", "id_ed25519", "x/secrets.yaml", ".claude/project.json", "CLAUDE.md",
+                  "scripts/check.sh", ".github/workflows/ci.yml"]:
             self.assertTrue(self.b.SKIP_NEW.search(f), f)
         for f in ["src/app.py", "tests/test_env.py", "docs/keys.md", "environment.py"]:
             self.assertFalse(self.b.SKIP_NEW.search(f), f)
@@ -1970,3 +1973,36 @@ class R26PrNudgeTest(ReqKit):
         self.set_cfg({"pr": {"auto": False}})
         (self.root / "app.py").write_text("X = 2\n")
         self.assertNotIn("decision", self.stop())
+
+
+class R27ShipNotesConsumedTest(R6ShipTest):
+    def test_used_notes_are_removed_so_a_failed_write_cannot_ship_stale_ones(self):
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        r, _ = self.land("--file", self.notes(), script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((self.root / ".devaccel/ship.md").exists())
+        (self.root / "app.py").write_text("X = 3\n")
+        r, log = self.land("--file", ".devaccel/ship.md", script="devaccel_ship.py")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("pr create", log)
+
+
+class R28PromptCaptureSymlinkTest(R25PromptCaptureTest):
+    def test_never_writes_through_a_symlink(self):
+        cmd = "python3 .claude/hooks/devaccel_batch.py .devaccel/prompt.md --branch batch/x"
+        msg = {"type": "user", "message": {"content": "1. a\n2. b\n"}}
+        victim = self.tmp / "victim.txt"
+        victim.write_text("keep")
+        (self.root / ".devaccel").mkdir(exist_ok=True)
+        (self.root / ".devaccel/prompt.md").symlink_to(victim)
+        self.run_guard(cmd, [msg])
+        self.assertEqual(victim.read_text(), "keep")
+        (self.root / ".devaccel/prompt.md").unlink()
+        (self.root / ".devaccel").rmdir()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (self.root / ".devaccel").symlink_to(outside)
+        self.run_guard(cmd, [msg])
+        self.assertFalse((outside / "prompt.md").exists())

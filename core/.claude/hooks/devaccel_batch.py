@@ -36,7 +36,8 @@ ITEM = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?(\d+)\.(?:\*\*)?[ \t]+", re
 # never auto-committed from a unit's tree, never inlined into a prompt (secrets, keys, devaccel/Claude state)
 SKIP_NEW = re.compile(r"(^|/)(\.?env|[^/]*\.env|\.env\.[^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore)|id_(rsa|ed25519|ecdsa|dsa)"
                       r"(\.pub)?|\.netrc|\.npmrc|\.pypirc|credentials(\.[^/]*)?|secrets?(\.[^/]*)?|[^/]*\.tfstate)$"
-                      r"|(^|/)\.(aws|ssh|gnupg|docker|kube)/|^\.claude/|^\.devaccel/|^CLAUDE\.md$|(^|/)__pycache__/",
+                      r"|(^|/)\.(aws|ssh|gnupg|docker|kube)/|^\.claude/|^\.devaccel/|^CLAUDE\.md$|(^|/)__pycache__/"
+                      r"|^scripts/check\.sh$|^\.github/",  # the verification machinery itself
                       re.I)
 CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 
@@ -453,7 +454,7 @@ def main() -> int:
         print("no unit to integrate", file=sys.stderr)
         cleanup(root, units, a.keep, branches=True)
         return 1
-    notes = root / ".devaccel" / "ship.md"
+    notes = root / ".devaccel" / f"batch-{slug}-pr.md"  # its own file (never the session's ship.md); ship removes it
     notes.parent.mkdir(exist_ok=True)
     title = a.title or f"batch: {len(ok)} units ({slug})"
     notes.write_text(title + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
