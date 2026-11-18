@@ -338,6 +338,16 @@ def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1, b
         print(f"refusing to open a PR from {head or 'detached HEAD'}: use a work branch", file=sys.stderr)
         return 2
     t = time.time()
+    # GitHub lookups that don't depend on the evidence run while it is computed (they were ~5 s in series)
+    early: dict = {}
+    head0 = git(root, "symbolic-ref", "--short", "-q", "HEAD").strip()
+    repo0 = github_repo(root) if not dry_run else ""
+    if repo0 and head0:
+        bg = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, cwd=root)
+        early["labels"] = [subprocess.Popen(["gh", "label", "create", n, "-R", repo0, "--color", c, "--description",
+                                             d], **bg) for n, (c, d) in LABELS.items()]
+        early["view"] = subprocess.Popen(["gh", "pr", "view", head0, "-R", repo0, "--json",
+                                          "url,state,headRefOid,baseRefName,isCrossRepository,labels"], **bg)
     ev = collect(root, cfg, cfg["scale"]["base_branch"], notes, units)
     t = stamp("evidence (snapshot + base check + triage)", t)
     body = render(ev, notes)
@@ -362,14 +372,26 @@ def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1, b
     if remote_head != git(root, "rev-parse", "HEAD").strip():
         print("push first: git push origin HEAD", file=sys.stderr)
         return 2
-    for name, (color, desc) in LABELS.items():
-        run(["gh", "label", "create", name, "-R", repo, "--color", color, "--description", desc], root)
+    if early and repo == repo0 and ev["head"] == head0:
+        for lp in early["labels"]:
+            lp.communicate()
+        vout, _ = early["view"].communicate()
+        cur_rc = early["view"].returncode
+    else:
+        for name, (color, desc) in LABELS.items():
+            run(["gh", "label", "create", name, "-R", repo, "--color", color, "--description", desc], root)
+        cur = run(["gh", "pr", "view", ev["head"], "-R", repo, "--json",
+                   "url,state,headRefOid,baseRefName,isCrossRepository,labels"], root)
+        vout, cur_rc = cur.stdout, cur.returncode
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write(body)
     try:
-        cur = run(["gh", "pr", "view", ev["head"], "-R", repo, "--json",
-                   "url,state,headRefOid,baseRefName,isCrossRepository,labels"], root)
-        existing = json.loads(cur.stdout) if cur.returncode == 0 and cur.stdout.strip() else {}
+        existing = json.loads(vout) if cur_rc == 0 and vout.strip() else {}
+        if early and existing.get("state") == "OPEN" and existing.get("headRefOid") != ev["head_sha"]:
+            # looked up before our push finished: ask again now that it has
+            cur = run(["gh", "pr", "view", ev["head"], "-R", repo, "--json",
+                       "url,state,headRefOid,baseRefName,isCrossRepository,labels"], root)
+            existing = json.loads(cur.stdout) if cur.returncode == 0 and cur.stdout.strip() else {}
         if existing.get("state") == "OPEN":  # re-run after fixing / merging base: refresh evidence and label
             if (existing.get("isCrossRepository") or existing.get("baseRefName") != ev["base"]
                     or existing.get("headRefOid") != ev["head_sha"]):
