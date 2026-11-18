@@ -168,8 +168,11 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
     if LAND_MERGE.search(flat):
         return "deny", "devaccel_land.py --merge(マージ)は人が端末で実行します。"
     segs_flat = [s for s in SEP.split(FD.sub(" ", flat)) if s.strip()]
-    if PR_SCRIPT.search(flat) and ENV_CHANGE.search(flat) and not all(READERS.search(s) for s in segs_flat):
-        return "deny", "devaccel_pr/land の実行と同じコマンドで環境変数・alias・source を変えないでください。"
+    runs = [s for s in segs_flat if PR_SCRIPT.search(s) and not READERS.search(s)]
+    if runs and (len(runs) > 1 or any(not READERS.search(s) for s in segs_flat if s not in runs)
+                 or ENV_CHANGE.search(flat)):
+        # allowlist, not a denylist: the script runs alone (only plain reads may share the command)
+        return "deny", "devaccel_pr/land は単独のコマンドで実行してください(環境変数・cd・関数定義などと並べない)。"
     if PR_SCRIPT.search(flat) and PIPE.search(flat) and not all(READERS.search(s) for s in segs_flat):
         return "deny", "devaccel_pr/land を名指しするコマンドで、他のコマンドへのパイプは使えません。"
     for s in segs_flat:

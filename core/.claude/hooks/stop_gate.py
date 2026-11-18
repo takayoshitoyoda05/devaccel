@@ -234,7 +234,11 @@ def main() -> int:
     if mode == "enforce" and sig == sess["fail"]:
         # stopping again without changing anything does not get past a failed check
         sess["streak"] += 1
-        reply = _block_or_escalate(sess, sig, sess["stage"] if "stage" in sess else "?", sess["reason"], max_rounds)
+        stage = sess["stage"] if "stage" in sess else "?"
+        reply = _block_or_escalate(sess, sig, stage, sess["reason"], max_rounds)
+        log_event(anchor, {"session": sid, "branch": branch, "mode": mode, "scope": "unit" if unit else "session",
+                           "result": "escalate" if "systemMessage" in reply else "fail", "stage": stage,
+                           "streak": sess["streak"], "repeat": True})
         emit(reply)
         save_session(anchor, sid, sess)
         return 0

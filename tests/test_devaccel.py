@@ -206,6 +206,7 @@ class KitTest(unittest.TestCase):
         (self.root / "app.py").write_text("BROKEN\n")
         self.assertEqual(stop().get("decision"), "block")
         self.assertEqual(stop().get("decision"), "block")
+        self.assertIn('"repeat": true', (self.root / ".claude/state/gate-log.jsonl").read_text())
         # non-UTF-8 file names / output do not crash the gate (it used to fail open)
         (self.root / "bad\udcff.py".encode("utf-8", "surrogateescape").decode("utf-8", "replace")).write_text("x = 1\n")
         os.makedirs(self.root / "raw", exist_ok=True)
@@ -495,7 +496,10 @@ class KitTest(unittest.TestCase):
                     "cd .claude/hooks && python3 devaccel_land.py --merge",
                     "export PATH=.devaccel:$PATH; python3 .claude/hooks/devaccel_pr.py --title x",
                     "PYTHONPATH=.devaccel python3 .claude/hooks/devaccel_pr.py --title x",
-                    "source x.sh && python3 .claude/hooks/devaccel_pr.py --title x", "N=$(mktemp) && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N", "cat .claude/hooks/devaccel_land.py\npython3 x --merge"]:
+                    "source x.sh && python3 .claude/hooks/devaccel_pr.py --title x",
+                    "python3() { sh; }; python3 .claude/hooks/devaccel_pr.py --title x",
+                    "hash -p /tmp/py python3; python3 .claude/hooks/devaccel_pr.py --title x",
+                    "true && python3 .claude/hooks/devaccel_pr.py --title x", "N=$(mktemp) && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N", "cat .claude/hooks/devaccel_land.py\npython3 x --merge"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
         r = sh(self.root, "python3", ".claude/hooks/devaccel_land.py", "--merge")  # no TTY: refused in the script too
         self.assertEqual(r.returncode, 2)
