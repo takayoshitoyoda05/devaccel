@@ -302,11 +302,12 @@ def cmd_install(root: Path) -> int:
     presets, runner = detect(root)
     created, kept = [], []
 
+    clash = [rel for rel in core_files() if (root / rel).exists() and sha(root / rel) != sha(CORE / rel)]
+    if clash:  # check everything before writing anything: no half-installed core without a lock
+        print("error: these already exist and differ. Move them away and retry:\n  " + "\n  ".join(clash))
+        return 1
     for rel in core_files():
         dst = root / rel
-        if dst.exists() and sha(dst) != sha(CORE / rel):
-            print(f"error: {rel} already exists and differs. Move it away and retry.")
-            return 1
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(CORE / rel, dst)
         created.append(rel)
@@ -376,6 +377,11 @@ def cmd_update(root: Path) -> int:
         return 1
 
     new_files = core_files()
+    clash = [r for r in new_files if r not in locked and (root / r).exists() and sha(root / r) != sha(CORE / r)]
+    if clash:  # a path that becomes core in this version already holds a user's file
+        print("update stopped: these paths become kit-owned in this version but hold your own files:\n  "
+              + "\n  ".join(clash) + "\nMove them away (or into project.json / a project-owned file), then rerun.")
+        return 1
     root_claude = root / ".claude"
     with tempfile.TemporaryDirectory(dir=root_claude, prefix=".devaccel-staging-") as tmp:
         staging = Path(tmp)
@@ -514,7 +520,7 @@ def cmd_doctor(root: Path) -> int:
     ok(not bad_denies, f"settings deny {bad_denies} breaks git/uv/worktrees under the sandbox",
        "remove them from .claude/settings.json (CHANGELOG 0.7.2)")
     if "stop_gate.py" not in json.dumps(wired.get("SubagentStop", [])):
-        notes.append("SubagentStop is not wired: the gate does not run inside /batch units. Add to hooks:\n"
+        problems.append("SubagentStop is not wired: the gate does not run inside /batch units. Add to hooks:\n"
                      + json.dumps({"SubagentStop": render_settings(["python"])["hooks"]["SubagentStop"]}))
 
     try:

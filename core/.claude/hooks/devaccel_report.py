@@ -25,7 +25,7 @@ def summarize(root: Path) -> list[str]:
                 events.append(json.loads(line))
             except ValueError:
                 pass
-    runs = [e for e in events if e.get("result") in ("pass", "fail", "would_block", "escalate", "timeout")]
+    runs = [e for e in events if e.get("result") in ("pass", "fail", "would_block", "escalate", "timeout", "missing", "error")]
     if not runs:
         out.append("gate log: no runs yet")
     else:

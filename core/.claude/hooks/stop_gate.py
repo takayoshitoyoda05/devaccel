@@ -220,6 +220,10 @@ def main() -> int:
 
     items = changed_paths(root)
     relevant = [it for it in items if not match_any(it[1], gate["ignore"])]
+    if unit:  # units commit before stopping (devaccel-pr): committed-but-unmerged work is checked too
+        seen_paths = {p for _s, p in relevant}
+        relevant += [("C", p) for p in sorted(branch_files(root, base_ref(root, cfg["scale"]["base_branch"])))
+                     if p not in seen_paths and not match_any(p, gate["ignore"]) and (root / p).exists()]
     if not relevant:
         return 0
 
@@ -270,6 +274,8 @@ def main() -> int:
         )
     elif result == "missing":
         log_event(anchor, event)
+        if mode == "enforce":  # never pass silently when the check could not run
+            reply["systemMessage"] = f"[devaccel] check.sh を実行できず未検査です: {output[:200] or 'scripts/check.sh がありません'}"
     elif result == "pass":
         sess["ok"], sess["streak"], sess["fail"] = sig, 0, ""
         log_event(anchor, event)
@@ -318,6 +324,10 @@ def _block_or_escalate(sess: dict, sig: str, stage: str, tail: str, max_rounds: 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as e:  # never break the session because of the gate itself
+    except Exception as e:  # never break the session because of the gate itself, but leave a trace
         print(f"[devaccel] stop_gate internal error: {e}", file=sys.stderr)
+        try:
+            log_event(trusted_root(None), {"result": "error", "error": repr(e)[:300]})
+        except Exception:
+            pass
         sys.exit(0)

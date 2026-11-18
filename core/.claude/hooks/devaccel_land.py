@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from devaccel_common import git, load_config, match_any  # noqa: E402
+from devaccel_common import git, load_config, match_any, trusted_root  # noqa: E402
 from devaccel_pr import DOCS, github_repo, run, run_base_check, static_triage  # noqa: E402
 
 IDENT = ["-c", "user.name=devaccel-land", "-c", "user.email=devaccel-land@localhost"]
@@ -58,7 +58,7 @@ def main() -> int:
             return 1
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
-    cfg = load_config(root)
+    cfg = load_config(trusted_root({"cwd": str(root)}))  # the main checkout's config, never a worktree's
     base = cfg["scale"]["base_branch"]
     repo = github_repo(root)
     if not repo:

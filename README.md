@@ -8,7 +8,7 @@ Claude Code を **少ないトークンで、正確に、速く** 回すため�
 - 小さい作業には何も挟まない。L 規模だけ設計書と仕様照合。
 - 配布後は各プロジェクトで育てる(`project.json` / `/devaccel-tune`)。
 
-**正直な現状(2026-11 の実測)**: 小さな機能追加 3 課題(sonnet、各 1 回)では、素の Claude Code と正確さは同等(隠しテスト全通過)。devaccel のコストは 0.6 系でトークン約 +25%・時間 2〜3 倍、0.7.1(S の verify-app 省略)で約 +13%・時間 +29% まで縮んだ。価値の主張は「人が見ていない並列・PR 経路での信頼」(ゲート、証拠つき PR、振り分け、land)にあり、小さな対話作業での上積みはまだ示せていない。計測は `tests/bench/`。
+**正直な現状(2026-11 の実測、各 2 回)**: 小さな機能追加 3 課題・罠つき難課題 3 課題とも、素の Claude Code と正確さは同等(隠しテスト全通過)。対話時の手間は 0.6 系で時間 2〜3 倍だったものが、0.8.3 でほぼ同等(時間 約 37〜40 秒 対 39 秒、コスト +4〜10%)。価値の主張は「人が見ていない並列・PR 経路での信頼」(単位内ゲート、証拠つき PR、振り分け、land)。計測は `tests/bench/`、記録は docs/design.md D14。
 
 **速くするための任意の手段**(既定にはしていない): 小さい作業は `/effort low`(実測で時間・コストとも数 % 減、罠のある課題での正確さは未確認)。Opus 系なら `/fast`(サブスクの枠外で追加課金)。
 
@@ -48,22 +48,23 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `.claude/skills/verify-app` | project | 「完了」前に実際に動かす手順(setup が生成) |
 | `scripts/check.sh` | project | `fast`(ゲート・自動整形あり)/ `full`(CI)。段を並べるだけ |
 | `.claude/project.json` | project | 挙動の調整点はすべてここ |
-| `.claude/settings.json` | project | permissions・サンドボックス・フック 2 行(install 時に 1 回だけ書く) |
+| `.claude/settings.json` | project | permissions・サンドボックス・フック(PreToolUse / Stop / SubagentStop。install 時に 1 回だけ書く) |
 | `.github/workflows/check.yml` | project | CI で `check.sh full` |
 
 **core は編集しない層**(update で置き換わる)。変えたい挙動は `project.json` か project 層で。
 
 ## ゲート(`.claude/project.json` の `gate`)
 
-- 置き場所で既定が違う(0.8.0): 対話セッション `mode` = `off`(人が見ている。実測で正確さの上積みなし・時間だけ増えた)、/batch の単位(worktree)`unit_mode` = `enforce`(誰も見ていない。失敗段を返して直させ、3 回でユーザーへ)。値は `off` / `observe`(記録のみ)/ `enforce`。
+- 置き場所で既定が違う(0.8.0): 対話セッション `mode` = `off`(人が見ている。実測で正確さの上積みなし・時間だけ増えた)、/batch の単位(worktree)`unit_mode` = `enforce`(誰も見ていない。失敗段を返して直させ、3 回直しても通らなければ 4 回目の失敗でユーザーへ)。値は `off` / `observe`(記録のみ)/ `enforce`。
 - 個人で一時的に変える: `.claude/settings.local.json` に `{"env": {"DEVACCEL_GATE_MODE": "off"}}`(doctor が表示)。
 - `spike/*` ブランチ、docs だけの変更、前回から変化のないターンでは走らない。
-- 失敗段の修正が `max_rounds`(3)回続いたら、Claude は修正をやめてユーザーに判断を仰ぐ。
+- 失敗段の修正を `max_rounds`(3)回しても通らなければ(4 回目の失敗で)、Claude は修正をやめてユーザーに判断を仰ぐ。何も変えずにもう一度止めても失敗は再提示される。作業単位では、コミット済みで base に未マージの変更も検査対象。検査できなかった場合(check.sh なし・timeout・内部エラー)は記録し、enforce では表示する。
+- 個人の一時的な上書き `DEVACCEL_GATE_MODE` は対話セッションだけに効く(作業単位のゲートは止まらない)。
 
 ## 注意
 
 - settings.json の `allow` は信頼ダイアログ承認後に有効(deny/ask とフックは常に有効)。
-- 既存の `.claude/settings.json` があるプロジェクトでは マージしない。install が表示するフック 2 行を自分で追記する。
+- 既存の `.claude/settings.json` があるプロジェクトでは マージしない。install が表示するフック(3 イベント)を自分で追記する。
 - チーム利用: `scripts/check.sh`・`.claude/`・`.github/workflows/` を CODEOWNERS とブランチ保護で守ると、ゲートを緩める変更に人の承認が必要になる。
 - セッション途中でモデルを変えない、スキルに `model:` を書かない(キャッシュが作り直しになる)。
 
@@ -109,7 +110,7 @@ install が `.claude/settings.json` にサンドボックス設定を書く。�
     "denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker/config.json", "~/.kube", "~/.npmrc", "~/.pypirc"],
     "allowWrite": ["~/.cache/pip", "~/.cache/pyright-python", "~/.cache/ruff", "~/.cache/uv"]
   },
-  "network": { "allowedDomains": ["files.pythonhosted.org", "github.com", "pypi.org", "registry.npmjs.org"] }
+  "network": { "allowedDomains": ["api.github.com", "files.pythonhosted.org", "github.com", "pypi.org", "registry.npmjs.org"] }
 }
 ```
 - `failIfUnavailable: true` のため、bubblewrap/socat が無いと Claude Code は起動しない(黙って保護なしで動くより安全)。協業者にも初回のインストールを案内する。

@@ -111,7 +111,7 @@ def load_config(root: Path) -> dict:
     # Personal override (put in .claude/settings.local.json "env"). Shown by doctor.
     override = os.environ.get("DEVACCEL_GATE_MODE")
     if override in MODES:
-        cfg = _merge(cfg, {"gate": {"mode": override, "unit_mode": override}})
+        cfg = _merge(cfg, {"gate": {"mode": override}})  # personal: sessions only, never the unit gate
     return cfg
 
 

@@ -1,7 +1,7 @@
 # devaccel core — DO NOT EDIT. Add project rules via .claude/project.json "guard".
 """PreToolUse(Bash) guard: stop *accidental* destructive commands.
 
-Scope is deliberately narrow (see docs/design.md D6):
+Scope is deliberately narrow (see docs/design.md D5b, D12):
 - Destructive / irreversible operations: broad rm -rf, sudo, force push, curl|sh,
   git options that write files or run programs, history-destroying git, DROP TABLE.
 - Parallel-PR policy: push only `git push origin HEAD` from a non-default branch, no remote
@@ -36,7 +36,7 @@ DENY: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bsudo\b"), "sudo は使えません。必要ならユーザーに依頼してください。"),
     (
         re.compile(r"\bgit\s+push\b[^;&|]*\s(--force(?!-with-lease)|-f\b|\+\S)"),
-        "force push は禁止です(--force-with-lease はユーザー確認の上で)。",
+        "force push は禁止です(--force-with-lease も含む。履歴の書き換えはユーザーが自分で行う)。",
     ),
     (
         re.compile(r"\b(curl|wget)\b[^;&]*\|\s*(sudo\s+)?(ba|z)?sh\b"),
