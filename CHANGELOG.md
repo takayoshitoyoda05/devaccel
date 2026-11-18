@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.8.1 (2026-11-18)
+- **高速化**: サンドボックスの denyRead から `~/**/.env` 系を削除し、`~/.ssh`・`~/.aws`・`~/.gnupg` を直接指定。ホーム全体のグロブは Bash 呼び出しごとに $HOME を走査し、1 回 4〜15 秒かかっていた(ホーム 190 万 inode で `find` 5.6 秒、`ls` 単体が 9.4 秒)。0.8.0 のベンチで devaccel の時間が vanilla の約 2 倍、サンドボックスなしなら +10% だった原因。既存プロジェクトは settings.json を手で直す(doctor が problem を出す)。
+
 ## 0.8.0 (2026-11-18)
 実測(D14)にもとづき、検証を「人が見ていない境界」に絞る(D15)。
 - ゲート: 対話セッションの既定を `off`、/batch の単位(worktree)は新設の `gate.unit_mode`(既定 `enforce`)。記録に `scope`。`promote`(observe→enforce の昇格)を削除。既存プロジェクトの `observe` には doctor が off を案内。

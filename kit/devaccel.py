@@ -201,8 +201,9 @@ SANDBOX = {
     "allowUnsandboxedCommands": False,  # ignore dangerouslyDisableSandbox retries
     "autoAllowBashIfSandboxed": True,   # sandboxed commands need no prompt (parallel units can't answer)
     # secrets: OS-level read denial for shell commands (the Read tool uses permissions.deny).
-    # "./" = project root in project settings; "~/" covers checkouts under $HOME.
-    "filesystem": {"denyRead": ["./**/.env", "./**/.env.*", "~/**/.env", "~/**/.env.*"]},
+    # "./" = project root in project settings. No "~/**" globs: the sandbox expands them on every Bash
+    # call, scanning all of $HOME (measured 4-15 s per call, 0.8.1). Home secrets are named directly.
+    "filesystem": {"denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg"]},
 }
 NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]}
 BASE_DOMAINS = ["github.com", "api.github.com"]  # git push + gh (PR script)
@@ -500,6 +501,14 @@ def cmd_doctor(root: Path) -> int:
         wired = {}
     bad_denies = [r for r in ("Read(/uv.lock)", "Read(/.venv/**)", "Read(/.claude/worktrees/**)")
                   if r in json.dumps(_perms(root))]
+    try:
+        deny_read = json.loads((root / ".claude/settings.json").read_text()).get("sandbox", {}) \
+            .get("filesystem", {}).get("denyRead", [])
+    except (OSError, ValueError):
+        deny_read = []
+    slow = [p for p in deny_read if p.startswith("~/") and "**" in p]
+    ok(not slow, f"sandbox denyRead {slow} scans all of $HOME on every Bash call (seconds each)",
+       'replace with "~/.ssh", "~/.aws", "~/.gnupg" (CHANGELOG 0.8.1)')
     ok(not bad_denies, f"settings deny {bad_denies} breaks git/uv/worktrees under the sandbox",
        "remove them from .claude/settings.json (CHANGELOG 0.7.2)")
     if "stop_gate.py" not in json.dumps(wired.get("SubagentStop", [])):
