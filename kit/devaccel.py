@@ -446,7 +446,7 @@ def cmd_doctor(root: Path) -> int:
         if not cond:
             problems.append(msg + (f"  → {hint}" if hint else ""))
 
-    ok(sys.version_info >= (3, 8), f"python3 {sys.version.split()[0]} < 3.8")
+    ok(sys.version_info >= (3, 10), f"python3 {sys.version.split()[0]} < 3.10")
     ok(shutil.which("git") is not None, "git not found")
     ok((root / ".git").exists(), "not a git repository root", "the Stop gate only works inside git")
 

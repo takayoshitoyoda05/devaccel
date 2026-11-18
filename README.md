@@ -32,7 +32,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `/devaccel-tune` | ゲート記録と PR 振り分けから追加・削除・調整を提案(承認後に適用) |
 | `/devaccel-batch` | 独立した S/M が 4 件以上のとき、コンテキストパックつきで `/batch` を呼ぶ |
 
-前提: python3 ≥ 3.8、git、bash。Python プリセットは uv・ruff・pyright・pytest(`uv add --dev ruff pyright pytest`)。
+前提: python3 ≥ 3.10、git、bash。Python プリセットは uv・ruff・pyright・pytest(`uv add --dev ruff pyright pytest`)。
 
 ## 導入されるもの
 

@@ -70,7 +70,7 @@ def denials(folder: Path) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trial", type=Path, default=Path.home() / "programming/python/devaccel-trial")
-    ap.add_argument("--max-bash-median", type=float, default=3.0)
+    ap.add_argument("--max-bash-median", type=float, default=2.0)  # PERF-04
     a = ap.parse_args()
     trial = a.trial.expanduser().resolve()
     tdir = transcript_dir(trial)

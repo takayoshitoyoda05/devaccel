@@ -143,7 +143,7 @@ class KitTest(unittest.TestCase):
         self.assertIn('"session": "a1"', log)
         self.assertIn('"branch": "unit"', log)
         # the unit cannot switch its gate off or neuter check.sh in its own worktree
-        (wt / ".claude/project.json").write_text('{"gate": {"mode": "off"}}')
+        (wt / ".claude/project.json").write_text('{"gate": {"mode": "off", "unit_mode": "off"}}')
         (wt / "scripts/check.sh").write_text("#!/usr/bin/env bash\necho '== ok: tests (0s)'\n")
         (wt / "app.py").write_text("BROKEN again\n")
         r = sh(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"),
@@ -222,8 +222,17 @@ class KitTest(unittest.TestCase):
         self.assertIn('"result": "missing"', (self.root / ".claude/state/gate-log.jsonl").read_text())
 
     def test_gate_ignores_docs_only(self):
+        # a check.sh that always fails: skipping it is the only way to get no block
+        (self.root / "scripts/check.sh").write_text('#!/usr/bin/env bash\necho "== stage: tests"\n'
+                                                    'echo "== failed: tests (0s)"; exit 1\n')
+        sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qam", "failing check")
         (self.root / "README.md").write_text("BROKEN\n")
+        (self.root / "docs").mkdir(exist_ok=True)
+        (self.root / "docs/notes.txt").write_text("x\n")
         self.assertEqual(self.stop(), {})
+        self.assertFalse((self.root / ".claude/state/gate-log.jsonl").exists())  # check.sh never ran
+        (self.root / "app.py").write_text("X = 2\n")  # control: a code change does run the failing check
+        self.assertEqual(self.stop().get("decision"), "block")
 
     def test_update_refuses_hand_edit_then_succeeds(self):
         hook = self.root / ".claude/hooks/guard.py"

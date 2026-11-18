@@ -64,7 +64,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | INST-05 | install は `.gitignore` に不足している行(`.claude/state/`、`.claude/settings.local.json`、`.claude/worktrees/`、`.devaccel/`、`__pycache__/`)だけを追記し、既存の行を消したり重複させたりしてはならない。 | 0.3.0、0.7.1 | unit |
 | INST-06 | install は Python プロジェクトを検出したとき、`presets=["python"]` の `project.json`、実行可能な `scripts/check.sh`(runner は uv か PATH)、対応する CI ワークフローを生成しなければならない。 | D10 | unit |
 | INST-07 | 生成された `check.sh full` は、本物の ruff・pyright・pytest で lint エラー・型エラー・テスト失敗を非 0 で検出し、ファイルを変更せず、`.claude/` 配下を整形・lint の対象にしてはならない。ツールが無い段は full で失敗、fast で `missing`、テスト 0 件は成功としなければならない。 | D3、README「開発」 | integration |
-| INST-08 | キットと core のスクリプトは python3 3.8 以上の標準ライブラリだけで動かなければならず、導入後のプロジェクトはキットの clone 先のパスに依存してはならない(clone だけで他の人・CI が動かせる)。 | D5、D8 | integration |
+| INST-08 | キットと core のスクリプトは python3 3.10 以上の標準ライブラリだけで動かなければならず(CI で 3.10 と 3.12 を回す)、導入後のプロジェクトはキットの clone 先のパスに依存してはならない(clone だけで他の人・CI が動かせる)。 | D5、D8 | integration |
 
 ### 2.2 UPDATE
 
@@ -81,7 +81,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 |---|---|---|---|
 | DOC-01 | doctor は problem が 1 つ以上あれば終了コード 1、無ければ `OK` と 0 を返し、導入先のファイルを変更してはならない。 | README | unit |
 | DOC-02 | doctor は core ファイルの欠落と手編集(lock とのハッシュ不一致)を problem として報告しなければならない。 | D9 | unit |
-| DOC-03 | doctor は guard / stop_gate の未配線を problem、`SubagentStop` の未配線を追記すべき設定つきで表示しなければならない。 | 0.6.0 | unit |
+| DOC-03 | doctor は guard / stop_gate / `SubagentStop` の未配線を problem(終了コード 1)とし、`SubagentStop` には追記すべき設定を示さなければならない。 | 0.6.0, 0.9.0 | unit |
 | DOC-04 | doctor は次を problem として報告しなければならない: サンドボックス無効、bubblewrap / socat の欠如、`~/` で始まりグロブ `**` を含む `denyRead`、`Read(/uv.lock)`・`Read(/.venv/**)`・`Read(/.claude/worktrees/**)` の deny、`Bash(git push*)` の ask、許可ドメインに `api.github.com` が無いこと。 | 0.2.0、0.4.0、0.6.4、0.7.2、0.8.1 | unit |
 | DOC-05 | doctor は次を problem として報告しなければならない: `check.sh` の欠如・実行不可、`.claude/state/` と `.devaccel/` が gitignore されていないこと、`CLAUDE.md` の行数が `budget.claude_md_max_lines` を超えていること、Python プリセットで ruff・pyright・pytest が見つからないこと。 | 0.7.1、D10 | unit |
 | DOC-06 | doctor は未記入の `devaccel:fill` 目印を表示し、記入済みの `devaccel:filled` を未記入と判定してはならない。 | 0.1.3 | unit |
@@ -241,3 +241,10 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | 10 | `DEVACCEL_GATE_MODE` が単位のゲートも止める | **コードを修正**: 対話セッションだけに効く。 |
 | 11 | design.md・docstring の古い記述 | 修正(D1・D4・D5 に追記、guard の参照を D5b/D12 に)。 |
 | 12 | force-with-lease のメッセージ、`-u` の扱い | メッセージを「禁止」に統一。スキルは「`-u` は不要」(guard は許可のまま)。 |
+
+## 5. テストで見つかった挙動の扱い(0.9.0)
+
+- GRD-03: ヒアドキュメント本文の行頭の `git add -A` も ask になる → **意図どおり**(規則は本文も見る。パーサの読み違いを作らない、0.1.x の教訓)。
+- GRD-11: `echo "sudo"` が deny になる → **誤検知として受け入れ**(実害が小さく、引用の解釈を足すと抜け道の元になる)。
+- 未テスト: SET-09/10・GATE-16 の SubagentStop 実発火(e2e-smoke)、GATE-09 の 110 秒上限(実時間が要る)、DOC-07 のブランチ保護表示(gh ログインが要る)。
+
