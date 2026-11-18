@@ -168,10 +168,13 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | SHIP-04 | 統合した PR の振り分けは単独の PR と同じ規則でなければならない(単位数で L 規模の基準を緩めない。ユーザー方針「検査の線は緩めない」、0.11.0 の緩和は撤回)。 | 0.11.0 | unit |
 | SHIP-05 | guard は ship を `python3 .claude/hooks/devaccel_ship.py …` の単独実行・展開なし・lock 一致の場合だけ許可しなければならない(PR スクリプトと同じ扱い)。 | 0.11.0 | unit |
 | SHIP-06 | `--branch` は保護ブランチ上でだけ、origin/<base> から作業ブランチを作って切り替えなければならない(main 自体は動かさない)。保護ブランチ名・不正な名前は拒否。 | 0.11.0 | unit |
-| BATCH-01 | `devaccel_batch.py` は単位ごとに `<main>/.claude/worktrees/<x>` を作り、`claude -p` を同時に起動し、Claude Code の中(`CLAUDECODE`)からの実行は拒否しなければならない。 | 0.12.0 | integration |
-| BATCH-02 | 単位を統合するのは、コミットがあり、かつゲートがその単位のブランチで `scope: unit` の pass を記録したものだけでなければならない。 | 0.12.0 | integration |
-| BATCH-03 | スクリプトのコミットは本体側の git dir を明示し、フック・fsmonitor を無効にし、秘密情報らしいファイルと `.claude/`・`.devaccel/` を含めてはならない。 | 0.12.0 | unit |
-| BATCH-04 | ゲートは単位の worktree の `.git` を(git を使わず)ファイルとして読み、`<anchor>/.git/worktrees/<x>` を指し、git の最上位が worktree そのものであるときだけ git を動かさなければならない。それ以外は block。 | 0.12.0 | unit |
+| BATCH-01 | `devaccel_batch.py` は単位ごとに `<main>/.claude/worktrees/<x>` を作り、`claude -p` を同時に起動しなければならない。Claude Code のサンドボックスの中(入れ子の bwrap が起動できない)では、単位を起動する前に拒否する。 | 0.12.0 / 0.13.0 | integration |
+| BATCH-02 | 単位を統合するのは、コミットがあり、かつスクリプト自身がそのコミットを本体の check.sh fast で隔離して検査して通り、検査の前後で木が変わらなかったものだけでなければならない(単位が書けるゲートの記録は信用しない)。 | 0.12.0 / 0.13.0(監査 M2) | integration |
+| BATCH-03 | スクリプトのコミットは本体側の git dir を明示し、フック・fsmonitor を無効にし、秘密情報らしいファイルと `.claude/`・`.devaccel/`・`CLAUDE.md` を含めてはならない。単位自身のコミットがそれらに触れていれば、その単位を統合しない。 | 0.12.0 / 0.13.0 | integration |
+| BATCH-04 | ゲートは単位の worktree の `.git` を、git を動かす前にファイルとして読み、`<anchor>/.git/worktrees/<その worktree 名>` を指し、その管理ディレクトリの逆リンクがこの worktree を指し、途中に入れ子の `.git` が無く、git の最上位が worktree そのものであるときだけ git を動かさなければならない。それ以外は block。 | 0.12.0 / 0.13.0(監査 M1) | unit |
+| BATCH-06 | Claude はファンアウトを自分で起動してよい(設定 `sandbox.excludedCommands` と allow で、そのコマンドだけサンドボックスの外・確認なし。ユーザー方針)。ただし形は `python3 .claude/hooks/devaccel_batch.py .devaccel/<名前>.md --branch batch/<名前> [--dry-run]` だけで、ガードとスクリプトの両方がこれを確かめ(依頼ファイルの実体は `.devaccel/` の中)、スクリプトは lock と一致しなければならない。 | 0.13.0 | unit |
+| BATCH-07 | 単位の自由文(報告)は、端末とPR本文に出す前に制御文字・双方向文字を除き、PR 本文ではコードスパンに入れなければならない。単位ごとに時間とターン数の上限を持ち、中断時もプロセス・worktree・単位ブランチを後始末しなければならない。 | 0.13.0(監査 M4/M5) | integration |
+| PR-13 | 対話セッションが未コミットのコード変更を残して止まるとき(`pr.auto`、既定 on)、1 回だけ止めて devaccel-pr での PR 化を促さなければならない。同じ状態でもう一度止まれば通す(ユーザーが PR 不要と言った場合に従える)。 | 0.13.0(ユーザー方針) | unit |
 | BATCH-05 | 同時に走らせる単位の数は固定値であってはならない。`--jobs` > `project.json` の `parallel.max_jobs` > 実行時のマシン(空きメモリ × 0.8 ÷ `parallel.unit_mem_mb`、CPU 数 × 2)の順に決め、決めた数と根拠を表示しなければならない。 | 0.12.1(ユーザー方針) | unit |
 
 ### 2.8 LAND(`devaccel_land.py`)
