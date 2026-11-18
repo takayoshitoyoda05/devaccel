@@ -168,6 +168,10 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | SHIP-04 | 統合した PR の振り分けは単独の PR と同じ規則でなければならない(単位数で L 規模の基準を緩めない。ユーザー方針「検査の線は緩めない」、0.11.0 の緩和は撤回)。 | 0.11.0 | unit |
 | SHIP-05 | guard は ship を `python3 .claude/hooks/devaccel_ship.py …` の単独実行・展開なし・lock 一致の場合だけ許可しなければならない(PR スクリプトと同じ扱い)。 | 0.11.0 | unit |
 | SHIP-06 | `--branch` は保護ブランチ上でだけ、origin/<base> から作業ブランチを作って切り替えなければならない(main 自体は動かさない)。保護ブランチ名・不正な名前は拒否。 | 0.11.0 | unit |
+| BATCH-01 | `devaccel_batch.py` は単位ごとに `<main>/.claude/worktrees/<x>` を作り、`claude -p` を同時に起動し、Claude Code の中(`CLAUDECODE`)からの実行は拒否しなければならない。 | 0.12.0 | integration |
+| BATCH-02 | 単位を統合するのは、コミットがあり、かつゲートがその単位のブランチで `scope: unit` の pass を記録したものだけでなければならない。 | 0.12.0 | integration |
+| BATCH-03 | スクリプトのコミットは本体側の git dir を明示し、フック・fsmonitor を無効にし、秘密情報らしいファイルと `.claude/`・`.devaccel/` を含めてはならない。 | 0.12.0 | unit |
+| BATCH-04 | ゲートは単位の worktree の `.git` を(git を使わず)ファイルとして読み、`<anchor>/.git/worktrees/<x>` を指し、git の最上位が worktree そのものであるときだけ git を動かさなければならない。それ以外は block。 | 0.12.0 | unit |
 
 ### 2.8 LAND(`devaccel_land.py`)
 
