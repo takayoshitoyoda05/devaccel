@@ -105,7 +105,8 @@ def main() -> int:
         if r.returncode != 0:
             print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
             return 1
-        prompt = (head + "\n\n" if head else "") + it + "\n\nこの 1 件だけを実装し、コミットして終了する。"
+        prompt = (head + "\n\n" if head else "") + it + ("\n\nこの 1 件だけを実装し、`scripts/check.sh fast` を通して終了する。"
+                                                         "コミットはしない(検査済みの作業ツリーを devaccel_batch がコミットする)。")
         cmd = ["claude", "-p", prompt, "--model", model, "--effort", effort, "--append-system-prompt", rules.strip(),
                "--output-format", "json", "--permission-mode", "acceptEdits"]
         units.append({"i": i, "branch": br, "wt": wt, "cmd": cmd})
@@ -135,9 +136,20 @@ def main() -> int:
                 done.append(u)
 
     ok, lines, cost = [], [], 0.0
+    log = root / ".devaccel" / f"batch-{slug}.log"
+    log.parent.mkdir(exist_ok=True)
+    full = []
     for u in sorted(done, key=lambda x: x["i"]):
         j = u["json"]
         cost += float(j.get("total_cost_usd") or 0)
+        full.append(f"=== unit {u['i']} ({u['branch']}, {u['secs']}s)\n{j.get('result', '')}\n")
+        # commit exactly the tree the gate verified (the gate checks uncommitted and committed work alike)
+        wt = u["wt"]
+        if git(wt, "status", "--porcelain").strip():
+            subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True)
+            subprocess.run(["git", "-C", str(wt), "-c", "user.name=devaccel-batch", "-c",
+                            "user.email=devaccel-batch@localhost", "commit", "-q", "-m",
+                            f"unit {u['i']}: " + " ".join(items[u["i"] - 1].split())[3:70]], capture_output=True)
         commits = git(root, "rev-list", "--count", f"{start}..{u['branch']}").strip()
         gated = gate_passed(root, u["branch"], u["t"])
         status = "ok" if commits not in ("", "0") and gated else (
@@ -146,7 +158,9 @@ def main() -> int:
         lines.append(f"- unit {u['i']} ({u['branch']}, {u['secs']}s): {status} — {summary}")
         if status == "ok":
             ok.append(u["branch"])
+    log.write_text("\n".join(full), encoding="utf-8")
     print("\n".join(lines))
+    print(f"(full unit reports: {log.relative_to(root)})")
     print(f"units: {len(ok)}/{len(units)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
 
     if not a.keep:
