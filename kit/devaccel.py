@@ -574,6 +574,12 @@ def cmd_doctor(root: Path) -> int:
         sb = json.loads((root / ".claude/settings.json").read_text()).get("sandbox", {})
     except (OSError, ValueError):
         sb = {}
+    if "Bash(python3 .claude/hooks/devaccel_batch.py *)" not in perms.get("allow", []) or \
+            "python3 .claude/hooks/devaccel_batch.py *" not in (sb.get("excludedCommands") or []):
+        notes.append("fan-out is not automatic here (0.13): Claude can't start devaccel_batch.py by itself. To "
+                     "allow it, add to .claude/settings.json: permissions.allow \"Bash(python3 .claude/hooks/"
+                     "devaccel_batch.py *)\" and sandbox.excludedCommands [\"python3 .claude/hooks/devaccel_batch.py *\"]"
+                     " (it then runs outside the sandbox without a prompt; units stay sandboxed)")
     if sb.get("enabled") and not sb.get("autoAllowBashIfSandboxed"):
         notes.append("sandbox.autoAllowBashIfSandboxed is off: /batch units will stop on permission prompts")
     try:  # parallel sizing for devaccel_batch (decided per machine at run time)
