@@ -95,7 +95,14 @@ def worktree_link_ok(tree: Path, anchor: Path) -> bool:
     target = Path(line[len("gitdir: "):].strip())
     if not target.is_absolute():
         target = tree / target
-    return target.resolve().parent == (anchor / ".git" / "worktrees").resolve()
+    target = target.resolve()
+    if target.parent != (anchor / ".git" / "worktrees").resolve() or target.name != tree.name:
+        return False  # another unit's admin dir would make this tree's result count for that unit's branch
+    try:  # and git's own back-link must name this tree
+        back = (target / "gitdir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return Path(back).resolve() == (tree / ".git").resolve()
 
 
 def project_root(data: dict | None = None) -> Path:

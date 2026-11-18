@@ -1502,7 +1502,7 @@ class R6ShipTest(ReqKit):
                 sh(self.root, "git", "add", f)
             self.commit(name)
         sh(self.root, "git", "checkout", "-qb", "batch/x", "main")
-        r, log = self.land("--file", self.notes("Batch"), "--units", "u1", "u2", "u3", "--dry-run",
+        r, log = self.land("--file", self.notes("Batch"), "--units", "u1", "u2", "u3", "--no-push",
                            script="devaccel_ship.py")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("統合した単位: u1, u2", r.stdout)
@@ -1510,7 +1510,7 @@ class R6ShipTest(ReqKit):
         self.assertTrue((self.root / "a.py").exists() and (self.root / "b.py").exists())
         sh(self.root, "git", "checkout", "-qB", "noop", "main")
         sh(self.root, "git", "checkout", "-qB", "batch/y", "main")
-        r, _ = self.land("--file", self.notes("Batch2"), "--units", "u2", "u2", "noop", "batch/y", "--dry-run",
+        r, _ = self.land("--file", self.notes("Batch2"), "--units", "u2", "u2", "noop", "batch/y", "--no-push",
                          script="devaccel_ship.py")
         self.assertIn("統合した単位: u2 /", r.stdout)  # counted once; no-op and current branch excluded
         self.assertIn("noop (no changes)", r.stdout)
@@ -1552,10 +1552,10 @@ class R7ShipBranchTest(ReqKit):
         before = sh(self.root, "git", "rev-parse", "main").stdout.strip()
         (self.root / "app.py").write_text("X = 4\n")
         for bad in ("master", "main", "a..b", "x;rm"):
-            r, _ = self.land("--file", ".devaccel/ship.md", "--branch", bad, "--dry-run", script="devaccel_ship.py")
+            r, _ = self.land("--file", ".devaccel/ship.md", "--branch", bad, "--no-push", script="devaccel_ship.py")
             self.assertEqual(r.returncode, 2, bad)
         self.assertEqual(sh(self.root, "git", "branch", "--list", "master").stdout.strip(), "")  # never created
-        r, _ = self.land("--file", ".devaccel/ship.md", "--branch", "feat/b", "--dry-run", script="devaccel_ship.py")
+        r, _ = self.land("--file", ".devaccel/ship.md", "--branch", "feat/b", "--no-push", script="devaccel_ship.py")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(sh(self.root, "git", "branch", "--show-current").stdout.strip(), "feat/b")
         self.assertEqual(sh(self.root, "git", "rev-parse", "main").stdout.strip(), before)
@@ -1706,3 +1706,125 @@ class R16PrConfinementTest(unittest.TestCase):
             self.assertFalse(p.need_confinement({"gate": {"sandbox": False}}))
         with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}), mock.patch("shutil.which", return_value=None):
             self.assertFalse(p.need_confinement(cfg))  # inside Claude Code's sandbox: already confined
+
+
+class R17ShipDryRunTest(R6ShipTest):
+    def test_dry_run_changes_nothing_and_paths_dot_refused(self):
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        head = sh(self.root, "git", "rev-parse", "HEAD").stdout
+        r, log = self.land("--file", self.notes(), "--dry-run", script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("pr create", log)
+        self.assertEqual(sh(self.root, "git", "rev-parse", "HEAD").stdout, head)  # nothing committed
+        self.assertIn("app.py", sh(self.root, "git", "status", "--porcelain").stdout)
+        for bad in (".", "./"):
+            r, _ = self.land("--file", self.notes(), "--no-push", "--paths", bad, script="devaccel_ship.py")
+            self.assertEqual(r.returncode, 2)
+        self.assertEqual(sh(self.root, "git", "rev-parse", "HEAD").stdout, head)
+
+
+class R18BatchEndToEndTest(R6ShipTest):
+    """BATCH-01..03 end to end with a stub `claude`: the script commits each unit and checks that commit itself
+    (confined); failing units and secrets/config edits are never integrated; unit text is neutralised."""
+
+    STUB = (
+        '#!/usr/bin/env bash\n'
+        'while [ "$1" != "-p" ]; do shift; done; p="$2"\n'
+        'case "$p" in\n'
+        '  *GOODTASK*) echo "A = 1" > a_mod.py;;\n'
+        '  *BADTASK*) echo "BROKEN = 1" >> app.py; echo "C = 1" > c_mod.py;;\n'
+        '  *SECRETTASK*) echo "TOKEN=x" > .env; echo "B = 1" > b_mod.py; echo " " >> .claude/project.json;;\n'
+        'esac\n'
+        'printf \'{"result": "\\u001b]0;pwn\\u0007 done @someone <!-- #1", "total_cost_usd": 0.001}\'\n')
+
+    def test_batch_integrates_only_units_whose_commit_passes_our_own_check(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "tasks.md"
+        tasks.write_text("1. GOODTASK: `a_mod.py` を作る。テストは不要。" + "x" * 80 + "\n"
+                         "2. BADTASK: `c_mod.py` を作る。テストは不要。" + "x" * 80 + "\n"
+                         "3. SECRETTASK: `b_mod.py` を作る。テストは不要。" + "x" * 80 + "\n")
+        r, log = self.land(str(tasks), "--branch", "batch/t", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("pr create", log)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/t").stdout.split()
+        self.assertIn("a_mod.py", files)
+        self.assertIn("b_mod.py", files)
+        self.assertNotIn("c_mod.py", files)  # its commit failed the check: not integrated
+        self.assertNotIn(".env", files)
+        self.assertNotIn("BROKEN", sh(self.root, "git", "show", "batch/t:app.py").stdout)
+        self.assertEqual(sh(self.root, "git", "diff", "main", "batch/t", "--", ".claude").stdout, "")
+        self.assertIn("check fail", r.stdout)
+        self.assertNotIn("\x1b", r.stdout)
+        self.assertNotIn("\x07", r.stdout)
+        self.assertIn("@\u200bsomeone", r.stdout)
+        self.assertNotIn("<!--", r.stdout)
+        self.assertEqual(sh(self.root, "git", "worktree", "list").stdout.count("\n"), 1)  # worktrees removed
+        self.assertEqual(sh(self.root, "git", "branch", "--list", "unit/*").stdout.strip(), "")
+
+    def test_batch_preflight_refuses_before_running_anything(self):
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "tasks.md"
+        tasks.write_text("1. GOODTASK `a_mod.py`\n")
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        r, log = self.land(str(tasks), "--branch", "batch/t", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("on branch feat", r.stderr)
+        self.assertEqual(sh(self.root, "git", "worktree", "list").stdout.count("\n"), 1)
+        sh(self.root, "git", "checkout", "-q", "main")
+        r, _ = self.land(str(tasks), "--branch", "main", "--dry-run", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not a valid work branch", r.stderr)
+
+
+class R19BatchHelpersTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch
+        self.b = devaccel_batch
+
+    def test_secret_and_config_names_are_never_committed(self):
+        for f in [".env", ".ENV", "prod.env", ".env.local", "conf/.env", "key.PEM", "credentials.json", ".npmrc",
+                  ".aws/credentials", "id_ed25519", "x/secrets.yaml", ".claude/project.json", "CLAUDE.md"]:
+            self.assertTrue(self.b.SKIP_NEW.search(f), f)
+        for f in ["src/app.py", "tests/test_env.py", "docs/keys.md", "environment.py"]:
+            self.assertFalse(self.b.SKIP_NEW.search(f), f)
+
+    def test_clean_neutralises_terminal_and_github_controls(self):
+        c = self.b.clean("\x1b]0;pwn\x07ok \x1b[2K @me closes #3 <!-- \u202e")
+        for bad in ("\x1b", "\x07", "\u202e", "<!--", "@me", "#3"):
+            self.assertNotIn(bad, c)
+        self.assertIn("ok", c)
+
+    def test_context_never_inlines_untracked_or_secret_files(self):
+        import tempfile
+        root = Path(tempfile.mkdtemp())
+        sh(root, "git", "init", "-q")
+        (root / "a.py").write_text("A = 1\n")
+        (root / ".env").write_text("TOKEN=x\n")
+        (root / "u.py").write_text("U = 1\n")
+        sh(root, "git", "add", "a.py", ".env")
+        ctx = self.b.context_files(root, "`a.py` `.env` `u.py`")
+        self.assertIn("A = 1", ctx)
+        self.assertNotIn("TOKEN", ctx)
+        self.assertNotIn("U = 1", ctx)
+
+
+class R20WorktreeLinkTest(ReqKit):
+    def test_link_to_another_units_admin_dir_is_rejected(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        from devaccel_common import worktree_link_ok
+        wts = self.root / ".claude/worktrees"
+        for n in ("a", "b"):
+            sh(self.root, "git", "worktree", "add", "-q", "-b", f"unit/{n}", str(wts / n))
+        self.assertTrue(worktree_link_ok(wts / "a", self.root))
+        (wts / "a/.git").write_text(f"gitdir: {self.root / '.git/worktrees/b'}\n")
+        self.assertFalse(worktree_link_ok(wts / "a", self.root))  # B's admin dir: A's pass would count for B

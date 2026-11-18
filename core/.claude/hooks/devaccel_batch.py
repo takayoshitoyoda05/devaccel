@@ -1,18 +1,18 @@
 # devaccel core — DO NOT EDIT.
-"""Deterministic fan-out (no LLM parent): one `claude -p --agent devaccel-unit` per task, all at once,
-then `devaccel_ship.py --units` -> one evidence PR.
+"""Deterministic fan-out (no LLM parent): one lean `claude -p` per task (the devaccel-unit rules appended to
+its system prompt), all at once, then `devaccel_ship.py --units` -> one evidence PR.
 
-Run it yourself from a terminal (or `! python3 ...` in Claude Code). Inside Claude Code's sandboxed Bash
-the nested `claude` cannot reach the API.
+Runs from a terminal, or from Claude Code when the project's settings run this exact command outside the
+sandbox (devaccel's settings do; inside the sandbox the nested `claude` cannot reach the API).
 
 usage: python3 .claude/hooks/devaccel_batch.py TASKS.md --branch batch/NAME [--title T] [--jobs N]
-                                              [--model M] [--hedge K] [--keep] [--dry-run]
-  --hedge K: run each task K times in separate worktrees; the first copy that passes the gate is used and
-             the slower copies are stopped (cuts tail latency; each copy is gated the same way).
+              [--model M] [--effort E] [--strong K] [--hedge K] [--speculate] [--no-context]
+              [--unit-timeout S] [--keep] [--dry-run]
   TASKS.md: optional common paragraph, then items starting with "1. ", "2. ", ... (one unit each).
-Verification is unchanged: each unit's session ends with the enforcing gate (check.sh fast, confined);
-a unit is integrated only if it committed work AND the gate log shows a pass for its branch; ship then
-runs the base branch's check.sh full on the integrated HEAD and triages the single PR.
+Verification: each unit's session ends with the enforcing gate (check.sh fast, confined) for feedback;
+then this script commits the unit's tree itself and re-runs the main checkout's check.sh fast on exactly
+that commit, confined, and requires the tree to be unchanged afterwards. Only units that pass are
+integrated; ship then runs the base branch's check.sh full on the integrated HEAD and triages the PR.
 """
 
 from __future__ import annotations
@@ -29,11 +29,23 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))
 from devaccel_common import git, load_config  # noqa: E402
+from stop_gate import run_check  # noqa: E402
 
 ITEM = re.compile(r"^\s*(\d+)\.\s+", re.M)
-# never auto-committed from a unit's tree (secrets, keys, devaccel/Claude state)
-SKIP_NEW = re.compile(r"(^|/)(\.env(\..*)?|.*\.(pem|key|p12|pfx)|id_(rsa|ed25519|ecdsa)(\.pub)?|\.netrc)$"
-                      r"|^\.claude/|^\.devaccel/|(^|/)__pycache__/")
+# never auto-committed from a unit's tree, never inlined into a prompt (secrets, keys, devaccel/Claude state)
+SKIP_NEW = re.compile(r"(^|/)(\.?env|[^/]*\.env|\.env\.[^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore)|id_(rsa|ed25519|ecdsa|dsa)"
+                      r"(\.pub)?|\.netrc|\.npmrc|\.pypirc|credentials(\.[^/]*)?|secrets?(\.[^/]*)?|[^/]*\.tfstate)$"
+                      r"|(^|/)\.(aws|ssh|gnupg|docker|kube)/|^\.claude/|^\.devaccel/|^CLAUDE\.md$|(^|/)__pycache__/",
+                      re.I)
+CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean(s: str) -> str:
+    """A unit's free text, made safe for the terminal and a PR body: no control/escape or bidi characters,
+    and no @mentions, issue links/closing keywords or HTML comments that would act on GitHub."""
+    s = CTRL.sub("", s)
+    return (s.replace("<", "&lt;").replace(">", "&gt;").replace("@", "@\u200b")
+            .replace("#", "#\u200b"))
 
 
 def split_tasks(text: str) -> tuple[str, list[str]]:
@@ -61,10 +73,14 @@ def context_files(root: Path, text: str, max_files: int = 3, max_bytes: int = 81
     """Inline small existing files the task text names (`path/like.py`): the unit starts with the types and
     helpers it must use instead of spending turns reading them (and guessing wrong)."""
     out, seen = [], set()
+    tracked = set(git(root, "ls-files", "-z").split("\0"))
     for m in re.finditer(r"`([\w./-]+\.[A-Za-z]{1,5})`", text):
         rel = m.group(1)
         p = (root / rel).resolve()
         if rel in seen or root.resolve() not in p.parents or not p.is_file() or p.stat().st_size > max_bytes:
+            continue
+        rel = p.relative_to(root.resolve()).as_posix()
+        if rel not in tracked or SKIP_NEW.search(rel):  # only committed project files, never secrets
             continue
         seen.add(rel)
         out.append(f"--- {rel}(参考: 現在の内容)\n" + p.read_text(encoding="utf-8", errors="replace"))
@@ -98,20 +114,67 @@ def plan_jobs(n_units: int, cli: int, cfg: dict, mem_mb: int, cpus: int) -> tupl
     return max(1, jobs), why
 
 
-def gate_passed(root: Path, branch: str, since: float) -> bool:
-    log = root / ".claude" / "state" / "gate-log.jsonl"
-    if not log.exists():
-        return False
-    for line in log.read_text(encoding="utf-8").splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("branch") == branch and e.get("result") == "pass" and e.get("scope") == "unit":
-            ts = e.get("ts", "")
-            if ts and time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S")) >= since - 2:
-                return True
-    return False
+def in_sandbox() -> bool:
+    """Inside Claude Code's sandbox a nested bwrap cannot start (and the nested claude has no API access)."""
+    import shutil
+    bw = shutil.which("bwrap")
+    if not bw:
+        return bool(os.environ.get("CLAUDECODE"))
+    return subprocess.run([bw, "--unshare-pid", "--ro-bind", "/", "/", "true"], capture_output=True,
+                          stdin=subprocess.DEVNULL).returncode != 0
+
+
+def protected_names(root: Path, base: str) -> set[str]:
+    names = {"main", "master", base}
+    h = git(root, "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD").strip()
+    return names | ({h.split("/", 1)[-1]} if h else set())
+
+
+def preflight(root: Path, base: str, branch: str) -> list[str]:
+    """Everything that would otherwise fail only after all units ran."""
+    import shutil
+    errs = []
+    if not re.fullmatch(r"[\w./-]+", branch) or ".." in branch or branch in protected_names(root, base):
+        errs.append(f"--branch {branch!r} is not a valid work branch name")
+    cur = git(root, "symbolic-ref", "--short", "-q", "HEAD").strip()
+    if cur and cur != branch and cur not in protected_names(root, base):
+        errs.append(f"on branch {cur}: run from {base} (a new {branch} is created from origin/{base})")
+    if cur != branch and git(root, "rev-parse", "-q", "--verify", f"refs/heads/{branch}").strip():
+        errs.append(f"branch {branch} already exists; pick another --branch")
+    for tool in ("claude", "gh", "bwrap"):
+        if not shutil.which(tool):
+            errs.append(f"`{tool}` is not on PATH")
+    if not git(root, "config", "--get", "remote.origin.url").strip():
+        errs.append("no origin remote")
+    if git(root, "status", "--porcelain", "--untracked-files=no").strip():
+        errs.append("the main checkout has uncommitted changes; commit or stash first")
+    if git(root, "status", "--porcelain", "--untracked-files=no", "--", ".claude").strip() or \
+            git(root, "ls-files", "--others", "--exclude-standard", "--", ".claude/hooks", ".claude/agents").strip():
+        errs.append(".claude is not committed (units start from origin and would miss it)")
+    return errs
+
+
+def cleanup(root: Path, units: list[dict], keep: bool, branches: bool = False) -> None:
+    """Stop what still runs; remove unit worktrees (even broken ones) and, after shipping, unit branches."""
+    import shutil
+    for u in units:
+        p = u.get("p")
+        if p is not None and p.poll() is None:
+            try:
+                os.killpg(p.pid, 9)
+            except OSError:
+                pass
+    if keep:
+        return
+    for u in units:
+        r = subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(u["wt"])],
+                           capture_output=True)
+        if r.returncode != 0 and u["wt"].exists():
+            shutil.rmtree(u["wt"], ignore_errors=True)
+    subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True)
+    if branches:
+        subprocess.run(["git", "-C", str(root), "branch", "-q", "-D", *[u["branch"] for u in units]],
+                       capture_output=True)
 
 
 def main() -> int:
@@ -131,13 +194,11 @@ def main() -> int:
                     help="start a backup copy of a straggling unit once half the units have passed (measured: the "
                          "original usually finishes first, so off by default)")
     ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
-    ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
-    ap.add_argument("--dry-run", action="store_true", help="split and show the units only")
+    ap.add_argument("--unit-timeout", type=int, default=900, help="seconds before a unit is stopped")
+    ap.add_argument("--max-turns", type=int, default=40, help="turn limit per unit")
+    ap.add_argument("--keep", action="store_true", help="keep unit worktrees and branches afterwards")
+    ap.add_argument("--dry-run", action="store_true", help="check everything and show the plan; run nothing")
     a = ap.parse_args()
-    if os.environ.get("CLAUDECODE"):
-        print("run this from your terminal (or `! python3 ...`): inside Claude Code's sandbox the nested "
-              "`claude` cannot reach the API", file=sys.stderr)
-        return 2
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     cfg = load_config(root)
@@ -153,13 +214,22 @@ def main() -> int:
     front, _, rules = agent.partition("\n---\n")
     model = a.model or (re.search(r"^model:\s*(\S+)", front, re.M) or [None, "haiku"])[1]
     effort = a.effort or (re.search(r"^effort:\s*(\S+)", front, re.M) or [None, "low"])[1]
+    errs = preflight(root, base, a.branch)
+    if in_sandbox():
+        errs.append("inside Claude Code's sandbox the nested `claude` cannot reach the API: run it from a "
+                    "terminal, or let devaccel's settings run it outside the sandbox (/devaccel-setup)")
+    for n, it in enumerate(items, 1):
+        for msg in task_warnings(it):
+            print(f"warning: task {n}: {msg}", flush=True)
     if a.dry_run:
         for i, it in enumerate(items, 1):
-            print(f"--- unit {i}\n{it[:200]}")
-        return 0
-    if git(root, "status", "--porcelain", "--untracked-files=no").strip():
-        print("the main checkout has uncommitted changes; commit or stash first", file=sys.stderr)
-        return 2
+            print(f"--- unit {i}\n{clean(it[:200])}")
+        jobs, why = plan_jobs(len(items) * max(1, a.hedge), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
+        print(f"would run {len(items)} unit(s), {jobs} at a time ({why})")
+    for e in errs:
+        print(f"error: {e}", file=sys.stderr)
+    if errs or a.dry_run:
+        return 2 if errs else 0
 
     subprocess.run(["git", "-C", str(root), "fetch", "-q", "origin", base], capture_output=True)
     start = f"origin/{base}" if git(root, "rev-parse", "-q", "--verify", f"origin/{base}").strip() else base
@@ -179,7 +249,7 @@ def main() -> int:
                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                "--tools", "Read", "Edit", "Write", "Bash", "Grep", "Glob", "--disable-slash-commands",
                "--append-system-prompt", rules.strip(),
-               "--output-format", "json", "--permission-mode", "acceptEdits"]
+               "--max-turns", str(a.max_turns), "--output-format", "json", "--permission-mode", "acceptEdits"]
         for k in range(1, copies + 1):  # --hedge: the same task in k worktrees; the first to pass the gate wins
             tag = f"{slug}-{i}" + (f"h{k}" if copies > 1 else "")
             br, wt = f"unit/{tag}", root / ".claude" / "worktrees" / tag
@@ -187,16 +257,28 @@ def main() -> int:
                                capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+                cleanup(root, units, a.keep)
                 return 1
             units.append({"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd})
 
     def settle(u: dict) -> str:
-        """Commit the tree the gate verified (our own git dir; hooks/fsmonitor off; no secrets/state files),
-        then: ok only if there is a commit AND the gate logged a pass for this branch."""
+        """Commit the unit's tree (our own git dir; hooks/fsmonitor off; no secrets/state files), then check
+        exactly that commit ourselves: the main checkout's check.sh fast, confined, and the tree must be
+        unchanged afterwards. The unit's own gate log is not trusted (the unit could write or race it)."""
         wt = u["wt"]
         gd = ["--git-dir", str(root / ".git" / "worktrees" / wt.name), "--work-tree", str(wt)]
-        safe = ["git", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", *gd]
+        safe = ["git", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-c", "core.quotePath=false",
+                *gd]
+        try:
+            os.killpg(u["p"].pid, 9)  # leftovers of the unit's session must not touch the tree being checked
+        except OSError:
+            pass
         subprocess.run([*safe, "add", "-u"], capture_output=True)
+        staged = subprocess.run([*safe, "diff", "--cached", "--name-only", "-z"], capture_output=True,
+                                text=True).stdout.split("\0")
+        bad = [f for f in staged if f and SKIP_NEW.search(f)]
+        if bad:  # tracked devaccel/Claude config or secrets edited by a unit: never auto-committed
+            subprocess.run([*safe, "reset", "-q", "--", *bad], capture_output=True)
         new = subprocess.run([*safe, "ls-files", "--others", "--exclude-standard", "-z"],
                              capture_output=True, text=True).stdout.split("\0")
         keep = [f for f in new if f and not SKIP_NEW.search(f)]
@@ -208,7 +290,19 @@ def main() -> int:
         commits = git(root, "rev-list", "--count", f"{start}..{u['branch']}").strip()
         if commits in ("", "0"):
             return "no commit"
-        return "ok" if gate_passed(root, u["branch"], u["t"]) else "gate not passed"
+        subprocess.run([*safe, "checkout", "-q", "--", "."], capture_output=True)  # tree == commit
+        subprocess.run([*safe, "clean", "-q", "-f", "-d"], capture_output=True)  # (ignored files stay: .venv)
+        sha = git(root, "rev-parse", u["branch"]).strip()
+        result, _, out, _ = run_check(wt, int(cfg["gate"]["timeout_sec"]), anchor=root,
+                                      sandbox=bool(cfg["gate"].get("sandbox", True)))
+        u["check_tail"] = out[-1500:]
+        after = subprocess.run([*safe, "status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                               text=True).stdout.strip()
+        if result != "pass":
+            return f"check {result}"
+        if after or git(root, "rev-parse", u["branch"]).strip() != sha:
+            return "tree changed during the check"
+        return "ok"
 
     def backup(u: dict) -> dict | None:
         """A second copy of a straggler's task in a fresh worktree (speculative execution)."""
@@ -224,58 +318,88 @@ def main() -> int:
 
     running, done, won, speculated = [], [], {}, set()
     pending = list(units)
-    for n, it in enumerate(items, 1):
-        for msg in task_warnings(it):
-            print(f"warning: task {n}: {msg}", flush=True)
     limit, why = plan_jobs(len(units), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
     print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # anchor: <root>/.claude/worktrees path
-    while pending or running:
-        while pending and len(running) < limit:
-            u = pending.pop(0)
-            if u["i"] in won:
-                continue
-            u["t"] = time.time()
-            u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
-            running.append(u)
-        time.sleep(0.5)
-        passed = sorted(x["secs"] for x in done if x.get("status") == "ok")
-        if a.speculate and len(passed) * 2 >= len(items) and len(running) < limit:
-            med = passed[len(passed) // 2]
-            for u in list(running):  # a straggler gets one backup copy; the first copy to pass wins
-                late = time.time() - u["t"] > max(1.4 * med, med + 15)
-                if late and u["i"] not in won and u["i"] not in speculated and len(running) < limit:
-                    v = backup(u)
-                    if v is not None:
-                        speculated.add(u["i"])
-                        v["t"] = time.time()
-                        v["p"] = subprocess.Popen(v["cmd"], cwd=v["wt"], stdout=subprocess.PIPE,
-                                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
-                                                  env=env, start_new_session=True)
-                        running.append(v)
-                        print(f"unit {u['i']} is straggling ({round(time.time() - u['t'])}s vs median {med}s): "
-                              "started a backup copy", flush=True)
-        for u in list(running):
-            if u["p"].poll() is None:
-                continue
-            out, err = u["p"].communicate()
-            u["secs"] = round(time.time() - u["t"])
-            try:
-                u["json"] = json.loads(out)
-            except ValueError:
-                u["json"] = {"is_error": True, "result": (out + err)[-300:]}
-            running.remove(u)
-            u["status"] = settle(u) if u["i"] not in won else "superseded"
-            done.append(u)
-            if u["status"] == "ok" and u["i"] not in won:
-                won[u["i"]] = u
-                for v in list(running):  # stop the slower copies of the same task
-                    if v["i"] == u["i"]:
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=max(1, limit))  # settling (commit + own check) overlaps the units
+    settling: dict = {}
+
+    def launch(u: dict) -> None:
+        u["t"] = time.time()
+        u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
+        running.append(u)
+
+    try:
+        while pending or running or settling:
+            while pending and len(running) + len(settling) < limit:
+                u = pending.pop(0)
+                if u["i"] not in won:
+                    launch(u)
+            time.sleep(0.5)
+            passed = sorted(x["secs"] for x in done if x.get("status") == "ok")
+            if a.speculate and len(passed) * 2 >= len(items) and len(running) < limit:
+                med = passed[len(passed) // 2]
+                for u in list(running):  # a straggler gets one backup copy; the first copy to pass wins
+                    late = time.time() - u["t"] > max(1.4 * med, med + 15)
+                    if late and u["i"] not in won and u["i"] not in speculated and len(running) < limit:
+                        v = backup(u)
+                        if v is not None:
+                            speculated.add(u["i"])
+                            launch(v)
+                            print(f"unit {u['i']} is straggling ({round(time.time() - u['t'])}s vs median "
+                                  f"{med}s): started a backup copy", flush=True)
+            for u in list(running):
+                if u["p"].poll() is None:
+                    if time.time() - u["t"] > a.unit_timeout:
                         try:
-                            os.killpg(v["p"].pid, 15)
+                            os.killpg(u["p"].pid, 9)
                         except OSError:
                             pass
+                        u["timed_out"] = True
+                    continue
+                out, err = u["p"].communicate()
+                u["secs"] = round(time.time() - u["t"])
+                try:
+                    u["json"] = json.loads(out)
+                    if not isinstance(u["json"], dict):
+                        raise ValueError
+                except ValueError:
+                    u["json"] = {"is_error": True, "result": (out + err)[-300:]}
+                running.remove(u)
+                if u.get("timed_out"):
+                    u["status"] = f"timeout ({a.unit_timeout}s)"
+                    done.append(u)
+                elif u["i"] in won:
+                    u["status"] = "superseded"
+                    done.append(u)
+                else:
+                    settling[id(u)] = (u, pool.submit(settle, u))
+            for key, (u, fut) in list(settling.items()):
+                if not fut.done():
+                    continue
+                del settling[key]
+                try:
+                    u["status"] = fut.result()
+                except Exception as e:  # noqa: BLE001 - a failed settle is a failed unit, never a pass
+                    u["status"] = f"settle error: {type(e).__name__}"
+                if u["status"] == "ok" and u["i"] in won:
+                    u["status"] = "superseded"
+                done.append(u)
+                if u["status"] == "ok":
+                    won[u["i"]] = u
+                    for v in list(running):  # stop the slower copies of the same task
+                        if v["i"] == u["i"]:
+                            try:
+                                os.killpg(v["p"].pid, 15)
+                            except OSError:
+                                pass
+    except BaseException:
+        cleanup(root, units, a.keep, branches=True)
+        raise
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     ok, lines, cost = [], [], 0.0
     log = root / ".devaccel" / f"batch-{slug}.log"
@@ -284,10 +408,12 @@ def main() -> int:
     for u in sorted(done, key=lambda x: (x["i"], x["k"])):
         j = u["json"]
         cost += float(j.get("total_cost_usd") or 0)  # (stopped copies report no cost: an underestimate)
-        full.append(f"=== unit {u['i']}/{u['k']} ({u['branch']}, {u['secs']}s, {u['status']})\n{j.get('result', '')}\n")
+        full.append(f"=== unit {u['i']}/{u['k']} ({u['branch']}, {u['secs']}s, {u['status']})\n"
+                    f"{clean(str(j.get('result', '')))}\n" + (f"--- check\n{clean(u['check_tail'])}\n"
+                                                             if u.get("check_tail") and u["status"] != "ok" else ""))
         if copies > 1 and won.get(u["i"]) is not u:
             continue
-        summary = " ".join((j.get("result") or "").split())[:160]
+        summary = clean(" ".join(str(j.get("result") or "").split())[:160])
         lines.append(f"- unit {u['i']} ({u['branch']}, {u['secs']}s): {u['status']} — {summary}")
     for i in range(1, len(items) + 1):
         if i in won:
@@ -299,12 +425,10 @@ def main() -> int:
     print(f"(full unit reports: {log.relative_to(root)})")
     print(f"units: {len(ok)}/{len(items)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
 
-    if not a.keep:
-        for u in units:
-            subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(u["wt"])],
-                           capture_output=True)
+    cleanup(root, units, a.keep)
     if not ok:
         print("no unit to integrate", file=sys.stderr)
+        cleanup(root, units, a.keep, branches=True)
         return 1
     notes = root / ".devaccel" / "ship.md"
     notes.parent.mkdir(exist_ok=True)
@@ -313,6 +437,7 @@ def main() -> int:
     print(f"[timing] units phase {round(time.time() - t0)}s", flush=True)
     r = subprocess.run([sys.executable, str(Path(__file__).with_name("devaccel_ship.py")), "--file",
                         str(notes.relative_to(root)), "--branch", a.branch, "--units", *ok], cwd=root)
+    cleanup(root, units, a.keep, branches=r.returncode == 0)  # integrated: the unit branches are no longer needed
     return r.returncode
 
 

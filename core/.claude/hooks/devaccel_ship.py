@@ -71,12 +71,34 @@ def main() -> int:
     ap.add_argument("--paths", nargs="*", default=[])
     ap.add_argument("--units", nargs="*", default=[])
     ap.add_argument("--branch", default="", help="create this work branch from origin/<base> if on a protected branch")
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="change nothing; show the plan and the evidence for HEAD")
+    ap.add_argument("--no-push", action="store_true",
+                    help="create the branch, integrate and commit locally, show the evidence; no push, no PR")
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     cfg = load_config(trusted_root({"cwd": str(root)}))
     head = git(root, "symbolic-ref", "--short", "-q", "HEAD").strip()
+    text = read_notes(a.file, root)
+    title, _, notes = text.partition("\n")
+    title = "".join(ch for ch in title.strip() if ch.isprintable())[:120]
+    if not title:
+        print("--file: line 1 must be the PR title", file=sys.stderr)
+        return 2
+    for p in a.paths:
+        if Path(p).is_absolute() or ".." in Path(p).parts or not Path(p).parts or (root / p).resolve() == root.resolve():
+            print(f"--paths: {p!r} must name files or directories inside the repo (not the repo itself)",
+                  file=sys.stderr)
+            return 2
+    if a.dry_run:  # nothing is created, merged, committed or pushed
+        print(f"dry run: would ship from {head or 'detached HEAD'}"
+              + (f" via new branch {a.branch}" if a.branch and (not head or head in protected(root, cfg)) else "")
+              + (f", integrating {len(a.units)} unit(s)" if a.units else "")
+              + (f", adding {' '.join(a.paths)}" if a.paths else ""))
+        if git(root, "status", "--porcelain", "--untracked-files=no").strip() or a.units:
+            print("(evidence is computed after the commit/integration; use --no-push to see it locally)")
+            return 0
+        return open_pr(root, title, notes, True)
     if a.branch and (not head or head in protected(root, cfg)):  # saves the parent its own git turns
         if a.branch in protected(root, cfg) or not re.fullmatch(r"[\w./-]+", a.branch) or ".." in a.branch:
             print(f"--branch {a.branch!r} is not a valid work branch name", file=sys.stderr)
@@ -92,20 +114,10 @@ def main() -> int:
     if not head or head in protected(root, cfg):
         print(f"refusing to ship from {head or 'detached HEAD'}: create a work branch first", file=sys.stderr)
         return 2
-    text = read_notes(a.file, root)
-    title, _, notes = text.partition("\n")
-    title = "".join(ch for ch in title.strip() if ch.isprintable())[:120]
-    if not title:
-        print("--file: line 1 must be the PR title", file=sys.stderr)
-        return 2
 
     t = time.time()
     merged, skipped = integrate(root, a.units, head) if a.units else ([], [])
     t = stamp("integrate units", t)
-    for p in a.paths:
-        if Path(p).is_absolute() or ".." in Path(p).parts:
-            print(f"--paths: {p} must be relative to the repo", file=sys.stderr)
-            return 2
     if a.paths and sh(root, "add", "--", *a.paths).returncode != 0:
         print("git add failed for --paths", file=sys.stderr)
         return 2
@@ -126,7 +138,7 @@ def main() -> int:
         return 2
 
     t = stamp("add + commit", t)
-    if a.dry_run:
+    if a.no_push:
         return open_pr(root, title, notes, True, units=max(1, len(merged)))
     if not git(root, "config", "--get", "remote.origin.url").strip():
         print("no origin remote", file=sys.stderr)

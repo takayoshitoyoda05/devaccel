@@ -246,13 +246,10 @@ def emit(obj: dict) -> None:
 def main() -> int:
     data = read_stdin_json()
     CTX.update({"session": str(data.get("agent_id") or data.get("session_id") or ""), "cwd": str(data.get("cwd") or "")})
-    root = project_root(data)  # what is checked (may be a /batch worktree)
     anchor = trusted_root(data)  # config and check.sh come from here, not from the worktree
     cfg = load_config(anchor)
     gate = cfg["gate"]
-    # a /batch unit = a linked worktree (git-dir != common-dir); robust to symlinks and path case
-    unit = (git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()
-            != git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    unit = False
     # a unit that breaks its worktree's .git link must not fall back to the (off) session mode
     cwd = str(data.get("cwd") or "")
     if "/.claude/worktrees/" in cwd + "/":
@@ -261,10 +258,15 @@ def main() -> int:
         parts = rc.split("/.claude/worktrees/", 1)
         name = parts[1].split("/")[0] if len(parts) == 2 else ""
         wt_top = Path(parts[0]) / ".claude" / "worktrees" / name if name else None
-        # the tree git actually uses must BE this worktree (no nested .git) and its link must point at the
-        # anchor's own worktree dir (read as a file); otherwise block — never run git in a forged checkout
-        if (wt_top is None or root.resolve() != wt_top.resolve()
-                or not worktree_link_ok(wt_top, anchor)):
+        # checked from the files alone, BEFORE any git runs there (git honours config in whatever git dir the
+        # agent-writable .git file names): no nested .git between cwd and the worktree top, and the link points
+        # at the anchor's own admin dir for this worktree; then git's own toplevel must agree
+        here = Path(rc).resolve()
+        nested = wt_top is not None and any((d / ".git").exists() for d in [here, *here.parents]
+                                            if wt_top.resolve() in d.parents)
+        ok = wt_top is not None and not nested and worktree_link_ok(wt_top, anchor)
+        root = project_root(data) if ok else Path(cwd)
+        if not ok or root.resolve() != wt_top.resolve():
             # a unit must not escape its gate by breaking .git: block like a failure, escalate after max_rounds
             sid = str(data.get("agent_id") or data.get("session_id") or "default")
             sess = load_session(anchor, sid)
@@ -280,6 +282,11 @@ def main() -> int:
             emit(reply)
             save_session(anchor, sid, sess)
             return 0
+    else:
+        root = project_root(data)  # what is checked
+        # a linked worktree elsewhere (git-dir != common-dir) is a unit too; robust to symlinks and path case
+        unit = (git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()
+                != git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
     mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
     CTX.update({"scope": "unit" if unit else "session", "mode": mode})
     if mode == "off" or not is_git_repo(root):
