@@ -114,7 +114,9 @@ jobs:
       - run: scripts/check.sh full
 """
 
-GITIGNORE_LINES = ["# devaccel", ".claude/state/", ".claude/settings.local.json", ".claude/worktrees/", "__pycache__/"]
+# .devaccel/ = scratch for PR notes / commit messages (writes under .claude/ always need approval)
+GITIGNORE_LINES = ["# devaccel", ".claude/state/", ".claude/settings.local.json", ".claude/worktrees/", ".devaccel/",
+                   "__pycache__/"]
 
 
 # ---------- helpers ----------
@@ -518,6 +520,8 @@ def cmd_doctor(root: Path) -> int:
 
     gi = root / ".gitignore"
     ok(gi.exists() and ".claude/state/" in gi.read_text(), ".claude/state/ not gitignored")
+    ok(gi.exists() and ".devaccel/" in gi.read_text(), ".devaccel/ not gitignored (PR notes scratch)",
+       "add .devaccel/ to .gitignore")
 
     cm = root / "CLAUDE.md"
     if cm.exists():

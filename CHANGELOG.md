@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.7.1 (2026-11-18)
+- /batch の単位が PR まで届かなかった件(0/3)の修正: `.claude/` 配下への Write は常に確認が要るため、PR メモとコミットメッセージの置き場を `.devaccel/`(gitignore、install が追記、doctor が点検)へ。seed CLAUDE.md に「Bash は単純なコマンドを 1 つずつ、ファイルは Write/Edit」(単位がヒアドキュメントや for ループでテストを書こうとして拒否されていた)。
+
 ## 0.7.0 (2026-11-18)
 fable の改善計画(短期)より。
 - seed CLAUDE.md: verify-app を規模依存に(S で追加テストが入口を通るなら省略可。PR は常に必須)。実測で devaccel のターン増の主因と推定。
