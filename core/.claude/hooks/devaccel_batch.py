@@ -118,8 +118,7 @@ def main() -> int:
         while pending and len(running) < limit:
             u = pending.pop(0)
             u["t"] = time.time()
-            env = {**os.environ, "DEVACCEL_TRUSTED_ROOT": str(root)}  # gate's trust anchor = this checkout
-            env.pop("CLAUDECODE", None)
+            env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # anchor: <root>/.claude/worktrees path
             u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       stdin=subprocess.DEVNULL, text=True, env=env)
             running.append(u)

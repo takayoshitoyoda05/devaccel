@@ -1584,4 +1584,5 @@ class R8TrustAnchorTest(ReqKit):
         (fake / "gitdir").write_text(str(wt / ".git") + "\n")
         (wt / ".git").write_text(f"gitdir: {fake}\n")
         self.assertNotEqual(self.anchor(wt), str(evil))
-        self.assertEqual(self.anchor(wt, {"DEVACCEL_TRUSTED_ROOT": str(self.root)}), str(self.root))
+        self.assertEqual(self.anchor(wt), str(self.root))
+        self.assertEqual(self.anchor(wt, {"DEVACCEL_TRUSTED_ROOT": str(evil)}), str(self.root))  # no env override

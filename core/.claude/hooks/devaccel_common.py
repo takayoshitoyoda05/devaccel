@@ -60,9 +60,7 @@ def _git_out(cwd: Path, *args: str) -> str:
 def trusted_root(data: dict | None = None) -> Path:
     """The main checkout: the trust anchor for the lock, project.json and check.sh. A worktree
     (a /batch unit) can edit its own copies of those, so they are never read from there."""
-    pinned = os.environ.get("DEVACCEL_TRUSTED_ROOT")  # set by devaccel_batch.py for its `claude -p` units
-    if pinned:  # (a unit's Bash cannot change the environment its hooks run with)
-        return Path(pinned)
+    # (no env-var override: a worktree's settings.json "env" could set it; the path itself is the anchor)
     env = os.environ.get("CLAUDE_PROJECT_DIR")
     if env:
         # a session started inside a devaccel worktree (<main>/.claude/worktrees/<x>) has project dir = the
