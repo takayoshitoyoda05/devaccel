@@ -480,6 +480,13 @@ def hooks_wired(settings: Path) -> bool:
     return wired("PreToolUse", "hooks/guard.py", "Bash") and wired("Stop", "hooks/stop_gate.py")
 
 
+def cfg_all(root: Path) -> dict:
+    try:
+        return json.loads((root / ".claude/project.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def _perms(root: Path) -> dict:
     try:
         return json.loads((root / ".claude/settings.json").read_text()).get("permissions", {})
@@ -565,6 +572,13 @@ def cmd_doctor(root: Path) -> int:
         sb = {}
     if sb.get("enabled") and not sb.get("autoAllowBashIfSandboxed"):
         notes.append("sandbox.autoAllowBashIfSandboxed is off: /batch units will stop on permission prompts")
+    try:  # parallel sizing for devaccel_batch (decided per machine at run time)
+        sys.path.insert(0, str(CORE / ".claude" / "hooks"))
+        import devaccel_batch as _b
+        jobs, why = _b.plan_jobs(64, 0, cfg_all(root), _b.mem_available_mb(), os.cpu_count() or 1)
+        notes.append(f"devaccel_batch would run up to {jobs} units at once here ({why})")
+    except Exception:
+        pass
     want_dw = render_settings([])["sandbox"]["filesystem"]["denyWrite"]
     if sb.get("enabled") and set(want_dw) - set(sb.get("filesystem", {}).get("denyWrite") or []):
         problems.append("sandbox.filesystem.denyWrite does not protect ./.claude/hooks etc.  → merge the "

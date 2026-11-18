@@ -42,7 +42,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `~/devaccel/protect.sh` | base ブランチの保護(人が実行、確認あり) |
 | `/devaccel-setup` | 初回生成(CLAUDE.md・verify-app・計測)。`--redetect` |
 | `/devaccel-tune` | ゲート記録と PR 振り分けから追加・削除・調整を提案(承認後に適用) |
-| `python3 .claude/hooks/devaccel_batch.py <tasks.md> --branch batch/<名前>` | **束の作業の推奨経路**(人が端末で実行): 件ごとに `claude -p`(haiku)を同時に起動し、ゲートを通った単位を統合して PR 1 本(D17) |
+| `python3 .claude/hooks/devaccel_batch.py <tasks.md> --branch batch/<名前>` | **束の作業の推奨経路**(人が端末で実行): 件ごとに `claude -p`(haiku)を同時に起動し、ゲートを通った単位を統合して PR 1 本(D17)。同時に走らせる数はマシンの空きメモリ・CPU とプロジェクト設定(`parallel.max_jobs`・`unit_mem_mb`)から自動で決まる |
 | `/devaccel-batch` | 会話の中から束を並列実装する(親 + 作業単位)。速さはファンアウトに劣る |
 
 ## 導入されるもの

@@ -172,6 +172,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | BATCH-02 | 単位を統合するのは、コミットがあり、かつゲートがその単位のブランチで `scope: unit` の pass を記録したものだけでなければならない。 | 0.12.0 | integration |
 | BATCH-03 | スクリプトのコミットは本体側の git dir を明示し、フック・fsmonitor を無効にし、秘密情報らしいファイルと `.claude/`・`.devaccel/` を含めてはならない。 | 0.12.0 | unit |
 | BATCH-04 | ゲートは単位の worktree の `.git` を(git を使わず)ファイルとして読み、`<anchor>/.git/worktrees/<x>` を指し、git の最上位が worktree そのものであるときだけ git を動かさなければならない。それ以外は block。 | 0.12.0 | unit |
+| BATCH-05 | 同時に走らせる単位の数は固定値であってはならない。`--jobs` > `project.json` の `parallel.max_jobs` > 実行時のマシン(空きメモリ × 0.8 ÷ `parallel.unit_mem_mb`、CPU 数 × 2)の順に決め、決めた数と根拠を表示しなければならない。 | 0.12.1(ユーザー方針) | unit |
 
 ### 2.8 LAND(`devaccel_land.py`)
 

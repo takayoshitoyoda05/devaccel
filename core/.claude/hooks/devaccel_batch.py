@@ -45,6 +45,31 @@ def split_tasks(text: str) -> tuple[str, list[str]]:
     return head, items
 
 
+def mem_available_mb() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def plan_jobs(n_units: int, cli: int, cfg: dict, mem_mb: int, cpus: int) -> tuple[int, str]:
+    """How many units run at once: --jobs > project.json parallel.max_jobs > this machine right now."""
+    if cli > 0:
+        return min(cli, n_units), f"--jobs {cli}"
+    par = cfg.get("parallel", {})
+    cap = int(par.get("max_jobs") or 0)
+    per = max(50, int(par.get("unit_mem_mb") or 300))
+    by_mem = max(1, int(mem_mb * 0.8) // per) if mem_mb else 4
+    by_cpu = max(1, cpus * 2)
+    jobs = min(n_units, by_mem, by_cpu, cap or n_units)
+    why = (f"available memory {mem_mb} MB x0.8 / {per} MB per unit = {by_mem}, CPUs {cpus} x2 = {by_cpu}"
+           + (f", project max_jobs {cap}" if cap else ""))
+    return max(1, jobs), why
+
+
 def gate_passed(root: Path, branch: str, since: float) -> bool:
     log = root / ".claude" / "state" / "gate-log.jsonl"
     if not log.exists():
@@ -66,7 +91,8 @@ def main() -> int:
     ap.add_argument("tasks", type=Path)
     ap.add_argument("--branch", required=True, help="work branch for the integrated PR (batch/...)")
     ap.add_argument("--title", default="")
-    ap.add_argument("--jobs", type=int, default=0, help="max concurrent units (0 = all)")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="max concurrent units (0 = project.json parallel.max_jobs, else decided from this machine)")
     ap.add_argument("--model", default="", help="unit model (default: the devaccel-unit agent's model)")
     ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
@@ -143,7 +169,8 @@ def main() -> int:
 
     running, done, won = [], [], {}
     pending = list(units)
-    limit = a.jobs or len(units)
+    limit, why = plan_jobs(len(units), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
+    print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # anchor: <root>/.claude/worktrees path
     while pending or running:
         while pending and len(running) < limit:

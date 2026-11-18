@@ -1657,3 +1657,17 @@ class R12SingleDecisionTest(ReqKit):
         out = r.stdout.strip()
         self.assertEqual(len(out.splitlines()), 1, out)
         self.assertEqual(json.loads(out).get("decision"), "block")
+
+
+class R13JobsPlanTest(unittest.TestCase):
+    def test_BATCH05_jobs_follow_machine_and_project(self):
+        """BATCH-05: concurrency is not a fixed number: --jobs > project max_jobs > machine (memory, CPUs)."""
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        cfg = {"parallel": {"max_jobs": 0, "unit_mem_mb": 300}}
+        self.assertEqual(b.plan_jobs(12, 0, cfg, 8000, 16)[0], 12)    # 8000*0.8/300 = 21 >= 12
+        self.assertEqual(b.plan_jobs(12, 0, cfg, 2000, 16)[0], 5)     # memory-bound
+        self.assertEqual(b.plan_jobs(12, 0, cfg, 64000, 2)[0], 4)     # CPU-bound
+        self.assertEqual(b.plan_jobs(12, 0, {"parallel": {"max_jobs": 3}}, 64000, 64)[0], 3)  # project cap
+        self.assertEqual(b.plan_jobs(12, 7, cfg, 1000, 1)[0], 7)      # explicit --jobs wins
+        self.assertEqual(b.plan_jobs(12, 0, {"parallel": {"unit_mem_mb": 1000}}, 8000, 16)[0], 6)  # heavy project

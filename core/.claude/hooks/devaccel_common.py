@@ -43,7 +43,9 @@ DEFAULTS: dict = {
     "guard": {"deny_regex": [], "ask_regex": []},
     # Anthropic-style parallel work: /batch fans out, devaccel-pr turns each unit into an
     # evidence PR labeled evidence-ok / needs-human. auto_merge only for evidence-ok.
-    "parallel": {"auto_merge": False},
+    # max_jobs 0 = decide per machine at run time (memory and CPUs); unit_mem_mb = per-unit estimate
+    # (claude -p + its confined check; depends on the project's tools)
+    "parallel": {"auto_merge": False, "max_jobs": 0, "unit_mem_mb": 300},
 }
 
 MODES = ("off", "observe", "enforce")
