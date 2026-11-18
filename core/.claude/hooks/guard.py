@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
-from devaccel_common import emit, git, load_config, read_stdin_json, trusted_root  # noqa: E402
+from devaccel_common import emit, git, load_config, read_stdin_json, trusted_root, write_nofollow  # noqa: E402
 
 # rm with both -r and -f aimed at a broad target (/, ~, $HOME, *, ., .., .git)
 _RM = re.compile(
@@ -283,28 +283,7 @@ def capture_prompt(data: dict, root: Path) -> None:
                 best = text
     except OSError:
         best = ""
-    # no symlink anywhere on the way, checked atomically by the kernel (O_NOFOLLOW on the dir and the file):
-    # a sandboxed session must not turn this unsandboxed write into a write elsewhere
-    import os
-    try:
-        out.parent.mkdir(exist_ok=True)
-        dfd = os.open(out.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError:
-        return
-    try:
-        if best:
-            fd = os.open(out.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(best)
-        else:
-            try:
-                os.unlink(out.name, dir_fd=dfd)
-            except FileNotFoundError:
-                pass
-    except OSError:
-        pass
-    finally:
-        os.close(dfd)
+    write_nofollow(out, best or None)
 
 
 def main() -> int:

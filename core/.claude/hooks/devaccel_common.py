@@ -180,6 +180,32 @@ def _sanitize(cfg: dict) -> dict:
     return out
 
 
+def write_nofollow(path: Path, text: str | None) -> bool:
+    """Write (or with None, remove) path without following a symlink at the file or its directory, checked by
+    the kernel (O_NOFOLLOW): code running outside the sandbox must not be turned into a write elsewhere by a
+    link the sandboxed session planted (e.g. under .devaccel/)."""
+    try:
+        path.parent.mkdir(exist_ok=True)
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        if text is None:
+            try:
+                os.unlink(path.name, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+            return True
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(dfd)
+
+
 def git(root: Path, *args: str, check: bool = False) -> str:
     try:
         r = subprocess.run(

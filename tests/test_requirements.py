@@ -2006,3 +2006,25 @@ class R28PromptCaptureSymlinkTest(R25PromptCaptureTest):
         (self.root / ".devaccel").symlink_to(outside)
         self.run_guard(cmd, [msg])
         self.assertFalse((outside / "prompt.md").exists())
+
+
+class R29WriteNoFollowTest(unittest.TestCase):
+    def test_refuses_symlinked_file_and_directory(self):
+        import tempfile
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        from devaccel_common import write_nofollow
+        d = Path(tempfile.mkdtemp())
+        victim = d / "victim"
+        victim.write_text("keep")
+        (d / "repo/.devaccel").mkdir(parents=True)
+        (d / "repo/.devaccel/x.md").symlink_to(victim)
+        self.assertFalse(write_nofollow(d / "repo/.devaccel/x.md", "evil"))
+        self.assertEqual(victim.read_text(), "keep")
+        outside = d / "outside"
+        outside.mkdir()
+        (d / "repo2").mkdir()
+        (d / "repo2/.devaccel").symlink_to(outside)
+        self.assertFalse(write_nofollow(d / "repo2/.devaccel/y.md", "evil"))
+        self.assertFalse((outside / "y.md").exists())
+        self.assertTrue(write_nofollow(d / "repo/.devaccel/ok.md", "fine"))
+        self.assertEqual((d / "repo/.devaccel/ok.md").read_text(), "fine")

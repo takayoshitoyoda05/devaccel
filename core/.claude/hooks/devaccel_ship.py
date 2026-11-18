@@ -27,6 +27,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (planted modules are refused by guard _pr_script_intact)
 from devaccel_common import git, load_config, trusted_root  # noqa: E402
+from devaccel_common import write_nofollow  # noqa: E402
 from devaccel_pr import SECRET, open_pr, read_notes, stamp  # noqa: E402
 
 IDENT = ["-c", "user.name=devaccel-ship", "-c", "user.email=devaccel-ship@localhost"]
@@ -156,8 +157,8 @@ def main() -> int:
     rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
     if rc == 0:  # used: a later ship must never reuse these notes (a failed Write would ship stale ones)
         nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
-        if root.resolve() in nf.resolve().parents and not nf.is_symlink():
-            nf.unlink(missing_ok=True)
+        if root.resolve() in nf.resolve().parents:
+            write_nofollow(nf, None)
     return rc
 
 

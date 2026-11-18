@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))
-from devaccel_common import git, load_config  # noqa: E402
+from devaccel_common import git, load_config, write_nofollow  # noqa: E402
 from stop_gate import run_check  # noqa: E402
 
 # "1. ", also as a markdown heading or bold ("## 1. ", "**1.** ") — how a session tends to rewrite a list
@@ -420,7 +420,6 @@ def main() -> int:
 
     ok, lines, cost = [], [], 0.0
     log = root / ".devaccel" / f"batch-{slug}.log"
-    log.parent.mkdir(exist_ok=True)
     full = []
     for u in sorted(done, key=lambda x: (x["i"], x["k"])):
         j = u["json"]
@@ -438,16 +437,16 @@ def main() -> int:
             ok.append(won[i]["branch"])
         elif copies > 1:
             lines.append(f"- unit {i}: no copy passed the gate")
-    log.write_text("\n".join(full), encoding="utf-8")
+    write_nofollow(log, "\n".join(full))
     # compact on stdout (a Claude session reading this pays for every line); the reports go to the log and PR
     for u in sorted(done, key=lambda x: (x["i"], x["k"])):
         if u["status"] != "ok" and u["status"] != "superseded":
             print(f"- unit {u['i']} ({u['branch']}): {clean(u['status'])}")
     print(f"(unit reports: {log.relative_to(root)})")
     print(f"units: {len(ok)}/{len(items)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
-    (root / ".devaccel" / "batch-last.json").write_text(json.dumps(  # machine-readable (cost of the units)
+    write_nofollow(root / ".devaccel" / "batch-last.json", json.dumps(  # machine-readable (cost of the units)
         {"branch": a.branch, "units": len(items), "ok": len(ok), "secs": round(time.time() - t0),
-         "cost_usd": round(cost, 4), "ts": time.time()}), encoding="utf-8")
+         "cost_usd": round(cost, 4), "ts": time.time()}))
 
     cleanup(root, units, a.keep)
     if not ok:
@@ -455,9 +454,11 @@ def main() -> int:
         cleanup(root, units, a.keep, branches=True)
         return 1
     notes = root / ".devaccel" / f"batch-{slug}-pr.md"  # its own file (never the session's ship.md); ship removes it
-    notes.parent.mkdir(exist_ok=True)
     title = a.title or f"batch: {len(ok)} units ({slug})"
-    notes.write_text(title + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+    if not write_nofollow(notes, title + "\n" + "\n".join(lines) + "\n"):
+        print(f"could not write {notes.relative_to(root)} (symlink?)", file=sys.stderr)
+        cleanup(root, units, a.keep, branches=True)
+        return 1
     if os.environ.get("DEVACCEL_TIMING"):
         print(f"[timing] units phase {round(time.time() - t0)}s", flush=True)
     r = subprocess.run([sys.executable, str(Path(__file__).with_name("devaccel_ship.py")), "--file",
