@@ -66,7 +66,7 @@ CHECK_HEAD = """#!/usr/bin/env bash
 #        scripts/check.sh full   (CI / before push; never modifies files)
 # Timeouts, output trimming and logging live in .claude/hooks/stop_gate.py.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "${DEVACCEL_ROOT:-$(dirname "$0")/..}"  # DEVACCEL_ROOT: gate/PR point it at a worktree
 MODE="${1:-full}"
 R="__RUNNER__"   # command prefix, e.g. "uv run" ("" = tools on PATH)
 

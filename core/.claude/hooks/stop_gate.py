@@ -20,6 +20,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from devaccel_common import (  # noqa: E402
+    check_script_for,
     emit,
     git,
     is_git_repo,
@@ -98,18 +99,22 @@ def run_check(root: Path, timeout: int, anchor: Path | None = None) -> tuple[str
         return "missing", 0, "", 0.0
     t0 = time.time()
     # the path goes in through the environment, never pasted into shell text
-    text = script.read_text(encoding="utf-8").replace('cd "$(dirname "$0")/.."', 'cd "$DEVACCEL_ROOT"')
+    text = check_script_for(script.read_text(encoding="utf-8", errors="replace"))
+    if text is None:
+        return "missing", 0, "scripts/check.sh: unrecognised cd line (see CHECK_HEAD)", 0.0
     try:
         r = subprocess.run(
             ["bash", "-c", text, "check.sh", "fast"],
             cwd=root,
             env={**os.environ, "DEVACCEL_ROOT": str(root)},
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return "timeout", -1, "", time.time() - t0
+    except OSError as e:
+        return "missing", 0, str(e), time.time() - t0
     out = (r.stdout or "") + (r.stderr or "")
     return ("pass" if r.returncode == 0 else "fail"), r.returncode, out, time.time() - t0
 
@@ -162,23 +167,35 @@ def notices(root: Path, cfg: dict, items: list[tuple[str, str]], base: str) -> l
 # ---------- state ----------
 
 
-def load_state(root: Path) -> dict:
-    p = state_dir(root) / "gate-state.json"
+# One state file per session/unit: parallel /batch units never read-modify-write a shared file.
+SESSION_DEFAULT = {"ok": "", "seen": "", "fail": "", "reason": "", "escalated": "", "streak": 0, "noticed": []}
+
+
+def _state_path(root: Path, sid: str) -> Path:
+    d = state_dir(root) / "gate"
+    d.mkdir(exist_ok=True)
+    return d / (re.sub(r"[^A-Za-z0-9_.-]", "_", sid)[:80] + ".json")
+
+
+def load_session(root: Path, sid: str) -> dict:
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(_state_path(root, sid).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        raw = {}
+    sess = dict(SESSION_DEFAULT, **(raw if isinstance(raw, dict) else {}))
+    if not isinstance(sess["noticed"], list):
+        sess["noticed"] = []
+    return sess
 
 
-def save_state(root: Path, state: dict) -> None:
-    # keep only the 20 most recent sessions
-    if len(state) > 20:
-        for k in sorted(state, key=lambda k: state[k].get("t", 0))[:-20]:
-            del state[k]
-    p = state_dir(root) / "gate-state.json"
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state), encoding="utf-8")
+def save_session(root: Path, sid: str, sess: dict) -> None:
+    p = _state_path(root, sid)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")  # unique per process
+    tmp.write_text(json.dumps(sess), encoding="utf-8")
     tmp.replace(p)
+    olds = sorted(p.parent.glob("*.json"), key=lambda f: f.stat().st_mtime)[:-50]  # keep the 50 newest
+    for f in olds:
+        f.unlink(missing_ok=True)
 
 
 # ---------- main ----------
@@ -190,7 +207,9 @@ def main() -> int:
     anchor = trusted_root(data)  # config and check.sh come from here, not from the worktree
     cfg = load_config(anchor)
     gate = cfg["gate"]
-    unit = root != anchor  # a /batch unit's worktree: nobody is watching, so the gate matters here
+    # a /batch unit = a linked worktree (git-dir != common-dir); robust to symlinks and path case
+    unit = (git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()
+            != git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
     mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
     if mode == "off" or not is_git_repo(root):
         return 0
@@ -205,13 +224,22 @@ def main() -> int:
         return 0
 
     sig = signature(root, relevant)
-    state = load_state(anchor)
-    sid = data.get("agent_id") or data.get("session_id", "default")  # each /batch unit has its own rounds
-    sess = state.setdefault(sid, {"ok": "", "seen": "", "streak": 0, "noticed": []})
-    sess["t"] = time.time()
-    if sig in (sess["ok"], sess["seen"]):
-        return 0  # nothing changed since the last check (e.g. a question-only turn)
-    result, _rc, output, secs = run_check(root, int(gate["timeout_sec"]), anchor)
+    sid = str(data.get("agent_id") or data.get("session_id") or "default")  # each /batch unit has its own rounds
+    sess = load_session(anchor, sid)
+    max_rounds = int(gate["max_rounds"])
+    if sig == sess["ok"] or sig == sess["escalated"]:
+        return 0  # verified, or already handed to the user, and nothing changed since
+    if mode == "observe" and sig == sess["seen"]:
+        return 0
+    if mode == "enforce" and sig == sess["fail"]:
+        # stopping again without changing anything does not get past a failed check
+        sess["streak"] += 1
+        reply = _block_or_escalate(sess, sig, sess["stage"] if "stage" in sess else "?", sess["reason"], max_rounds)
+        emit(reply)
+        save_session(anchor, sid, sess)
+        return 0
+    # the hook itself is killed by Claude Code at its settings timeout (120 s): stay below it
+    result, _rc, output, secs = run_check(root, min(int(gate["timeout_sec"]), 110), anchor)
     # fast mode may auto-format: remember the tree as it is *after* the check
     relevant = [it for it in changed_paths(root) if not match_any(it[1], gate["ignore"])]
     sig = signature(root, relevant)
@@ -230,6 +258,7 @@ def main() -> int:
     reply: dict = {}
 
     if result == "timeout":
+        sess["seen"] = ""  # unverified: check again next time
         log_event(anchor, event)
         reply["systemMessage"] = (
             f"[devaccel] check.sh fast が {gate['timeout_sec']}s で打ち切られました。"
@@ -238,39 +267,23 @@ def main() -> int:
     elif result == "missing":
         log_event(anchor, event)
     elif result == "pass":
-        sess["ok"], sess["streak"] = sig, 0
+        sess["ok"], sess["streak"], sess["fail"] = sig, 0, ""
         log_event(anchor, event)
     else:
         stage, tail = failed_section(output)
         event["stage"] = stage
-        max_rounds = int(gate["max_rounds"])
         if mode == "observe":
             event["result"] = "would_block"
             log_event(anchor, event)
-            save_state(anchor, state)
+            save_session(anchor, sid, sess)
             return 0
         sess["streak"] += 1
+        sess["fail"], sess["reason"], sess["stage"] = sig, tail, stage
         event["streak"] = sess["streak"]
-        if sess["streak"] <= max_rounds:
-            log_event(anchor, event)
-            reply["decision"] = "block"
-            reply["reason"] = (
-                f"[devaccel] check.sh fast の段 `{stage}` が失敗しました"
-                f"(修正ラウンド {sess['streak']}/{max_rounds})。修正してください。"
-                "テストや検査を弱める変更で通さないこと。\n\n" + tail
-            )
-        else:
+        reply = _block_or_escalate(sess, sig, stage, tail, max_rounds)
+        if "systemMessage" in reply:
             event["result"] = "escalate"
-            log_event(anchor, event)
-            sess["streak"] = 0
-            reply["decision"] = "block"
-            reply["reason"] = (
-                f"[devaccel] `{stage}` が {max_rounds} ラウンド修正しても通りません。これ以上の修正はやめ、"
-                "失敗した段と出力をユーザーに示し、どうするか判断を仰いでください。\n\n" + tail
-            )
-            reply["systemMessage"] = (
-                f"[devaccel] 検査未通過のまま停止: 段 `{stage}`。判断が必要です。"
-            )
+        log_event(anchor, event)
 
     if result in ("pass", "fail"):
         fresh = [(k, m) for k, m in notices(root, cfg, relevant, base) if k not in sess["noticed"]]
@@ -280,9 +293,22 @@ def main() -> int:
             reply["systemMessage"] = (reply.get("systemMessage", "") + "\n" + note).strip()
             log_event(anchor, {"session": sid, "result": "notice", "notes": [m for _, m in fresh]})
 
-    save_state(anchor, state)
-    emit(reply)
+    emit(reply)  # the decision goes out first; a state-write problem must not swallow a block
+    save_session(anchor, sid, sess)
     return 0
+
+
+def _block_or_escalate(sess: dict, sig: str, stage: str, tail: str, max_rounds: int) -> dict:
+    if sess["streak"] <= max_rounds:
+        return {"decision": "block", "reason": (
+            f"[devaccel] check.sh fast の段 `{stage}` が失敗しました"
+            f"(修正ラウンド {sess['streak']}/{max_rounds})。修正してください。"
+            "テストや検査を弱める変更で通さないこと。\n\n" + tail)}
+    sess["streak"], sess["escalated"] = 0, sig
+    return {"decision": "block",
+            "reason": (f"[devaccel] `{stage}` が {max_rounds} ラウンド修正しても通りません。これ以上の修正はやめ、"
+                       "失敗した段と出力をユーザーに示し、どうするか判断を仰いでください。\n\n" + tail),
+            "systemMessage": f"[devaccel] 検査未通過のまま停止: 段 `{stage}`。判断が必要です。"}
 
 
 if __name__ == "__main__":

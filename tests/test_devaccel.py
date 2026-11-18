@@ -193,6 +193,33 @@ class KitTest(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout or "{}").get("decision"), "block", r.stdout + r.stderr)
         self.assertIn('"scope": "unit"', (self.root / ".claude/state/gate-log.jsonl").read_text())
 
+    def test_gate_review_fixes(self):
+        env = {"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce"}
+
+        def stop(sid: str = "r") -> dict:
+            r = sh(self.root, "python3", ".claude/hooks/stop_gate.py", env=env,
+                   stdin=json.dumps({"session_id": sid, "cwd": str(self.root)}))
+            self.assertNotIn("internal error", r.stderr)
+            return json.loads(r.stdout) if r.stdout.strip() else {}
+
+        # stopping again without changes does not get past a failed check
+        (self.root / "app.py").write_text("BROKEN\n")
+        self.assertEqual(stop().get("decision"), "block")
+        self.assertEqual(stop().get("decision"), "block")
+        # non-UTF-8 file names / output do not crash the gate (it used to fail open)
+        (self.root / "bad\udcff.py".encode("utf-8", "surrogateescape").decode("utf-8", "replace")).write_text("x = 1\n")
+        os.makedirs(self.root / "raw", exist_ok=True)
+        with open(os.path.join(os.fsencode(self.root / "raw"), b"latin\xff.py"), "wb") as f:
+            f.write(b"y = 1\n")
+        self.assertEqual(stop("r2").get("decision"), "block")
+        # per-session state files (no shared read-modify-write between parallel units)
+        self.assertTrue(list((self.root / ".claude/state/gate").glob("*.json")))
+        # an unrecognised cd line is not run against the wrong directory
+        (self.root / "scripts/check.sh").write_text('#!/usr/bin/env bash\ncd /tmp\necho "== ok: tests (0s)"\n')
+        (self.root / "app.py").write_text("X = 9\n")
+        self.assertNotEqual(stop("r3").get("decision"), "block")
+        self.assertIn('"result": "missing"', (self.root / ".claude/state/gate-log.jsonl").read_text())
+
     def test_gate_ignores_docs_only(self):
         (self.root / "README.md").write_text("BROKEN\n")
         self.assertEqual(self.stop(), {})
@@ -453,8 +480,7 @@ class KitTest(unittest.TestCase):
     def test_land_policy_in_guard(self):
         sh(self.root, "git", "checkout", "-qb", "feat")
         for ok in ["python3 .claude/hooks/devaccel_land.py", "python3 .claude/hooks/devaccel_land.py --dry-run",
-                   "grep -n merge .claude/hooks/devaccel_land.py", "grep -c def .claude/hooks/devaccel_pr.py | head -1", "python3 .claude/hooks/devaccel_pr.py --title 't' --dry-run",
-                   "N=$(mktemp) && echo ok > $N && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N"]:
+                   "grep -n merge .claude/hooks/devaccel_land.py", "grep -c def .claude/hooks/devaccel_pr.py | head -1", "python3 .claude/hooks/devaccel_pr.py --title 't' --dry-run"]:
             self.assertIsNone(self.gv(ok), ok)
         for cmd in ["python3 .claude/hooks/devaccel_land.py --merge", "python3 .claude/hooks/devaccel_land.py --dry-run '--merge'",
                     "python3 .claude/hooks/devaccel_land.py --mer", "python3 .claude/hooks/devaccel_land.py \\--merge",
@@ -466,7 +492,10 @@ class KitTest(unittest.TestCase):
                     "cat .claude/hooks/devaccel_land.py | python3 -", "cat .claude/hooks/devaccel_l*.py | python3 - --merge",
                     "echo merge | script -qc 'python3 .claude/hooks/devaccel_l?nd.py --merge' /dev/null",
                     "python3 .claude/hooks/devaccel_{land,x}.py", "unbuffer python3 x.py", "python3 .claude/*/devaccel_land.py --m",
-                    "cd .claude/hooks && python3 devaccel_land.py --merge", "cat .claude/hooks/devaccel_land.py\npython3 x --merge"]:
+                    "cd .claude/hooks && python3 devaccel_land.py --merge",
+                    "export PATH=.devaccel:$PATH; python3 .claude/hooks/devaccel_pr.py --title x",
+                    "PYTHONPATH=.devaccel python3 .claude/hooks/devaccel_pr.py --title x",
+                    "source x.sh && python3 .claude/hooks/devaccel_pr.py --title x", "N=$(mktemp) && python3 .claude/hooks/devaccel_pr.py --title t --verify-notes $N", "cat .claude/hooks/devaccel_land.py\npython3 x --merge"]:
             self.assertEqual(self.gv(cmd), "deny", cmd)
         r = sh(self.root, "python3", ".claude/hooks/devaccel_land.py", "--merge")  # no TTY: refused in the script too
         self.assertEqual(r.returncode, 2)

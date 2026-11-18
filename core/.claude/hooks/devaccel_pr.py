@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from devaccel_common import git, load_config, match_any, trusted_root  # noqa: E402
+from devaccel_common import check_script_for, git, load_config, match_any, trusted_root  # noqa: E402
 from stop_gate import SKIP_RE  # noqa: E402
 
 # "Changes can't modify their own checks": touching the verification machinery always
@@ -45,13 +45,11 @@ LABELS = {
 
 
 def run(cmd: list[str], cwd: Path, timeout: int = 600, env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
 
 
-# check.sh starts with `cd "$(dirname "$0")/.."`; when it runs from elsewhere, point it at the
+# check.sh cds via ${DEVACCEL_ROOT:-...} (older ones: `cd "$(dirname "$0")/.."`); point it at the
 # tree via an env var (never by pasting a path into shell text)
-CD_LINE = 'cd "$(dirname "$0")/.."'
-CD_ENV = 'cd "$DEVACCEL_ROOT"'
 
 
 DOCS = ["*.md", "**/*.md", "docs/**"]
@@ -64,10 +62,13 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path) -> tuple
     if not base_check:
         return False, ["== missing: scripts/check.sh"], "", 0.0
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8") as f:
-        f.write(base_check.replace(CD_LINE, CD_ENV))
+        script = check_script_for(base_check)
+        f.write(script or "echo '== failed: check.sh (unrecognised cd line)'; exit 1\n")
     try:
         r = run(["bash", f.name, "full"], workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10,
                 env={**os.environ, "DEVACCEL_ROOT": str(workdir)})
+    except subprocess.TimeoutExpired:
+        return False, ["== failed: check.sh full (timeout)"], "timeout", round(time.time() - t0, 1)
     finally:
         Path(f.name).unlink(missing_ok=True)
     out = (r.stdout + r.stderr).splitlines()
@@ -201,6 +202,8 @@ def read_notes(path: str, root: Path) -> str:
     allowed = [root.resolve(), Path(tempfile.gettempdir()).resolve()]
     if not any(p == a or a in p.parents for a in allowed):
         raise SystemExit(f"--verify-notes must be inside the repo or {tempfile.gettempdir()}")
+    if not p.is_file():
+        raise SystemExit(f"--verify-notes: {path} not found (write it first)")
     if p.name.startswith(".env") or p.stat().st_size > NOTES_MAX:
         raise SystemExit(f"--verify-notes: refused ({p.name}, max {NOTES_MAX} bytes)")
     text = p.read_text(encoding="utf-8")
@@ -223,7 +226,7 @@ def main() -> int:
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
-    cfg = load_config(root)
+    cfg = load_config(trusted_root({"cwd": str(root)}))  # never the unit's own project.json
     par = cfg.get("parallel", {})
     if git(root, "status", "--porcelain", "--untracked-files=no").strip():
         print("uncommitted changes: commit first", file=sys.stderr)

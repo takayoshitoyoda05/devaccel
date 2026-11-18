@@ -7,6 +7,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -49,7 +50,7 @@ MODES = ("off", "observe", "enforce")
 
 def _git_out(cwd: Path, *args: str) -> str:
     try:
-        r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, errors="replace", timeout=5)
         return r.stdout.strip() if r.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -119,7 +120,7 @@ def git(root: Path, *args: str, check: bool = False) -> str:
         r = subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -138,6 +139,22 @@ def match_any(path: str, patterns: list[str]) -> bool:
         if fnmatch.fnmatch(path, p) or fnmatch.fnmatch("/" + path, p):
             return True
     return False
+
+
+CD_OLD = 'cd "$(dirname "$0")/.."'
+CD_ENV = 'cd "${DEVACCEL_ROOT:-$(dirname "$0")/..}"'
+
+
+def check_script_for(text: str) -> str | None:
+    """check.sh text that cds into $DEVACCEL_ROOT, or None if its cd line is unrecognised
+    (running it elsewhere would silently check the wrong directory)."""
+    if "DEVACCEL_ROOT" in text:
+        return text
+    if CD_OLD in text:
+        return text.replace(CD_OLD, CD_ENV)
+    if re.search(r"^\s*cd\s", text, re.M):
+        return None  # some other cd: it would leave the tree we were asked to check
+    return text  # no cd at all: runs in the cwd we set
 
 
 def state_dir(root: Path) -> Path:

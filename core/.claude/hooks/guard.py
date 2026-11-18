@@ -81,6 +81,8 @@ LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-ru
 READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status|add))\s[^`$<>]*$")
 LAND_MERGE = re.compile(r"devaccel_land.*\s-+m", re.S)  # defense in depth, anywhere in the command
 PIPE = re.compile(r"(?<!\|)\|(?!\|)")
+# env changes before running the PR/land script could shadow python3 or its imports (PATH, PYTHONPATH, ...)
+ENV_CHANGE = re.compile(r"(?:^|[\s;&|(])(?:export|env|declare|typeset|alias|source|unset|\.)\s|(?:^|[\s;&|(])\w+=")
 HOOKS_GLOB = re.compile(r"\.claude/hooks/\S*[*?\[{]|\.claude/hooks/?\s|\.claude/hook[*?\[{]|\.claude/[*?\[{]")
 PTY = re.compile(r"(?:^|[\s;&|(])(?:script|unbuffer|expect|empty|socat)\s")
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
@@ -100,7 +102,7 @@ def _segments(command: str) -> list[str]:
 def _current_branch(cwd: Path) -> str:
     try:
         r = subprocess.run(["git", "-C", str(cwd), "symbolic-ref", "--short", "-q", "HEAD"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, errors="replace", timeout=5)
         return r.stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -110,7 +112,7 @@ def _protected_branches(cwd: Path, cfg: dict) -> set[str]:
     names = {"main", "master", cfg.get("scale", {}).get("base_branch", "main")}
     try:
         r = subprocess.run(["git", "-C", str(cwd), "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, errors="replace", timeout=5)
         if r.stdout.strip():
             names.add(r.stdout.strip().split("/", 1)[-1])
     except (OSError, subprocess.TimeoutExpired):
@@ -166,6 +168,8 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
     if LAND_MERGE.search(flat):
         return "deny", "devaccel_land.py --merge(マージ)は人が端末で実行します。"
     segs_flat = [s for s in SEP.split(FD.sub(" ", flat)) if s.strip()]
+    if PR_SCRIPT.search(flat) and ENV_CHANGE.search(flat) and not all(READERS.search(s) for s in segs_flat):
+        return "deny", "devaccel_pr/land の実行と同じコマンドで環境変数・alias・source を変えないでください。"
     if PR_SCRIPT.search(flat) and PIPE.search(flat) and not all(READERS.search(s) for s in segs_flat):
         return "deny", "devaccel_pr/land を名指しするコマンドで、他のコマンドへのパイプは使えません。"
     for s in segs_flat:

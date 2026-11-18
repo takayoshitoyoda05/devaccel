@@ -4,7 +4,7 @@
 
 ## コマンド
 <!-- devaccel:fill セットアップ・実行・テストのコマンド -->
-- 検査: `scripts/check.sh fast`(普段)/ `scripts/check.sh full`(CI と同じ)
+- 検査: `scripts/check.sh fast`(普段)/ `scripts/check.sh full`(CI と同じ)。整形・lint・型・テストをまとめて回すので、ruff・pyright・pytest を個別に回さない。
 
 ## 進め方
 - L(3ファイル超・設計判断あり・認証/DB/削除/秘密情報に触れる)は、plan mode で design スキルを使い、設計書の承認を得てから実装。

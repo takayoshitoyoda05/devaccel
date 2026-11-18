@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.3 (2026-11-18)
+独立したコードレビュー(結論を渡さず別エージェント)の指摘 1〜9 を修正。
+- guard: devaccel_pr/land の実行と同じコマンドで環境変数・alias・source を変える形を拒否(`PATH=`/`PYTHONPATH=` で python や import を差し替えられた)。
+- ゲート: 非 UTF-8 のファイル名・出力で落ちて素通しになっていた → 置換デコード。状態をセッション/単位ごとのファイルに分け、並列単位の同時書き込みで block が消える競合を解消(判定を先に出してから保存)。enforce で「何も変えずにもう一度止める」と通れた → 同じ木なら失敗を再提示(3 回で人へ)。timeout は未検証として次回再実行、検査の上限をフックの 120 秒より下に。単位の判定を git-dir ≠ common-dir に(シンボリックリンク・大小文字に強い)。
+- check.sh の cd 行を `${DEVACCEL_ROOT:-...}` に。見慣れない cd 行の check.sh は別の木に向けず missing 扱い。
+- devaccel_pr: 設定は本体から読む(単位の project.json の base_branch で差分を空にできた)。base check の timeout と、メモファイルが無い場合を明確なエラーに。
+- seed CLAUDE.md: 「check.sh fast がまとめて回すので個別に回さない」(実測でターン 15→12、Bash 5.8→3.7、コスト -6%、正確さ同等)。README に任意の高速化手段(`/effort low`、`/fast`)。
+
 ## 0.8.2 (2026-11-18)
 - サンドボックス denyRead にホーム直下の秘密を追加(`~/.netrc`、`~/.docker/config.json`、`~/.kube`、`~/.npmrc`、`~/.pypirc`)。他のチェックアウトの `.env` は対象外になったことを README に明記(0.8.1 の速度修正との引き換え)。
 
