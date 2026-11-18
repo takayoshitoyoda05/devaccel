@@ -1642,3 +1642,18 @@ class R11NestedGitTest(ReqKit):
         (inner / "x.py").write_text("X = 1\n")
         d, _ = self.gate(inner, agent="u5")
         self.assertEqual(d.get("decision"), "block")
+
+
+class R12SingleDecisionTest(ReqKit):
+    def test_gate_prints_exactly_one_decision_even_if_saving_state_fails(self):
+        wt = self.root / ".claude" / "worktrees" / "u6"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "u6", str(wt))
+        (wt / "app.py").write_text("BROKEN\n")
+        state = self.root / ".claude" / "state" / "gate"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "u6.json").mkdir()  # saving the session state will fail after the decision is printed
+        r = run(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"), env={"CLAUDE_PROJECT_DIR": str(self.root)},
+                stdin=json.dumps({"session_id": "s", "agent_id": "u6", "cwd": str(wt)}))
+        out = r.stdout.strip()
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertEqual(json.loads(out).get("decision"), "block")

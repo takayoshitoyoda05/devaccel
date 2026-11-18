@@ -20,10 +20,10 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
 from devaccel_common import (  # noqa: E402
+    emit as _emit_raw,
     worktree_link_ok,
     check_script_for,
     confined,
-    emit,
     git,
     is_git_repo,
     load_config,
@@ -210,9 +210,12 @@ def save_session(root: Path, sid: str, sess: dict) -> None:
     tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")  # unique per process
     tmp.write_text(json.dumps(sess), encoding="utf-8")
     tmp.replace(p)
-    olds = sorted(p.parent.glob("*.json"), key=lambda f: f.stat().st_mtime)[:-50]  # keep the 50 newest
-    for f in olds:
-        f.unlink(missing_ok=True)
+    try:  # pruning is housekeeping; it must never turn into a gate error
+        olds = sorted(p.parent.glob("*.json"), key=lambda f: f.stat().st_mtime)[:-50]  # keep the 50 newest
+        for f in olds:
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[str, str]]:
@@ -230,6 +233,14 @@ def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[
 
 
 CTX: dict = {}  # for the error log: what we knew when it failed
+
+
+def emit(obj: dict) -> None:
+    """At most one decision per run: a later error must not print a second JSON (unparseable = fail open)."""
+    if CTX.get("emitted"):
+        return
+    CTX["emitted"] = True
+    _emit_raw(obj)
 
 
 def main() -> int:
