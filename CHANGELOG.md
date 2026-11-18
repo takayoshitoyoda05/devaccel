@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.2 (2026-11-18)
+- ship の固定費を約 12 秒 → 約 8 秒: push を証拠づくり(HEAD のスナップショットと base の check)と並行、gh のラベル作成と既存 PR の照会も並行(push 後に古ければ照会し直す)。段階ごとの秒数を `DEVACCEL_TIMING=1` で表示。
+- devaccel_batch: `--effort`、`--strong K`(長い K 件を sonnet)、参照ファイルの埋め込み(課題文が `` `path` `` で名指す 8 KB 以下のファイルを最大 3 つ。`--no-context` で無効)。計測の結果、既定は haiku・effort low のまま(D17)。
+
 ## 0.12.1 (2026-11-18)
 - devaccel_batch の並列数をマシンとプロジェクトに合わせて実行時に決める(固定しない): `--jobs` > `project.json` の `parallel.max_jobs` > 空きメモリ × 0.8 ÷ `parallel.unit_mem_mb`(既定 300)と CPU 数 × 2。使う数と根拠を表示。doctor がそのマシンでの目安を表示。
 
