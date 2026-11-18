@@ -246,6 +246,45 @@ class KitTest(unittest.TestCase):
         self.assertTrue(any("check.sh full" in r for r in ev["reasons"]), ev)  # base check.sh still fails
         self.assertTrue(any("検証基盤" in r for r in ev["reasons"]), ev)
 
+    def test_pr_triage_defect_injection(self):
+        """Each injected defect must yield needs-human (no false evidence-ok); a benign change must not."""
+        test_file = "tests/test_app.py"
+        (self.root / "tests").mkdir(exist_ok=True)
+        (self.root / test_file).write_text("def test_a():\n    assert 1\n\n\ndef test_b():\n    assert 2\n")
+        sh(self.root, "git", "add", "tests")
+        sh(self.root, "git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", "tests")
+        design = "docs/design/feature.md"
+        cases = {
+            "benign": ({"app.py": "X = 2\n"}, None),
+            "check fails": ({"app.py": "BROKEN\n"}, "check.sh full"),
+            "test deleted": ({test_file: None}, "テスト削除"),
+            "test shrunk": ({test_file: "def test_a():\n    assert 1\n"}, "既存テストの行削除"),
+            "skip added": ({"tests/test_new.py": "import pytest\n\n\n@pytest.mark.skip\ndef test_x():\n    pass\n"},
+                           "skip"),
+            "risky path": ({"auth/login.py": "X = 1\n"}, "リスク"),
+            "machinery": ({"pytest.ini": "[pytest]\n"}, "検証基盤"),
+            "open AC": ({design: "# f\n- [x] done\n- [ ] not yet\n"}, "受け入れ条件"),
+            "no verify notes": ({"app.py": "X = 3\n"}, "verify-app"),
+        }
+        for name, (files, expect) in cases.items():
+            with self.subTest(name):
+                sh(self.root, "git", "checkout", "-q", "-f", "main")
+                sh(self.root, "git", "checkout", "-q", "-B", "feat")
+                for path, text in files.items():
+                    p = self.root / path
+                    if text is None:
+                        sh(self.root, "git", "rm", "-q", path)
+                        continue
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(text)
+                    sh(self.root, "git", "add", path)
+                ev = self.pr_dry_run(notes="" if name == "no verify notes" else "ran it")
+                if expect is None:
+                    self.assertEqual(ev["label"], "evidence-ok", ev["reasons"])
+                else:
+                    self.assertEqual(ev["label"], "needs-human", name)
+                    self.assertTrue(any(expect in r for r in ev["reasons"]), (name, ev["reasons"]))
+
     def gv(self, cmd: str):
         cfg = json.loads((self.root / ".claude/project.json").read_text())
         v = guard.decide(cmd, guard.load_config(self.root) | cfg, self.root, self.root)

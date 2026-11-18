@@ -32,11 +32,16 @@ ALLOWED = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(uv run pytest*)", "Bas
 
 
 def sh(cmd: list[str], cwd: Path, timeout: int = 900, env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env,
+                          stdin=subprocess.DEVNULL)
+
+
+CONDS = ("vanilla", "devaccel", "devaccel-noverify", "devaccel-gateonly")
 
 
 def prepare(cond: str, trial: Path, ref: str) -> Path:
-    d = WORK / cond
+    # ablations reuse the trusted devaccel clone (workspace trust is per path)
+    d = WORK / ("vanilla" if cond == "vanilla" else "devaccel")
     if not d.exists():
         d.parent.mkdir(parents=True, exist_ok=True)
         sh(["git", "clone", "-q", str(trial), str(d)], d.parent)
@@ -50,6 +55,14 @@ def prepare(cond: str, trial: Path, ref: str) -> Path:
         cm = (d / "CLAUDE.md").read_text(encoding="utf-8")
         (d / "CLAUDE.md").write_text(cm.split("\n## 進め方")[0].rstrip() + "\n", encoding="utf-8")
         sh(["git", "-c", "user.email=b@b", "-c", "user.name=bench", "commit", "-qam", "vanilla"], d)
+    elif cond != "devaccel":
+        cm = (d / "CLAUDE.md").read_text(encoding="utf-8")
+        if cond == "devaccel-noverify":  # without the verify-app rule
+            cm = "\n".join(ln for ln in cm.splitlines() if "verify-app" not in ln) + "\n"
+        else:  # gateonly: no process/verification text, hooks and settings stay
+            cm = cm.split("\n## 進め方")[0].rstrip() + "\n"
+        (d / "CLAUDE.md").write_text(cm, encoding="utf-8")
+        sh(["git", "-c", "user.email=b@b", "-c", "user.name=bench", "commit", "-qam", cond], d)
     sh(["uv", "sync", "-q"], d)
     return d
 
@@ -85,7 +98,7 @@ def main() -> int:
     ap.add_argument("--model", default="claude-sonnet-5-5")
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--tasks", default="t1_min,t2_month,t3_top")
-    ap.add_argument("--conds", default="vanilla,devaccel")
+    ap.add_argument("--conds", default=",".join(CONDS))
     ap.add_argument("--max-turns", type=int, default=60)
     a = ap.parse_args()
     trial = a.trial.expanduser().resolve()
@@ -104,19 +117,29 @@ def main() -> int:
         keep = ("PATH", "HOME", "USER", "LANG", "TERM", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "UV_CACHE_DIR")
         env = {k: v for k, v in os.environ.items() if k in keep}  # no stray tokens from this shell
         env["DEVACCEL_GATE_MODE"] = "enforce"  # the gate as intended in steady state
-        r = sh(["claude", "-p", prompt, "--output-format", "json", "--model", a.model,
+        r = sh(["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", a.model,
                 "--max-turns", str(a.max_turns), "--permission-mode", "acceptEdits",
                 "--allowedTools", *ALLOWED], d, timeout=3600, env=env)
         wall = round(time.time() - t0)
-        try:
-            j = json.loads(r.stdout)
-        except ValueError:
-            j = {"is_error": True, "result": (r.stdout + r.stderr)[-500:]}
+        j, tools = {"is_error": True, "result": (r.stdout + r.stderr)[-500:]}, {}
+        for line in r.stdout.splitlines():  # stream-json: count tool calls (incl. Skill) for the breakdown
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "result":
+                j = ev
+            for blk in (ev.get("message") or {}).get("content") or []:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    key = blk["name"] + (f":{blk['input'].get('skill') or blk['input'].get('command', '')}"
+                                         if blk["name"] == "Skill" else "")
+                    tools[key] = tools.get(key, 0) + 1
         u = j.get("usage") or {}
         rec = {"task": task, "cond": cond, "rep": rep, "ref": ref[:8], "model": a.model, "wall_s": wall,
                "turns": j.get("num_turns"), "cost_usd": j.get("total_cost_usd"), "is_error": j.get("is_error"),
                "subtype": j.get("subtype"), "in": u.get("input_tokens"), "out": u.get("output_tokens"),
                "cache_read": u.get("cache_read_input_tokens"), "cache_write": u.get("cache_creation_input_tokens"),
+               "tools": tools,
                **grade(d, task, check_sh)}
         with log.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")

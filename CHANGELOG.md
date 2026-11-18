@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 (2026-11-18)
+fable の改善計画(短期)より。
+- seed CLAUDE.md: verify-app を規模依存に(S で追加テストが入口を通るなら省略可。PR は常に必須)。実測で devaccel のターン増の主因と推定。
+- 振り分けの欠陥注入テスト: 検査失敗・テスト削除/行削除・skip・risky・検証基盤・未チェックの受け入れ条件・実動作確認なしの 8 種がすべて needs-human、無害な変更は evidence-ok。
+- 非 Python: check.sh が空なら doctor が problem を出し、`/devaccel-setup` が package.json / Makefile / Cargo.toml / go.mod から段を提案。
+- bench: stream-json でツール別呼び出し回数を記録、アブレーション条件(`devaccel-noverify`, `devaccel-gateonly`)、`summarize.py`。
+- LICENSE(MIT)、README に実測の正直な結果と「何でないか」。
+
 ## 0.6.5 (2026-11-18)
 - devaccel-pr スキル: `$(mktemp)`・変数・ヒアドキュメントを使わない手順に(展開を含む Bash は確認なしで許可されず、/batch の単位では拒否されて 3 単位中 2 単位が PR 前に止まった)。メモは Write で `.claude/state/pr-notes.md`、コミットは `git commit -F .claude/state/commit-msg.txt`。
 

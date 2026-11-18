@@ -507,6 +507,9 @@ def cmd_doctor(root: Path) -> int:
 
     check = root / "scripts/check.sh"
     ok(check.exists() and os.access(check, os.X_OK), "scripts/check.sh missing or not executable")
+    if check.exists() and "no checks configured" in check.read_text():
+        problems.append("scripts/check.sh has no checks: the gate passes everything  → run /devaccel-setup "
+                        "(it proposes stages from package.json / Makefile / Cargo.toml / go.mod)")
     if "python" in cfg.get("presets", []):
         runner_uv = check.exists() and 'R="uv run"' in check.read_text()
         for tool in ("ruff", "pyright", "pytest"):
