@@ -90,6 +90,8 @@ case "$MODE" in
 
 WORKFLOW_UV = """name: check
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -100,8 +102,23 @@ jobs:
       - run: scripts/check.sh full
 """
 
+WORKFLOW_GENERIC = """name: check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # add your toolchain setup here (see /devaccel-setup), then:
+      - run: scripts/check.sh full
+"""
+
 WORKFLOW_PIP = """name: check
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -205,7 +222,11 @@ SANDBOX = {
     # call, scanning all of $HOME (measured 4-15 s per call, 0.8.1). Home secrets are named directly.
     # Not ~/.config/gh: the PR script and git push use it inside the sandbox (D12). Other checkouts'
     # .env under $HOME are not covered (accepted for speed; README).
-    "filesystem": {"denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker/config.json", "~/.kube", "~/.npmrc", "~/.pypirc"]},
+    # denyWrite: the trusted root's verification machinery and gate state (Bash writes; Edit is ask-gated).
+    # Paths only (no globs); /batch worktrees under .claude/worktrees/ stay writable.
+    "filesystem": {"denyWrite": ["./.claude/hooks", "./.claude/skills", "./.claude/state", "./.claude/devaccel.lock",
+                                 "./.claude/project.json", "./.claude/settings.json", "./scripts/check.sh"],
+                   "denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker/config.json", "~/.kube", "~/.npmrc", "~/.pypirc"]},
 }
 NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]}
 BASE_DOMAINS = ["github.com", "api.github.com"]  # git push + gh (PR script)
@@ -280,8 +301,11 @@ def render_settings(presets: list[str]) -> dict:
 
 def write_new(root: Path, rel: str, content: str | None = None, src: Path | None = None) -> bool:
     dst = root / rel
-    if dst.exists():
+    if dst.exists() or dst.is_symlink():  # a dangling symlink would make us write outside the project
         return False
+    for parent in dst.relative_to(root).parents:
+        if (root / parent).is_symlink():
+            raise SystemExit(f"error: {root / parent} is a symlink; refusing to write {rel} through it")
     dst.parent.mkdir(parents=True, exist_ok=True)
     if src is not None:
         shutil.copy2(src, dst)
@@ -320,22 +344,21 @@ def cmd_install(root: Path) -> int:
     gen = {
         ".claude/project.json": json.dumps(cfg, indent=2, ensure_ascii=False) + "\n",
         "scripts/check.sh": render_check(presets, runner),
-        ".github/workflows/check.yml": WORKFLOW_UV if runner else WORKFLOW_PIP,
+        ".github/workflows/check.yml": WORKFLOW_UV if runner else WORKFLOW_PIP if presets else WORKFLOW_GENERIC,
     }
     for rel, content in gen.items():
         (created if write_new(root, rel, content) else kept).append(rel)
-    os.chmod(root / "scripts/check.sh", 0o755)
+    if "scripts/check.sh" in created:
+        os.chmod(root / "scripts/check.sh", 0o755)
 
-    settings = root / ".claude/settings.json"
     if write_new(root, ".claude/settings.json",
                  json.dumps(render_settings(presets), indent=2, ensure_ascii=False) + "\n"):
         created.append(".claude/settings.json")
     else:
         kept.append(".claude/settings.json")
-        if not hooks_wired(settings):
-            print("\n! .claude/settings.json already exists; devaccel does not merge it.")
-            print("  Add these entries yourself (see README 'settings.json'):")
-            print(json.dumps({"hooks": render_settings(presets)["hooks"]}, indent=2))
+        print("\n! .claude/settings.json already exists; devaccel does not merge it.")
+        print("  Merge these keys yourself (hooks incl. SubagentStop, permissions, sandbox, env), then run doctor.sh:")
+        print(json.dumps(render_settings(presets), indent=2, ensure_ascii=False))
 
     gi = root / ".gitignore"
     text = gi.read_text() if gi.exists() else ""
@@ -425,11 +448,20 @@ def _safe_core_path(root: Path, rel: str) -> bool:
 
 
 def hooks_wired(settings: Path) -> bool:
+    """guard on PreToolUse(Bash), stop_gate on Stop (SubagentStop is checked separately by doctor)."""
     try:
-        text = settings.read_text()
-    except OSError:
+        hooks = json.loads(settings.read_text()).get("hooks", {})
+    except (OSError, ValueError, AttributeError):
         return False
-    return "hooks/guard.py" in text and "hooks/stop_gate.py" in text
+
+    def wired(event: str, script: str, matcher: str | None = None) -> bool:
+        for entry in hooks.get(event, []) if isinstance(hooks.get(event), list) else []:
+            if matcher and entry.get("matcher") != matcher:
+                continue
+            if any(script in str(h.get("command", "")) for h in entry.get("hooks", [])):
+                return True
+        return False
+    return wired("PreToolUse", "hooks/guard.py", "Bash") and wired("Stop", "hooks/stop_gate.py")
 
 
 def _perms(root: Path) -> dict:
@@ -507,6 +539,19 @@ def cmd_doctor(root: Path) -> int:
         wired = json.loads((root / ".claude/settings.json").read_text()).get("hooks", {})
     except (OSError, ValueError):
         wired = {}
+    perms = _perms(root)
+    need = ["Read(**/.env)", "Bash(gh *)", "Bash(git push --force*)"]
+    lacking = [r for r in need if r not in perms.get("deny", [])]
+    ok(not lacking, f"settings permissions.deny lacks {lacking}", "merge the deny list printed by install.sh")
+    try:
+        sb = json.loads((root / ".claude/settings.json").read_text()).get("sandbox", {})
+    except (OSError, ValueError):
+        sb = {}
+    if sb.get("enabled") and not sb.get("autoAllowBashIfSandboxed"):
+        notes.append("sandbox.autoAllowBashIfSandboxed is off: /batch units will stop on permission prompts")
+    if sb.get("enabled") and "./.claude/hooks" not in (sb.get("filesystem", {}).get("denyWrite") or []):
+        problems.append("sandbox.filesystem.denyWrite does not protect ./.claude/hooks etc.  → merge the "
+                        "sandbox block printed by install.sh (CHANGELOG 0.10.0)")
     bad_denies = [r for r in ("Read(/uv.lock)", "Read(/.venv/**)", "Read(/.claude/worktrees/**)")
                   if r in json.dumps(_perms(root))]
     try:
@@ -568,9 +613,9 @@ def cmd_doctor(root: Path) -> int:
         if p.exists() and re.search(r"<!-- devaccel:fill\b(?!ed)", p.read_text()):
             notes.append(f"{f} still has devaccel:fill placeholders → /devaccel-setup")
 
-    rep = root / ".claude/hooks/devaccel_report.py"
+    rep = CORE / ".claude/hooks/devaccel_report.py"  # the kit's copy: never execute the project's files
     if rep.exists():
-        r = subprocess.run([sys.executable, str(rep)], cwd=root, capture_output=True, text=True,
+        r = subprocess.run([sys.executable, "-I", str(rep)], cwd=root, capture_output=True, text=True,
                            env={**os.environ, "CLAUDE_PROJECT_DIR": str(root)})
         notes += [ln for ln in r.stdout.splitlines() if ln.startswith("gate runs")]
 

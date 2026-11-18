@@ -2,39 +2,49 @@
 
 > **English summary**: devaccel is a small, distributable Claude Code kit for personal and light professional Python work (WSL/Linux). It keeps interactive sessions close to vanilla Claude Code (measured), and adds a safety net only where nobody is watching: a verification gate inside `/batch` worktree units, evidence-based PRs triaged into `evidence-ok` / `needs-human`, and a local merge queue (`devaccel_land.py`) that re-verifies parallel PRs together before a human merges. Docs are in Japanese; see `docs/requirements.md` for what it guarantees and what it deliberately does not.
 
-Claude Code を **少ないトークンで、正確に、速く** 回すための、プロジェクト配布型キット(Python 中心 / WSL・Linux)。
-研究用の重装備版(claude-ml-template)とは独立。設計の理由は [docs/design.md](docs/design.md)。
+Claude Code で **並列・無人の作業に検証の安全網を足す** プロジェクト配布型キット(Python 中心 / WSL・Linux)。対話セッションは素の Claude Code とほぼ同じ手間に保つ(実測)。設計の理由は [docs/design.md](docs/design.md)、保証すること・しないことは [docs/requirements.md](docs/requirements.md)。
 
-- 常駐するのは短い `CLAUDE.md`(約15行)とスキル説明 3 行だけ。自作エージェントは 0。対話セッションには検証の儀式を挟まない(実測で効かなかった)。
-- 正確さは LLM の審査ではなく **機械ゲート + 実際に動かす確認** で担保する。
-- 小さい作業には何も挟まない。L 規模だけ設計書と仕様照合。
-- 配布後は各プロジェクトで育てる(`project.json` / `/devaccel-tune`)。
+- **無人の経路に足すもの**: `/batch` の作業単位(worktree)の中で検査を強制するゲート(check.sh を bubblewrap で隔離して実行)、機械的に組み立てた証拠つき PR と `evidence-ok` / `needs-human` の振り分け、並列 PR を最新 base 上でまとめて再検証してから人がマージする `devaccel_land.py`。
+- **対話には挟まない**: 常駐は短い `CLAUDE.md`(約15行)とスキル説明 3 行。対話セッションのゲートは既定 off。
+- 正確さは LLM の審査ではなく **機械の検査 + 実際に動かす確認** で担保する。
 
-**正直な現状(2026-11 の実測、各 2 回)**: 小さな機能追加 3 課題・罠つき難課題 3 課題とも、素の Claude Code と正確さは同等(隠しテスト全通過)。対話時の手間は 0.6 系で時間 2〜3 倍だったものが、0.8.3 でほぼ同等(時間 約 37〜40 秒 対 39 秒、コスト +4〜10%)。価値の主張は「人が見ていない並列・PR 経路での信頼」(単位内ゲート、証拠つき PR、振り分け、land)。計測は `tests/bench/`、記録は docs/design.md D14。ベンチとリリース前スモークの対象(試験用プロジェクト)は非公開のため、そのままでは再現できない(`--trial` に自分の小さな Python CLI を指定し、`tests/bench/tasks` を合わせれば同じ手順で測れる)。
+**正直な現状(2026-11 の実測。各 2 回、n が小さい)**
+- 小さな機能追加 3 課題(sonnet): 正確さは素の Claude Code と同等(隠しテスト全通過)。0.8.3 で時間 約 37〜40 秒 対 39 秒、コスト +4〜12%。トークンは**減っていない**。
+- 罠つき難課題 3 課題(haiku、0.7.2 時点): 正確さは同等、時間は約 2 倍(最新版では未再計測)。
+- 振り分けが仕込んだ欠陥を見逃さないことは**合成テスト**で確認(8 種)。実際の PR での誤検知・見逃し率は未計測(実 PR は十数本)。
+- 並列(`/batch`)が逐次より速いかは**未計測**。`/devaccel-tune` による継続調整は実データでは未実証。
+- 計測は `tests/bench/`、記録は docs/design.md D14。ベンチとリリース前スモークの対象(試験用プロジェクト)は非公開(`--trial` に自分の小さな Python CLI を指定し、`tests/bench/tasks` を合わせれば同じ手順で測れる)。
 
-**速くするための任意の手段**(既定にはしていない): 小さい作業は `/effort low`(実測で時間・コストとも数 % 減、罠のある課題での正確さは未確認)。Opus 系なら `/fast`(サブスクの枠外で追加課金)。
+**これは何でないか**: セキュリティ境界ではない(guard は文字列判定の best-effort。本当の境界はサンドボックスと GitHub のブランチ保護)。トークン削減キットでもない。Python 以外は検査の段を自分で書く(`/devaccel-setup` が提案)。macOS は未検証。
 
-**これは何でないか**: セキュリティ境界ではない(guard は文字列判定の best-effort。本当の境界はサンドボックスと GitHub のブランチ保護)。Python 以外は検査の段を自分で書く必要がある(`/devaccel-setup` が提案)。サンドボックスに bubblewrap/socat が必要で、無いと Claude Code が起動しない設定にしている(`failIfUnavailable`)。
+## 前提(先に入れる)
+
+- Claude Code、python3 ≥ 3.10、git、bash、[gh](https://cli.github.com/)(PR の流れを使う場合、`gh auth login` 済み)
+- **bubblewrap と socat**(サンドボックスとゲートの隔離に必須。無いと Claude Code が起動しない設定にしている):
+  `sudo apt-get install bubblewrap socat`
+- Python プリセット: uv・ruff・pyright・pytest(`uv add --dev ruff pyright pytest`)
 
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.9.0   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.10.0   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
-git add -A && git commit       # .claude/ ごとコミット → 他の人は clone するだけで同じ環境
+git add -A && git commit       # .claude/ ごとコミット → 他の人は clone するだけで同じ環境(bubblewrap は各自)
+~/devaccel/protect.sh          # GitHub の main を保護(公開リポジトリか Pro。マージの本当の境界)
 ```
+
+更新: `cd ~/devaccel && git fetch --tags && git checkout <新しいタグ>` → プロジェクトで `~/devaccel/update.sh` → `.claude/` をコミット(未コミットだと /batch の単位が PR を作れない。doctor が知らせる)。
 
 | コマンド | 用途 |
 |---|---|
-| `~/devaccel/update.sh` | core を最新に。core が手編集されていたら止まって差分を表示 |
-| `~/devaccel/doctor.sh` | 改変・配線・ツール・CLAUDE.md 行数・ゲート統計の点検 |
+| `~/devaccel/update.sh` | core をキットの版に合わせる。core が手編集されていたら止まって差分を表示 |
+| `~/devaccel/doctor.sh` | 改変・配線・権限・サンドボックス・ツール・CLAUDE.md 行数・ゲート統計の点検 |
+| `~/devaccel/protect.sh` | base ブランチの保護(人が実行、確認あり) |
 | `/devaccel-setup` | 初回生成(CLAUDE.md・verify-app・計測)。`--redetect` |
 | `/devaccel-tune` | ゲート記録と PR 振り分けから追加・削除・調整を提案(承認後に適用) |
 | `/devaccel-batch` | 独立した S/M が 4 件以上のとき、コンテキストパックつきで `/batch` を呼ぶ |
-
-前提: python3 ≥ 3.10、git、bash。Python プリセットは uv・ruff・pyright・pytest(`uv add --dev ruff pyright pytest`)。
 
 ## 導入されるもの
 
@@ -102,22 +112,57 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 sudo apt-get install bubblewrap socat   # WSL1 は非対応
 ```
 install が `.claude/settings.json` にサンドボックス設定を書く。起動後 `/sandbox` の Dependencies タブで有効を確認。doctor が依存の有無を点検する。
-既存の settings.json があるプロジェクトでは、次を自分で追記する(公式: https://code.claude.com/docs/en/sandboxing):
+既存の settings.json があるプロジェクトでは、install が表示する設定一式(hooks・permissions・sandbox・env)を自分でマージし、doctor で確認する。サンドボックス部分は次のとおり(Python プリセット。公式: https://code.claude.com/docs/en/sandboxing):
 ```json
 "sandbox": {
   "enabled": true,
   "failIfUnavailable": true,
   "allowUnsandboxedCommands": false,
+  "autoAllowBashIfSandboxed": true,
   "filesystem": {
-    "denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker/config.json", "~/.kube", "~/.npmrc", "~/.pypirc"],
-    "allowWrite": ["~/.cache/pip", "~/.cache/pyright-python", "~/.cache/ruff", "~/.cache/uv"]
+    "denyWrite": [
+      "./.claude/hooks",
+      "./.claude/skills",
+      "./.claude/state",
+      "./.claude/devaccel.lock",
+      "./.claude/project.json",
+      "./.claude/settings.json",
+      "./scripts/check.sh"
+    ],
+    "denyRead": [
+      "./**/.env",
+      "./**/.env.*",
+      "~/.ssh",
+      "~/.aws",
+      "~/.gnupg",
+      "~/.netrc",
+      "~/.docker/config.json",
+      "~/.kube",
+      "~/.npmrc",
+      "~/.pypirc"
+    ],
+    "allowWrite": [
+      "~/.cache/pip",
+      "~/.cache/pyright-python",
+      "~/.cache/ruff",
+      "~/.cache/uv"
+    ]
   },
-  "network": { "allowedDomains": ["api.github.com", "files.pythonhosted.org", "github.com", "pypi.org", "registry.npmjs.org"] }
+  "network": {
+    "allowedDomains": [
+      "api.github.com",
+      "files.pythonhosted.org",
+      "github.com",
+      "pypi.org",
+      "registry.npmjs.org"
+    ]
+  }
 }
 ```
 - `failIfUnavailable: true` のため、bubblewrap/socat が無いと Claude Code は起動しない(黙って保護なしで動くより安全)。協業者にも初回のインストールを案内する。
 - `allowUnsandboxedCommands: false` で、Claude がサンドボックス外での再実行を求める抜け道を閉じる。
-- フックと Read/Edit ツールはサンドボックスの外で動く(Read の秘密は permissions が担当)。
+- `autoAllowBashIfSandboxed: true` で、サンドボックス内の Bash は確認なしで動く(/batch の単位が確認待ちで止まらない)。`denyWrite` で、本体の検証基盤(`.claude/hooks` 等・`scripts/check.sh`)とゲートの状態をエージェントの Bash から守る。
+- フックと Read/Edit ツールはサンドボックスの外で動く(Read の秘密は permissions が担当)。そのためゲートと land は check.sh(エージェントが書いたテストを含む)を**自前の bubblewrap で隔離して**実行する: ファイルシステムは読み取り専用、`$HOME` は空(ツールチェーンは読み取り専用で戻し、ツールのキャッシュだけ書ける)、書けるのは作業ツリーだけ(`.git` は読み取り専用)、`.env` は隠し、環境変数は最小限。ネットワークは依存の取得のため許可(リポジトリのコードを外に送れる残余リスク)。
 - 読み取りは既定で広い。ほかに守りたい場所は `denyRead` に**パスを直接**足す(`~/**/x` のようなホーム全体のグロブは Bash のたびに $HOME を走査して数秒〜十数秒遅くなる)。そのため**他のプロジェクトの `.env` は守られない**(速度との引き換え。気になるなら秘密は `~/.config/<app>/` 等にまとめて直接指定)。`~/.config/gh` は PR 作成と push に必要なので読める(D12)。
 
 ## 開発
@@ -127,5 +172,5 @@ install が `.claude/settings.json` にサンドボックス設定を書く。�
 1. **CI**(`.github/workflows/ci.yml`): ruff・pyright・単体テスト(guard / ゲート / 振り分けの欠陥注入 / land / install・update・doctor)。
    結合テスト `tests/integration/generated_check.sh`: 新しい uv プロジェクトに install し、生成された check.sh を本物の ruff / pyright / pytest で実行(lint・型エラーを検出し、.claude/ を書き換えないこと)。
 2. 手元: `python3 -m unittest discover -s tests -v`
-3. **リリース前スモーク**(実際の Claude Code、約 $0.3): `python3 tests/smoke/release_smoke.py` — サンドボックス内の Bash 1 回の遅延と、worktree の単位が拒否なしにコミットと PR 本文まで行けるかを確認。
+3. **リリース前スモーク**(実際の Claude Code、約 $0.3): `python3 tests/smoke/release_smoke.py --trial <devaccel を入れた信頼済みのプロジェクト>` — サンドボックス内の Bash 1 回の遅延と、worktree の単位が拒否なしにコミットと PR 本文まで行けるかを確認。
 4. 大きい変更は、結論を伝えずにコードだけ渡した別エージェントでレビュー(`/code-review`、ultra は使わない)。計測は `tests/bench/`。

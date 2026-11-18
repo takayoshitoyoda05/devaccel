@@ -231,12 +231,21 @@ def main() -> int:
     # a /batch unit = a linked worktree (git-dir != common-dir); robust to symlinks and path case
     unit = (git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()
             != git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    # a unit that breaks its worktree's .git link must not fall back to the (off) session mode
+    cwd = str(data.get("cwd") or "")
+    if "/.claude/worktrees/" in cwd + "/":
+        unit = True
+        if "/.claude/worktrees/" not in str(root) + "/":  # resolved to the main checkout: link broken
+            log_event(anchor, {"session": str(data.get("agent_id") or ""), "scope": "unit", "result": "missing",
+                               "error": "worktree is not its own git checkout"})
+            emit({"systemMessage": "[devaccel] 作業単位の worktree が git として壊れていて検査できません(未検証)。"})
+            return 0
     mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
     if mode == "off" or not is_git_repo(root):
         return 0
 
     branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
-    if branch and match_any(branch, gate["skip_branches"]):
+    if branch and not unit and match_any(branch, gate["skip_branches"]):  # units cannot opt out by renaming
         return 0
 
     relevant = relevant_paths(root, gate, cfg, unit)
@@ -317,7 +326,8 @@ def main() -> int:
             sess["noticed"] = sess["noticed"] + [k for k, _ in fresh]  # once per kind per session
             note = "[devaccel] " + " / ".join(m for _, m in fresh)
             reply["systemMessage"] = (reply.get("systemMessage", "") + "\n" + note).strip()
-            log_event(anchor, {"session": sid, "result": "notice", "notes": [m for _, m in fresh]})
+            log_event(anchor, {"session": sid, "branch": branch, "mode": mode, "scope": "unit" if unit else "session",
+                               "result": "notice", "notes": [m for _, m in fresh]})
 
     emit(reply)  # the decision goes out first; a state-write problem must not swallow a block
     save_session(anchor, sid, sess)

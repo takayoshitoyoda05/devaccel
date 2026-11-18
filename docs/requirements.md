@@ -1,6 +1,6 @@
 # devaccel 要求仕様
 
-対象: devaccel 0.8.4。作成 2026-11-18。
+対象: devaccel 0.10.0(初版は 0.8.4 時点。0.9.0・0.10.0 の監査で追記)。作成 2026-11-18。
 出典: README.md、docs/design.md(D1〜D15)、CHANGELOG.md、seed/CLAUDE.md、各 SKILL.md、kit/devaccel.py、core/.claude/hooks/*.py。tests/ は読まずに書いた(テストとの対応付けは別の担当が独立に行う)。
 
 ## 1. 前提
@@ -83,6 +83,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | DOC-02 | doctor は core ファイルの欠落と手編集(lock とのハッシュ不一致)を problem として報告しなければならない。 | D9 | unit |
 | DOC-03 | doctor は guard / stop_gate / `SubagentStop` の未配線を problem(終了コード 1)とし、`SubagentStop` には追記すべき設定を示さなければならない。 | 0.6.0, 0.9.0 | unit |
 | DOC-09 | doctor は devaccel の core(`.claude/hooks`・`.claude/skills`・lock)が未コミットなら problem にしなければならない(/batch の worktree は HEAD から作られ、ロックと合わずに PR 手順が拒否される)。 | 0.9.0 | unit |
+| DOC-10 | doctor は、フックの配線を構造で判定し(PreToolUse の matcher が Bash で guard、Stop に stop_gate)、permissions.deny の必須項目(`Read(**/.env)`、`Bash(gh *)`、force push)と sandbox の denyWrite の欠落を problem にしなければならない。doctor はプロジェクト内のスクリプトを実行してはならない(キット側の report を `-I` で実行)。 | 0.10.0 監査 | unit |
 | DOC-04 | doctor は次を problem として報告しなければならない: サンドボックス無効、bubblewrap / socat の欠如、`~/` で始まりグロブ `**` を含む `denyRead`、`Read(/uv.lock)`・`Read(/.venv/**)`・`Read(/.claude/worktrees/**)` の deny、`Bash(git push*)` の ask、許可ドメインに `api.github.com` が無いこと。 | 0.2.0、0.4.0、0.6.4、0.7.2、0.8.1 | unit |
 | DOC-05 | doctor は次を problem として報告しなければならない: `check.sh` の欠如・実行不可、`.claude/state/` と `.devaccel/` が gitignore されていないこと、`CLAUDE.md` の行数が `budget.claude_md_max_lines` を超えていること、Python プリセットで ruff・pyright・pytest が見つからないこと。 | 0.7.1、D10 | unit |
 | DOC-06 | doctor は未記入の `devaccel:fill` 目印を表示し、記入済みの `devaccel:filled` を未記入と判定してはならない。 | 0.1.3 | unit |
@@ -103,6 +104,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | SET-08 | 許可ドメインは `github.com` と `api.github.com` を常に含み、Python プリセットでは PyPI 2 ドメインと `registry.npmjs.org`、およびツールキャッシュ(`~/.cache/uv` ほか)への書き込み許可を含まなければならない。env は同時サブエージェント数 3、サブエージェントのモデル `sonnet` を設定しなければならない。 | 0.3.2、0.4.0、0.6.3、D11 | unit |
 | SET-09 | 生成された設定の下で、本物の Claude Code のサンドボックス内から `uv run`・`git stash` / merge・worktree 内のファイル編集が拒否されずに動かなければならない。 | 0.3.2、0.6.4、0.7.2 | e2e-smoke |
 | SET-10 | 生成された設定の下で、サンドボックス内の Bash からプロジェクトの `.env` と `~/.ssh` を読めてはならない。 | D5b | e2e-smoke |
+| SET-11 | 生成された sandbox は `filesystem.denyWrite` で本体の `.claude/hooks`・`.claude/skills`・`.claude/state`・lock・`project.json`・`settings.json`・`scripts/check.sh` を守り、`.claude/worktrees/` は書き込み可のままでなければならない。 | 0.10.0 監査 | unit |
 
 ### 2.5 GATE(`stop_gate.py`)
 
@@ -124,6 +126,8 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | GATE-14 | trusted root の `check.sh` が無い、または認識できない `cd` 行を持つ場合、ゲートは別の木を検査してはならず、`missing` として記録しなければならない。 | 0.8.3 | unit |
 | GATE-15 | `DEVACCEL_GATE_MODE` が `off` / `observe` / `enforce` のいずれかなら対話セッションの `mode` だけを上書きし(単位の `unit_mode` は上書きしない)、それ以外の値は無視しなければならない。 | README, 0.9.0 | unit |
 | GATE-16 | 本物の Claude Code で /batch の単位(サブエージェント)が終了するとき、`SubagentStop` でゲートが発火し、単位の worktree を検査して本体に記録しなければならない。 | 0.6.0、0.6.4、D13 | e2e-smoke |
+| GATE-17 | ゲートと land は check.sh を bubblewrap で隔離して実行しなければならない: 作業ツリー以外は読み取り専用、作業ツリーの `.git` と本体の検証基盤も読み取り専用、`$HOME` は許可リスト(ツールチェーンは読み取り専用、ツールのキャッシュのみ書き込み可)、`.env` は隠し、環境変数は最小限。bwrap が無ければ未検査として表示しなければならない(素の権限で実行してはならない)。 | 0.10.0 監査 H1 | unit |
+| GATE-18 | 作業単位は、ブランチ名(`spike/*`)や worktree の `.git` リンクの破壊でゲートを止められてはならない。判定前後で同じ「検査対象」の定義を使い、コミット済みの変更でエスカレーション後もブロックし続けてはならない。 | 0.10.0 監査 | unit |
 
 ### 2.6 GUARD(`guard.py`)
 
@@ -140,6 +144,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | GRD-09 | guard は疑似端末ラッパー(`script`、`unbuffer`、`expect`、`empty`、`socat`)と、`.claude/hooks/` を指すワイルドカード・ブレース展開、`cd .claude/hooks` を deny しなければならない。 | 0.5.3 | unit |
 | GRD-10 | guard は内部エラー時に許可してはならず(ask に倒す)、`project.json` の不正な正規表現で組み込み規則を無効にしてはならず、有効な `guard.deny_regex` / `ask_regex` は適用しなければならない。 | 0.1.1 | unit |
 | GRD-11 | guard は通常の開発コマンド(具体的なパスの `rm -rf`、`git commit -F`、`2>&1`、検査語を含む引用符つき文字列やヒアドキュメントでのファイル作成、`.env` という語を含むだけのコマンド)を deny / ask にしてはならない。 | 0.1.12、0.2.0、D5b | unit |
+| GRD-12 | guard は PR/land スクリプトの横(作業単位の `.claude/hooks/`)に lock 外のファイル(`json.py` 等、`__pycache__`)があれば実行を拒否しなければならない(モジュールのすり替え)。フックは自分のディレクトリを `sys.path` の末尾に追加しなければならない。 | 0.10.0 監査 H3 | unit |
 
 ### 2.7 PR(`devaccel_pr.py`)
 
@@ -156,6 +161,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | PR-09 | 同じブランチに open の PR があれば新しく作らず本文とラベルを更新し(反対のラベルは外す)、その PR がフォーク由来・base 不一致・head 不一致なら更新せず終了コード 2 で止まらなければならない。 | 0.5.0 | unit(gh を偽装) |
 | PR-10 | 既存 PR が `needs-human` で、ブランチが最新の base を取り込んでいない間は、再実行しても `evidence-ok` に戻してはならない。 | 0.5.0 | integration(gh を偽装) |
 | PR-11 | `--dry-run` は GitHub を一切変更せず本文とラベルを出力しなければならず、`gh` の呼び出しは origin の設定から得た `-R owner/repo` に固定しなければならない。自動マージは既定で無効、有効でも `evidence-ok` かつ base に必須ステータスチェックがあるときだけ設定しなければならない。 | 0.3.1、0.4.0、D11 | unit(gh を偽装) |
+| PR-12 | 振り分けはリネーム・非 ASCII のパス・ファイル種別の変更・`.gitattributes` による差分抑止に影響されてはならない。ツール/テスト設定ファイル(`pyproject.toml`、`.gitattributes`、入れ子の ruff/pytest/pyright 設定ほか)の変更はすべて needs-human。pytest を使う check.sh で 1 件も passed が無ければ失敗扱い。PR 本文に認証情報らしき文字列が入るなら作成を拒否しなければならない。自動マージは検証した head に固定しなければならない。 | 0.10.0 監査 H2/H5 | unit |
 
 ### 2.8 LAND(`devaccel_land.py`)
 
@@ -246,6 +252,12 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 ## 5. テストで見つかった挙動の扱い(0.9.0)
 
 - GRD-03: ヒアドキュメント本文の行頭の `git add -A` も ask になる → **意図どおり**(規則は本文も見る。パーサの読み違いを作らない、0.1.x の教訓)。
-- GRD-11: `echo "sudo"` が deny になる → **誤検知として受け入れ**(実害が小さく、引用の解釈を足すと抜け道の元になる)。
+- GRD-11: `echo "sudo"` が deny になる → **誤検知として受け入れ**(実害が小さく、引用の解釈を足すと抜け道の元になる)。0.10.0 で `git commit -m "..."` の(`$` やバッククォートを含まない)メッセージは判定から外した(「Add push docs」等の誤検知)。
 - 未テスト: SET-09/10・GATE-16 の SubagentStop 実発火(e2e-smoke)、GATE-09 の 110 秒上限(実時間が要る)、DOC-07 のブランチ保護表示(gh ログインが要る)。
 
+
+## 6. 0.10.0 の監査(公開前、独立 4 本)で受け入れたリスクの追記
+
+- 隔離した check.sh からもネットワークには出られる(依存の取得に必要)。リポジトリのコードを外に送れる残余リスク(コードは GitHub にも上がる)。
+- ツールのキャッシュ(`~/.cache/uv` 等)は書き込める(Claude Code のサンドボックスも同じ範囲を許可)。キャッシュ汚染は防がない。
+- guard の正規表現の網羅は D12 のとおり打ち止め。境界はサンドボックス + ブランチ保護。

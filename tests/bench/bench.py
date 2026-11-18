@@ -4,7 +4,7 @@ Same tasks, same model, same starting commit. Each run starts from a reset clone
 path per condition (fixed paths so workspace trust can be granted once). After the run the
 held-out tests (never visible to the agent) and the trial's own check.sh full are applied.
 
-usage: python3 tests/bench/bench.py --trial ~/programming/python/devaccel-trial \
+usage: python3 tests/bench/bench.py --trial <your small Python CLI repo> [--work <trusted dir>] \
          [--model claude-sonnet-5-5] [--reps 1] [--tasks t1_min,t2_month] [--conds vanilla,devaccel]
 Results: tests/bench/results/<date>.jsonl (+ a markdown table on stdout).
 """
@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-WORK = Path.home() / "programming" / "python" / "devaccel-bench"
+WORK = Path.home() / ".cache" / "devaccel-bench"  # override with --work (each path needs workspace trust once)
 # narrow on purpose: no interpreters/launchers (python3, cat, generic uv run). The agent runs as the user
 # (subscription auth lives in ~/.claude), so the allowlist is the boundary; devaccel runs add its sandbox.
 ALLOWED = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(uv run pytest*)", "Bash(uv run kakeibo *)",
@@ -96,6 +96,7 @@ def grade(d: Path, task: str, check_sh: str) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trial", type=Path, required=True)
+    ap.add_argument("--work", type=Path, default=WORK, help="where the per-condition clones live (trusted paths)")
     ap.add_argument("--ref", default="origin/main")
     ap.add_argument("--model", default="claude-sonnet-5-5")
     ap.add_argument("--reps", type=int, default=1)
@@ -103,6 +104,7 @@ def main() -> int:
     ap.add_argument("--conds", default=",".join(CONDS))
     ap.add_argument("--max-turns", type=int, default=60)
     a = ap.parse_args()
+    globals()["WORK"] = a.work.expanduser()
     trial = a.trial.expanduser().resolve()
     sh(["git", "fetch", "-q", "origin"], trial)
     ref = sh(["git", "rev-parse", a.ref], trial).stdout.strip()

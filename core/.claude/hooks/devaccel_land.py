@@ -138,7 +138,8 @@ def main() -> int:
                           + ", ".join(s[3:] for s in stages if s.startswith("== failed")))
                 print("\n".join("    " + ln for ln in tail.splitlines()[-10:]))
                 continue
-            print(f"#{n} ok on base + {len(passed)} earlier PR(s) ({secs}s): {p['title']}")
+            title = "".join(ch for ch in str(p["title"]) if ch.isprintable())[:120]  # no terminal escapes
+            print(f"#{n} ok on base + {len(passed)} earlier PR(s) ({secs}s): {title}")
             passed.append(n)
             if a.merge and not a.dry_run:
                 run(["git", "fetch", "-q", "origin", base], root)

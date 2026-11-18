@@ -5,7 +5,7 @@ Catches what unit tests cannot (every 0.6-0.8 regression was of this kind):
   2. A /batch-style worktree unit can edit, write notes outside .claude/, commit and build a PR body
      without any permission denial (0.6.4 / 0.6.5 / 0.7.1 / 0.7.2).
 
-usage: python3 tests/smoke/release_smoke.py [--trial ~/programming/python/devaccel-trial]
+usage: python3 tests/smoke/release_smoke.py --trial <trusted project with devaccel installed>
 Exit 0 = pass. Leaves no branches or worktrees behind.
 """
 
@@ -69,7 +69,7 @@ def denials(folder: Path) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--trial", type=Path, default=Path.home() / "programming/python/devaccel-trial")
+    ap.add_argument("--trial", type=Path, required=True, help="a trusted project with devaccel installed")
     ap.add_argument("--max-bash-median", type=float, default=2.0)  # PERF-04
     a = ap.parse_args()
     trial = a.trial.expanduser().resolve()

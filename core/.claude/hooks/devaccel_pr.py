@@ -82,7 +82,12 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
         Path(f.name).unlink(missing_ok=True)
     out = (r.stdout + r.stderr).splitlines()
     ok = r.returncode == 0
-    stages = [ln for ln in out if re.match(r"== (ok|failed|missing):", ln)]
+    stages = [ln for ln in out if re.match(r"== (ok|failed|missing): [\w-]+ \(", ln)]  # no forged free text
+    if (ok and "pytest" in base_check and "== ok: tests (" in "\n".join(out)
+            and not re.search(r"\b[1-9]\d* passed\b", "\n".join(out))):
+        # pytest reported success without a single passed test (os._exit(0) in a test, testpaths elsewhere...)
+        ok = False
+        stages.append("== failed: tests (0 passed reported)")
     return ok, stages, ("" if ok else "\n".join(out[-30:])), round(time.time() - t0, 1)
 
 
@@ -248,6 +253,9 @@ def main() -> int:
     notes = read_notes(a.verify_notes, root)
     ev = collect(root, cfg, cfg["scale"]["base_branch"], notes)
     body = render(ev, notes)
+    if SECRET.search(body):  # check output and acceptance criteria end up in the body too
+        print("PR body looks like it contains a credential (check output / notes); refused", file=sys.stderr)
+        return 2
     if a.dry_run:
         print(body)
         print(json.dumps({"label": ev["label"], "reasons": ev["reasons"]}, ensure_ascii=False))
@@ -303,7 +311,7 @@ def main() -> int:
         if prot.returncode != 0 or '"contexts":[]' in prot.stdout.replace(" ", ""):
             print("auto-merge: skipped — base branch has no required status checks (set branch protection first)")
             return 0
-        m = run(["gh", "pr", "merge", url, "-R", repo, "--auto", "--squash"], root)
+        m = run(["gh", "pr", "merge", url, "-R", repo, "--auto", "--squash", "--match-head-commit", ev["head_sha"]], root)
         print("auto-merge: " + ("enabled (merges when required checks pass)" if m.returncode == 0
                                 else "not enabled — " + (m.stderr.strip() or m.stdout.strip())[:200]))
     return 0

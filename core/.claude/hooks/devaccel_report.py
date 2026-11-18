@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import collections
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -43,9 +44,12 @@ def summarize(root: Path) -> list[str]:
         if slow:
             out.append("stage avg secs: " + ", ".join(
                 f"{k}={sum(v) / len(v):.1f}" for k, v in sorted(slow.items(), key=lambda kv: -sum(kv[1]))))
-        notes = collections.Counter(n for e in events if e.get("result") == "notice" for n in e.get("notes", []))
+        # kinds only: notices carry file names / test lines, which are agent-controlled text and this output
+        # is injected into the /devaccel-tune context
+        notes = collections.Counter(re.split(r"[::(]", str(n))[0][:30] for e in events
+                                    if e.get("result") == "notice" for n in e.get("notes", []))
         for n, c in notes.most_common(3):
-            out.append(f"notice x{c}: {n[:100]}")
+            out.append(f"notice x{c}: {n}")
     cm = root / "CLAUDE.md"
     if cm.exists():
         n = len(cm.read_text(encoding="utf-8").splitlines())

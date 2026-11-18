@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.0 (2026-11-18)
+公開前の独立監査 4 本(脆弱性・約束の検証・改善余地・初見利用者)と自動レビューの指摘を修正。テスト 85 → 112 本(すべてミューテーションで失敗を確認)。
+- **H1 検査の隔離(D16)**: ゲートと land は check.sh を bubblewrap で実行(読み取り専用、`$HOME` は許可リスト、書けるのは作業ツリーだけ、`.git` と本体の検証基盤は読み取り専用、`.env` を隠し、環境変数は最小限)。フックはサンドボックスの外で動くため、エージェントの書いたテストが利用者の全権限で動いていた。bwrap が無ければ未検査と表示。
+- **H2/H5 振り分けのすり抜け**: git はパスを引用符で囲まずリネームを対にしない。`--no-renames --text`。ツール/テスト設定ファイル(pyproject.toml、.gitattributes、入れ子の ruff/pytest/pyright 設定ほか)の変更はすべて needs-human。種類の変わったファイル、バイナリ化したテストも needs-human。pytest で passed が 1 件も無い成功は失敗扱い。
+- **H3 モジュールのすり替え**: フックは自分のディレクトリを sys.path の末尾に。guard は PR/land スクリプトの横に lock 外のファイル(`json.py`、`__pycache__`)があれば拒否。
+- **H4 単位ゲート**: 判定前後で同じ検査対象の定義を使う(コミット済みの変更でブロックが止まらなかった 0.9.0 の退行)。
+- ゲート: project.json の型違いは既定値に戻す(落ちて素通しだった)。単位はブランチ名や `.git` リンクの破壊で検査を止められない。notice/error の記録に branch・scope・mode。
+- guard: `rm -Rf /`・`${HOME}`・`~/*`、`git -c diff.external=` 等を拒否。`git commit -m "…"` の素のメッセージは判定から外す(「Add push docs」等の誤検知)。
+- PR: 自動マージは検証した head に固定(`--match-head-commit`)。本文に認証情報らしき文字列があれば作成を拒否。証拠の段の行は形式を限定。land は PR タイトルの制御文字を除く。
+- 設定: sandbox `denyWrite` で本体の `.claude/hooks`・`skills`・`state`・lock・`project.json`・`settings.json`・`scripts/check.sh` を守る。生成する CI は `permissions: contents: read`、Python 以外には汎用の workflow。
+- doctor: フック配線を構造で判定、permissions.deny と denyWrite の欠落を problem、キット側の report を `-I` で実行(プロジェクトのスクリプトを実行しない)。install: 既存 settings.json には設定一式を表示、シンボリックリンク越しに書かない、既存 check.sh の権限を変えない。report: notice は種類だけ(ファイル名をスキルの文脈に入れない)。
+- README: 看板を実測に合わせて修正(トークン削減キットではない、並列の速さ・実 PR での振り分け精度は未計測)、前提(Claude Code・gh・bubblewrap)を手順の前に、更新手順、サンドボックス設定例を最新に。bench/smoke は個人の既定パスをやめ `--trial` 必須。
+
 ## 0.9.0 (2026-11-18)
 要件とテストの見直し。
 - `docs/requirements.md`: 検証できる要件 94 件と、受け入れたリスク 16 件(テストを読まない別エージェントが文書とコードから作成)。文書とコードの食い違い 12 件を決着させた。

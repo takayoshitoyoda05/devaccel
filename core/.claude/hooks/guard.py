@@ -27,8 +27,9 @@ from devaccel_common import emit, load_config, read_stdin_json, trusted_root  # 
 
 # rm with both -r and -f aimed at a broad target (/, ~, $HOME, *, ., .., .git)
 _RM = re.compile(
-    r"\brm\s+(?=[^;&|]*(-[a-zA-Z]*r|--recursive))(?=[^;&|]*(-[a-zA-Z]*f|--force))[^;&|]*?"
-    r"(?:\s|^)(?:/|~/?|\$HOME/?|\*|\./?|\.\./?|\.git/?|/\*)(?=\s|$|;|&|\|)"
+    r"\brm\s+(?=[^;&|]*(-[a-zA-Z]*[rR]|--recursive))(?=[^;&|]*(-[a-zA-Z]*f|--force))[^;&|]*?"
+    r"(?:\s|^)(?:/|~/?|~/\*|\$HOME/?|\$\{HOME\}/?|\$HOME/\*|\$\{HOME\}/\*|\*|\./?|\.\./?|\.git/?|/\*)"
+    r"(?=\s|$|;|&|\|)"
 )
 
 DENY: list[tuple[re.Pattern, str]] = [
@@ -43,7 +44,8 @@ DENY: list[tuple[re.Pattern, str]] = [
         "ダウンロードしたスクリプトをそのまま実行しないでください。",
     ),
     (
-        re.compile(r"\bgit\b[^;&|]*-c\s*\S*(pager|editor|ssh|exec|textconv|fsmonitor|alias)\S*=", re.I),
+        re.compile(r"\bgit\b[^;&|]*-c\s*\S*(pager|editor|ssh|exec|textconv|fsmonitor|alias|external|command|"
+                   r"program|hookspath|helper|filter)\S*=", re.I),
         "git -c による外部コマンド指定は使えません。",
     ),
 ]
@@ -129,6 +131,13 @@ def _pr_script_intact(cwd: Path, project: Path) -> bool:
                   if ln and not ln.startswith(("#", "version", "ref"))}
     except (OSError, IndexError):
         return False
+    hooks = cwd / ".claude" / "hooks"
+    try:  # nothing besides the locked files may sit next to the scripts (module shadowing, stale .pyc)
+        extra = [p.name for p in hooks.iterdir() if f".claude/hooks/{p.name}" not in locked]
+    except OSError:
+        return False
+    if extra:
+        return False
     for name in PR_FILES:
         rel = f".claude/hooks/{name}"
         try:
@@ -208,7 +217,13 @@ def _compile_extra(patterns: list, label: str) -> list[tuple[re.Pattern, str]]:
     return out
 
 
+# A plain quoted commit message is data, not a command ("Add push docs" must not trip the push rule).
+# Only messages without $ or backticks are blanked: those would be expanded by the shell.
+_COMMIT_MSG = re.compile(r"""(\bgit\s+commit\b[^;&|]*?(?:-m|--message)[= ]?\s*)("[^"$`\\]*"|'[^']*')""")
+
+
 def decide(command: str, cfg: dict, cwd: Path | None = None, project: Path | None = None) -> tuple[str, str] | None:
+    command = _COMMIT_MSG.sub(lambda m: m.group(1) + '"msg"', command)
     flat = command.replace('"', "").replace("'", "").replace("\\", "")  # rm -rf "/" -> rm -rf /
     extra = cfg.get("guard", {})
     for rx, why in DENY + _compile_extra(extra.get("deny_regex", []), "guard.deny_regex"):

@@ -113,7 +113,31 @@ def load_config(root: Path) -> dict:
     override = os.environ.get("DEVACCEL_GATE_MODE")
     if override in MODES:
         cfg = _merge(cfg, {"gate": {"mode": override}})  # personal: sessions only, never the unit gate
-    return cfg
+    return _sanitize(cfg)
+
+
+def _sanitize(cfg: dict) -> dict:
+    """Wrong types in project.json fall back to the defaults (a crashing gate would fail open)."""
+    out: dict = {}
+    for key, default in DEFAULTS.items():
+        val = cfg.get(key, default)
+        if isinstance(default, dict):
+            val = val if isinstance(val, dict) else {}
+            merged = {}
+            for k, d in default.items():
+                v = val.get(k, d)
+                ok = (isinstance(v, bool) == isinstance(d, bool)) and isinstance(v, type(d)) if d is not None else True
+                if isinstance(d, list):
+                    ok = isinstance(v, list) and all(isinstance(x, str) for x in v)
+                if isinstance(d, str) and k in ("mode", "unit_mode"):
+                    ok = v in MODES
+                merged[k] = v if ok else d
+            merged.update({k: v for k, v in val.items() if k not in default})
+            out[key] = merged
+        else:
+            out[key] = val if isinstance(val, type(default)) else default
+    out.update({k: v for k, v in cfg.items() if k not in DEFAULTS})
+    return out
 
 
 def git(root: Path, *args: str, check: bool = False) -> str:
@@ -161,36 +185,37 @@ def check_script_for(text: str) -> str | None:
 
 # ---------- confinement for code we did not write (tests in a unit's tree, PR code in land) ----------
 HOME = Path.home()
-SECRET_PATHS = [".ssh", ".aws", ".gnupg", ".config/gh", ".git-credentials", ".netrc", ".claude", ".claude.json",
-                ".docker", ".kube", ".npmrc", ".pypirc", ".config/gcloud", ".azure"]
-CACHE_PATHS = [".cache/uv", ".cache/pip", ".cache/pyright-python", ".cache/ruff", ".local/share/uv"]
+# $HOME is replaced by an empty tmpfs; only these come back. Toolchains read-only, tool caches writable
+# (the same caches Claude Code's sandbox lets the agent write), the tree writable except its .git.
+HOME_RO = [".local", ".cargo", ".rustup", ".pyenv", ".nvm", ".volta", ".bun", ".deno", ".sdkman", "go", ".gitconfig"]
+CACHE_RW = [".cache/uv", ".cache/pip", ".cache/pyright-python", ".cache/ruff"]
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TZ", "UV_CACHE_DIR", "UV_PYTHON", "XDG_CACHE_HOME")
 
 
 def confined(cmd: list[str], tree: Path, protect: list[Path] | None = None) -> tuple[list[str], dict] | None:
-    """Wrap cmd in bubblewrap: whole filesystem read-only, only `tree` (minus `protect`) and tool caches
-    writable, secrets hidden, minimal environment. Hooks run outside Claude Code's sandbox, so check.sh
-    (which runs tests the agent wrote) must not run with the user's full rights. None = bwrap unavailable."""
+    """Wrap cmd in bubblewrap. Hooks run outside Claude Code's sandbox, and check.sh runs tests the agent
+    wrote, so it must not get the user's full rights: read-only filesystem, empty $HOME (allowlist above),
+    only `tree` writable, its .git and `protect` read-only (a writable .git = git config/hooks executed by
+    the next unsandboxed git call), .env files masked, minimal environment. None = bwrap unavailable."""
     import shutil
     bw = shutil.which("bwrap")
     if not bw:
         return None
     tree = tree.resolve()
-    args = [bw, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--die-with-parent"]
-    for rel in CACHE_PATHS:
+    args = [bw, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+            "--tmpfs", str(HOME), "--die-with-parent"]
+    for rel in HOME_RO:
+        p = HOME / rel
+        if p.exists():
+            args += ["--ro-bind", str(p), str(p)]
+    for rel in CACHE_RW:
         p = HOME / rel
         p.mkdir(parents=True, exist_ok=True)
         args += ["--bind", str(p), str(p)]
-    args += ["--bind", str(tree), str(tree)]  # after --tmpfs /tmp: trees under /tmp stay visible
-    for p in protect or []:
+    args += ["--bind", str(tree), str(tree)]  # after the tmpfs mounts: trees under /tmp or $HOME stay visible
+    for p in [tree / ".git", *(protect or [])]:
         if p.exists():
             args += ["--ro-bind", str(p), str(p)]
-    for rel in SECRET_PATHS:
-        p = HOME / rel
-        if p.is_dir():
-            args += ["--tmpfs", str(p)]
-        elif p.exists():
-            args += ["--ro-bind", "/dev/null", str(p)]
     for p in list(tree.glob(".env")) + list(tree.glob(".env.*")):
         args += ["--ro-bind", "/dev/null", str(p)]
     env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
