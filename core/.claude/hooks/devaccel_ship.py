@@ -5,7 +5,8 @@ Replaces the 5-6 tool-turn devaccel-pr flow (write notes, add, write message, co
 guarded call. The evidence is still computed by devaccel_pr (base branch's check.sh on a HEAD snapshot,
 triage); nothing here is self-reported.
 
-usage: python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md [--paths P ...] [--units B ...] [--dry-run]
+usage: python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md [--branch NAME] [--paths P ...]
+                                              [--units B ...] [--dry-run]
   ship.md: line 1 = PR title / commit subject; the rest = what was run and observed (verify notes).
   --paths: new (untracked) files to add; tracked changes are always added (never `git add -A`).
   --units: local branches of parallel units to merge (--no-ff) onto the current work branch first;
@@ -17,6 +18,7 @@ work branch only (never main/master/base/origin HEAD), remote origin only, no fo
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -67,12 +69,25 @@ def main() -> int:
     ap.add_argument("--file", required=True, help="line 1: title; rest: verify notes")
     ap.add_argument("--paths", nargs="*", default=[])
     ap.add_argument("--units", nargs="*", default=[])
+    ap.add_argument("--branch", default="", help="create this work branch from origin/<base> if on a protected branch")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     cfg = load_config(trusted_root({"cwd": str(root)}))
     head = git(root, "symbolic-ref", "--short", "-q", "HEAD").strip()
+    if a.branch and (not head or head in protected(root, cfg)):  # saves the parent its own git turns
+        if a.branch in protected(root, cfg) or not re.fullmatch(r"[\w./-]+", a.branch) or ".." in a.branch:
+            print(f"--branch {a.branch!r} is not a valid work branch name", file=sys.stderr)
+            return 2
+        base = cfg["scale"]["base_branch"]
+        sh(root, "fetch", "-q", "origin", base)
+        start = f"origin/{base}" if git(root, "rev-parse", "-q", "--verify", f"origin/{base}").strip() else base
+        sw = sh(root, "switch", "-c", a.branch, start)
+        if sw.returncode != 0:
+            print("could not create the work branch: " + (sw.stderr.strip() or sw.stdout.strip())[:200], file=sys.stderr)
+            return 2
+        head = a.branch
     if not head or head in protected(root, cfg):
         print(f"refusing to ship from {head or 'detached HEAD'}: create a work branch first", file=sys.stderr)
         return 2

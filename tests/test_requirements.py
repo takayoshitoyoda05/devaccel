@@ -1538,3 +1538,25 @@ class R6ShipTest(ReqKit):
         p = self.root / ".claude/hooks/devaccel_ship.py"
         p.write_text(p.read_text() + "\n# hack\n")
         self.assertEqual(self.gv("python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md"), "deny")
+
+
+class R7ShipBranchTest(ReqKit):
+    land = td.KitTest.land
+
+    def test_SHIP06_branch_created_from_base_when_on_main(self):
+        """SHIP-06: on main, --branch creates the work branch (from origin/<base>) and ships from it; main is untouched;
+        protected or malformed names are refused."""
+        self.with_origin()
+        (self.root / ".devaccel").mkdir(exist_ok=True)
+        (self.root / ".devaccel/ship.md").write_text("T\nran\n")
+        before = sh(self.root, "git", "rev-parse", "main").stdout.strip()
+        (self.root / "app.py").write_text("X = 4\n")
+        for bad in ("master", "main", "a..b", "x;rm"):
+            r, _ = self.land("--file", ".devaccel/ship.md", "--branch", bad, "--dry-run", script="devaccel_ship.py")
+            self.assertEqual(r.returncode, 2, bad)
+        self.assertEqual(sh(self.root, "git", "branch", "--list", "master").stdout.strip(), "")  # never created
+        r, _ = self.land("--file", ".devaccel/ship.md", "--branch", "feat/b", "--dry-run", script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sh(self.root, "git", "branch", "--show-current").stdout.strip(), "feat/b")
+        self.assertEqual(sh(self.root, "git", "rev-parse", "main").stdout.strip(), before)
+        self.assertIn("app.py", sh(self.root, "git", "show", "--name-only", "HEAD").stdout)
