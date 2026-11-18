@@ -165,7 +165,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | SHIP-01 | `devaccel_ship.py` は 1 回の実行で、追跡済みの変更と `--paths` の新規ファイル(`-A` はしない)をコミットし、作業ブランチを origin へ push し、`devaccel_pr` と同じ証拠・振り分けで PR を作成/更新しなければならない。題名は `ship.md` の 1 行目、確認メモは 2 行目以降(`--verify-notes` と同じ制限)。 | 0.11.0 | unit |
 | SHIP-02 | ship は main/master/base/origin HEAD/detached では何もコミット・push してはならない。push 先は origin の同名ブランチだけで、force してはならない。`--paths` はリポジトリ内の相対パスに限る。 | 0.11.0 | unit |
 | SHIP-03 | `--units` は各単位のローカルブランチを `--no-ff` で統合し、衝突した単位は外して PR 本文に明記し、統合後の木に対して base の check.sh を 1 回だけ実行しなければならない。 | 0.11.0 | unit |
-| SHIP-04 | 統合した PR の L 規模判定は `large_if_files_over × 統合した単位数`(上限 15)でなければならない。他の振り分け規則は全差分のまま。 | 0.11.0 | unit |
+| SHIP-04 | 統合した PR の振り分けは単独の PR と同じ規則でなければならない(単位数で L 規模の基準を緩めない。ユーザー方針「検査の線は緩めない」、0.11.0 の緩和は撤回)。 | 0.11.0 | unit |
 | SHIP-05 | guard は ship を `python3 .claude/hooks/devaccel_ship.py …` の単独実行・展開なし・lock 一致の場合だけ許可しなければならない(PR スクリプトと同じ扱い)。 | 0.11.0 | unit |
 
 ### 2.8 LAND(`devaccel_land.py`)

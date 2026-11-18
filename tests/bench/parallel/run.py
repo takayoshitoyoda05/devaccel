@@ -35,10 +35,14 @@ def sh(cmd: list[str], cwd: Path, timeout: int = 3600) -> subprocess.CompletedPr
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
 
 
+CAP: int | None = None  # --cap: CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS for this run (command-line settings win)
+
+
 def claude(prompt: str, cwd: Path, model: str) -> tuple[dict, float]:
     t0 = time.time()
-    r = sh(["claude", "-p", prompt, "--output-format", "json", "--model", model, "--permission-mode", "acceptEdits"],
-           cwd)
+    extra = ["--settings", json.dumps({"env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": str(CAP)}})] if CAP else []
+    r = sh(["claude", "-p", prompt, "--output-format", "json", "--model", model, "--permission-mode", "acceptEdits",
+            *extra], cwd)
     wall = time.time() - t0
     try:
         return json.loads(r.stdout), wall
@@ -134,14 +138,18 @@ def main() -> int:
     ap.add_argument("--arms", default="seq_old,seq_ship,par")
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--model", default="claude-sonnet-5-5")
+    ap.add_argument("--cap", type=int, default=None, help="max concurrent subagents for this run")
     a = ap.parse_args()
+    global CAP
+    CAP = a.cap
     trial = a.trial.expanduser().resolve()
     tasks = a.tasks.read_text(encoding="utf-8")
     out = HERE / "results.jsonl"
     for rep in range(a.reps):
         for arm in a.arms.split(","):
             rec = run_arm(arm, trial, tasks, a.heldout.resolve(), a.model)
-            rec.update({"rep": rep, "tasks": a.tasks.name, "ts": dt.datetime.now().isoformat(timespec="seconds")})
+            rec.update({"rep": rep, "tasks": a.tasks.name, "cap": a.cap,
+                        "ts": dt.datetime.now().isoformat(timespec="seconds")})
             with out.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             print(json.dumps(rec, ensure_ascii=False), flush=True)

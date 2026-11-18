@@ -1515,8 +1515,8 @@ class R6ShipTest(ReqKit):
         self.assertIn("統合した単位: u2 /", r.stdout)  # counted once; no-op and current branch excluded
         self.assertIn("noop (no changes)", r.stdout)
 
-    def test_SHIP04_large_threshold_scales_with_units(self):
-        """Integrating 3 units of 2 files each (6 files) is not 'L' when 3 units were merged; it is for 1 unit."""
+    def test_SHIP04_large_threshold_not_relaxed_for_units(self):
+        """An integrated batch is judged like any PR: 6 files is 'L' (needs a human) whatever the unit count."""
         sys.path.insert(0, str(KIT / "core/.claude/hooks"))
         import devaccel_pr
         cfg = json.loads(json.dumps(DEFAULTS))
@@ -1525,10 +1525,9 @@ class R6ShipTest(ReqKit):
             (self.root / f"m{i}.py").write_text("Z = 1\n")
         self.commit("six")
         base = sh(self.root, "git", "rev-parse", "main").stdout.strip()
-        one = devaccel_pr.static_triage(self.root, cfg, base, "HEAD", 1)[1]
-        three = devaccel_pr.static_triage(self.root, cfg, base, "HEAD", 3)[1]
-        self.assertTrue(any("L 規模" in x for x in one))
-        self.assertFalse(any("L 規模" in x for x in three))
+        for units in (1, 3):
+            reasons = devaccel_pr.static_triage(self.root, cfg, base, "HEAD", units)[1]
+            self.assertTrue(any("L 規模" in x for x in reasons), units)
 
     def test_SHIP05_guard_forms(self):
         sh(self.root, "git", "checkout", "-qb", "feat")

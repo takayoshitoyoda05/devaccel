@@ -182,8 +182,8 @@ def static_triage(root: Path, cfg: dict, base: str, ref: str,
             if not d or not d[1].isdigit() or int(d[1]) > 0:  # "-" (binary) counts as shrunk
                 tests_shrunk.append(path)
     reasons = []
-    # a PR integrating N parallel units may touch N small units' worth of files (capped at 15)
-    if len(files) > min(int(scale["large_if_files_over"]) * max(1, units), 15):
+    # same threshold for integrated batches: more files = a human reads it (no relaxation per unit)
+    if len(files) > int(scale["large_if_files_over"]):
         reasons.append(f"L 規模({len(files)} ファイル)")
     if risky:
         reasons.append("リスクのあるパス: " + ", ".join(risky[:5]))
