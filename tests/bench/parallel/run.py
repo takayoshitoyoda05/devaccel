@@ -125,8 +125,9 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
     sh(["git", "checkout", "-q", "main"], trial)
     sh(["git", "pull", "-q"], trial)
     before = {p["number"] for p in open_prs(trial)}
-    if arm in ("fanout", "fanout_hedge"):
-        j, wall = run_fanout(trial, ["--hedge", "2"] if arm == "fanout_hedge" else None)
+    if arm.startswith("fanout"):
+        extra = {"fanout_hedge": ["--hedge", "2"], "fanout_sonnet": ["--model", "sonnet"]}.get(arm)
+        j, wall = run_fanout(trial, extra)
         new = [p for p in open_prs(trial) if p["number"] not in before]
         rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "turns": 0, "models": {},
                "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new], "result_tail": j["result"]}
