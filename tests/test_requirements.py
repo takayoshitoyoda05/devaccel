@@ -1560,3 +1560,28 @@ class R7ShipBranchTest(ReqKit):
         self.assertEqual(sh(self.root, "git", "branch", "--show-current").stdout.strip(), "feat/b")
         self.assertEqual(sh(self.root, "git", "rev-parse", "main").stdout.strip(), before)
         self.assertIn("app.py", sh(self.root, "git", "show", "--name-only", "HEAD").stdout)
+
+
+class R8TrustAnchorTest(ReqKit):
+    def anchor(self, project: Path, extra: dict | None = None) -> str:
+        code = ("import sys; sys.path.insert(0, %r); import devaccel_common as c; print(c.trusted_root(None))"
+                % str(self.root / ".claude/hooks"))
+        env = {"CLAUDE_PROJECT_DIR": str(project), **(extra or {})}
+        return run(project, sys.executable, "-c", code, env=env).stdout.strip()
+
+    def test_GATE_trust_anchor_not_redirectable_from_a_worktree(self):
+        """A fan-out unit's project dir is its worktree: the anchor is the main checkout; a forged .git file
+        pointing at an attacker-made git dir does not move it; DEVACCEL_TRUSTED_ROOT wins."""
+        wt = self.root / ".claude" / "worktrees" / "u1"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "u1", str(wt))
+        self.assertEqual(self.anchor(wt), str(self.root))
+        evil = self.tmp / "evil"
+        sh(self.tmp, "git", "init", "-q", str(evil))
+        fake = evil / ".git" / "worktrees" / "x"
+        fake.mkdir(parents=True)
+        (fake / "commondir").write_text("../..\n")
+        (fake / "HEAD").write_text("ref: refs/heads/main\n")
+        (fake / "gitdir").write_text(str(wt / ".git") + "\n")
+        (wt / ".git").write_text(f"gitdir: {fake}\n")
+        self.assertNotEqual(self.anchor(wt), str(evil))
+        self.assertEqual(self.anchor(wt, {"DEVACCEL_TRUSTED_ROOT": str(self.root)}), str(self.root))

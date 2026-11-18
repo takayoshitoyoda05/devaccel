@@ -117,8 +117,10 @@ def main() -> int:
         while pending and len(running) < limit:
             u = pending.pop(0)
             u["t"] = time.time()
+            env = {**os.environ, "DEVACCEL_TRUSTED_ROOT": str(root)}  # gate's trust anchor = this checkout
+            env.pop("CLAUDECODE", None)
             u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      stdin=subprocess.DEVNULL, text=True)
+                                      stdin=subprocess.DEVNULL, text=True, env=env)
             running.append(u)
         time.sleep(0.5)
         for u in list(running):

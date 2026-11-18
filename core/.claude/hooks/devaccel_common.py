@@ -60,14 +60,22 @@ def _git_out(cwd: Path, *args: str) -> str:
 def trusted_root(data: dict | None = None) -> Path:
     """The main checkout: the trust anchor for the lock, project.json and check.sh. A worktree
     (a /batch unit) can edit its own copies of those, so they are never read from there."""
+    pinned = os.environ.get("DEVACCEL_TRUSTED_ROOT")  # set by devaccel_batch.py for its `claude -p` units
+    if pinned:  # (a unit's Bash cannot change the environment its hooks run with)
+        return Path(pinned)
     env = os.environ.get("CLAUDE_PROJECT_DIR")
     if env:
-        # a session started inside a linked worktree (devaccel_batch fan-out: `claude -p` per unit) has its
-        # project dir = the worktree; the trust anchor is still the main checkout behind the common .git
+        # a session started inside a devaccel worktree (<main>/.claude/worktrees/<x>) has project dir = the
+        # worktree; the anchor is <main>, taken from the path itself (the worktree's .git file is
+        # agent-writable, so git metadata could point anywhere)
+        if "/.claude/worktrees/" in str(Path(env).resolve()) + "/":
+            return Path(str(Path(env).resolve()).split("/.claude/worktrees/")[0])
         git_dir = _git_out(Path(env), "rev-parse", "--path-format=absolute", "--git-dir")
         common = _git_out(Path(env), "rev-parse", "--path-format=absolute", "--git-common-dir")
-        if git_dir and common and git_dir != common and common.endswith("/.git"):
-            return Path(common).parent
+        if git_dir and common and git_dir != common:
+            gd, cd, ev = Path(git_dir).resolve(), Path(common).resolve(), Path(env).resolve()
+            if cd.name == ".git" and gd.parent == cd / "worktrees" and ev not in cd.parents and cd not in ev.parents:
+                return cd.parent
         return Path(env)
     cwd = Path(data["cwd"]) if data and data.get("cwd") else Path.cwd()
     common = _git_out(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
