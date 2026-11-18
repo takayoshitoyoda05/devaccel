@@ -127,9 +127,13 @@ def main() -> int:
                 ev = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(ev, dict):
+                continue
             if ev.get("type") == "result":
                 j = ev
-            for blk in (ev.get("message") or {}).get("content") or []:
+            msg = ev.get("message") if isinstance(ev, dict) else None
+            content = msg.get("content") if isinstance(msg, dict) else None
+            for blk in content if isinstance(content, list) else []:
                 if isinstance(blk, dict) and blk.get("type") == "tool_use":
                     key = blk["name"] + (f":{blk['input'].get('skill') or blk['input'].get('command', '')}"
                                          if blk["name"] == "Skill" else "")
