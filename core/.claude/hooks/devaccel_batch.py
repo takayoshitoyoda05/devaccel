@@ -94,6 +94,7 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=0,
                     help="max concurrent units (0 = project.json parallel.max_jobs, else decided from this machine)")
     ap.add_argument("--model", default="", help="unit model (default: the devaccel-unit agent's model)")
+    ap.add_argument("--effort", default="", help="unit effort (default: the devaccel-unit agent's)")
     ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
     ap.add_argument("--dry-run", action="store_true", help="split and show the units only")
@@ -116,7 +117,7 @@ def main() -> int:
     agent = (root / ".claude" / "agents" / "devaccel-unit.md").read_text(encoding="utf-8")
     front, _, rules = agent.partition("\n---\n")
     model = a.model or (re.search(r"^model:\s*(\S+)", front, re.M) or [None, "haiku"])[1]
-    effort = (re.search(r"^effort:\s*(\S+)", front, re.M) or [None, "low"])[1]
+    effort = a.effort or (re.search(r"^effort:\s*(\S+)", front, re.M) or [None, "low"])[1]
     if a.dry_run:
         for i, it in enumerate(items, 1):
             print(f"--- unit {i}\n{it[:200]}")
