@@ -1,0 +1,1418 @@
+diff --git a/src/kakeibo/bankimport.py b/src/kakeibo/bankimport.py
+new file mode 100644
+index 0000000..f207918
+--- /dev/null
++++ b/src/kakeibo/bankimport.py
+@@ -0,0 +1,110 @@
++"""Import bank-statement CSV text into Expense records."""
++
++from __future__ import annotations
++
++import csv
++import io
++import re
++from datetime import date
++
++from kakeibo.core import Expense
++
++DEFAULT_MAPPING: dict[str, str] = {
++    "date": "利用日",
++    "category": "分類",
++    "amount": "利用金額",
++    "memo": "利用店名",
++}
++
++# 任意の "-"、任意の ¥ / ￥、ASCII 数字で始まる数字とカンマ列、任意の "円"
++_AMOUNT_RE = re.compile(r"(-?)[¥￥]?([0-9][0-9,]*)円?")
++# YYYY/M/D または YYYY-M-D。区切りは両方で同じものに揃える
++_DATE_RE = re.compile(r"([0-9]{4})([/-])([0-9]{1,2})\2([0-9]{1,2})")
++
++
++def parse_amount(s: str) -> int:
++    """Parse a bank amount such as "￥1,234" or "-300円" into yen."""
++    m = _AMOUNT_RE.fullmatch(s.strip())
++    if m is None:
++        raise ValueError(f"金額の形式が不正です: {s!r}")
++    value = int(m.group(2).replace(",", ""))
++    return -value if m.group(1) else value
++
++
++def parse_date(s: str) -> date:
++    """Parse "YYYY/M/D" or "YYYY-M-D" into a date."""
++    m = _DATE_RE.fullmatch(s.strip())
++    if m is None:
++        raise ValueError(f"日付の形式が不正です: {s!r}")
++    # date() は存在しない日付に ValueError を出す
++    return date(int(m.group(1)), int(m.group(3)), int(m.group(4)))
++
++
++def _cell(row: list[str], index: dict[str, int], field: str) -> str:
++    """Value of ``field`` in ``row``; "" when the row is short."""
++    i = index[field]
++    return row[i] if i < len(row) else ""
++
++
++def import_rows(
++    text: str,
++    mapping: dict[str, str] | None = None,
++    category_map: dict[str, str] | None = None,
++) -> tuple[list[Expense], list[tuple[int, str]]]:
++    """Read CSV text (header on line 1) into expenses.
++
++    Returns (valid expenses in input order, errors as (line_number, field)).
++    Line numbers are physical lines in ``text`` with the header as line 1.
++    A row with any error is excluded from the expenses.
++    """
++    cols = DEFAULT_MAPPING if mapping is None else mapping
++    for key in ("date", "category", "amount"):
++        if key not in cols:
++            raise ValueError(f"mapping に {key} がありません")
++
++    reader = csv.reader(io.StringIO(text, newline=""))
++    try:
++        header = next(reader)
++    except StopIteration:
++        raise ValueError("ヘッダー行がありません") from None
++
++    index: dict[str, int] = {}
++    for field, col in cols.items():
++        if col not in header:
++            raise ValueError(f"列 {col!r} がヘッダーにありません")
++        index[field] = header.index(col)
++
++    expenses: list[Expense] = []
++    errors: list[tuple[int, str]] = []
++    prev_line = reader.line_num
++    for row in reader:
++        lineno = prev_line + 1  # 複数行にまたがるレコードは開始行
++        prev_line = reader.line_num
++        if not row:
++            continue
++
++        row_errors: list[tuple[int, str]] = []
++        day: date | None = None
++        amount: int | None = None
++        try:
++            day = parse_date(_cell(row, index, "date"))
++        except ValueError:
++            row_errors.append((lineno, "date"))
++        try:
++            amount = parse_amount(_cell(row, index, "amount"))
++        except ValueError:
++            row_errors.append((lineno, "amount"))
++        category = _cell(row, index, "category").strip()
++        if not category:
++            row_errors.append((lineno, "category"))
++
++        if day is None or amount is None or not category:
++            errors.extend(row_errors)
++            continue
++
++        if category_map is not None:
++            category = category_map.get(category, category)
++        memo = _cell(row, index, "memo").strip() if "memo" in index else ""
++        expenses.append(Expense(day=day, category=category, amount=amount, memo=memo))
++
++    return expenses, errors
+diff --git a/src/kakeibo/monthdiff.py b/src/kakeibo/monthdiff.py
+new file mode 100644
+index 0000000..70a53d0
+--- /dev/null
++++ b/src/kakeibo/monthdiff.py
+@@ -0,0 +1,89 @@
++"""Month-over-month comparison of expenses by category."""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++from kakeibo.core import Expense
++
++_MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
++
++
++@dataclass(frozen=True)
++class DiffRow:
++    category: str
++    prev: int
++    curr: int
++    delta: int
++    pct: float | None
++    status: str
++
++
++def _month_of(e: Expense) -> str:
++    return f"{e.day.year:04d}-{e.day.month:02d}"
++
++
++def _check_month(month: str) -> None:
++    if not _MONTH_RE.fullmatch(month):
++        raise ValueError(f"月の形式が不正です(YYYY-MM): {month!r}")
++
++
++def month_diff(rows: list[Expense], prev_month: str, curr_month: str) -> list[DiffRow]:
++    _check_month(prev_month)
++    _check_month(curr_month)
++
++    prev_totals: dict[str, int] = {}
++    curr_totals: dict[str, int] = {}
++    for e in rows:
++        m = _month_of(e)
++        if m == prev_month:
++            prev_totals[e.category] = prev_totals.get(e.category, 0) + e.amount
++        elif m == curr_month:
++            curr_totals[e.category] = curr_totals.get(e.category, 0) + e.amount
++
++    out: list[DiffRow] = []
++    for cat in set(prev_totals) | set(curr_totals):
++        prev = prev_totals.get(cat, 0)
++        curr = curr_totals.get(cat, 0)
++        delta = curr - prev
++        pct = None if prev == 0 else round(delta / prev * 100, 1) + 0.0
++        if cat not in prev_totals:
++            status = "new"
++        elif cat not in curr_totals:
++            status = "gone"
++        elif delta > 0:
++            status = "up"
++        elif delta < 0:
++            status = "down"
++        else:
++            status = "same"
++        out.append(DiffRow(cat, prev, curr, delta, pct, status))
++
++    out.sort(key=lambda d: (-abs(d.delta), d.category))
++    return out
++
++
++def top_movers(diffs: list[DiffRow], n: int = 3) -> list[DiffRow]:
++    if n < 0:
++        raise ValueError(f"n は 0 以上である必要があります: {n}")
++    return [d for d in diffs if d.status != "same"][:n]
++
++
++def render_diff(diffs: list[DiffRow]) -> str:
++    lines = ["category\tprev\tcurr\tdelta\tpct"]
++    for d in diffs:
++        pct = "-" if d.pct is None else f"{d.pct + 0.0:+.1f}%"
++        lines.append(f"{d.category}\t{d.prev}\t{d.curr}\t{d.delta:+d}\t{pct}")
++    return "\n".join(lines)
++
++
++def available_months(rows: list[Expense]) -> list[str]:
++    return sorted({_month_of(e) for e in rows})
++
++
++def latest_diff(rows: list[Expense]) -> list[DiffRow]:
++    months = available_months(rows)
++    if len(months) < 2:
++        raise ValueError("前月比には少なくとも 2 か月分の明細が必要です")
++    return month_diff(rows, months[-2], months[-1])
+diff --git a/src/kakeibo/query.py b/src/kakeibo/query.py
+new file mode 100644
+index 0000000..ecf9aad
+--- /dev/null
++++ b/src/kakeibo/query.py
+@@ -0,0 +1,170 @@
++"""Search query language for filtering Expense rows.
++
++Grammar (lowest precedence first):
++    or_expr  := and_expr ("OR" and_expr)*
++    and_expr := not_expr (["AND"] not_expr)*
++    not_expr := "NOT" not_expr | primary
++    primary  := TERM | CAT | "(" or_expr ")"
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++
++from kakeibo.core import Expense
++
++
++class QueryError(ValueError):
++    """Raised when a search query cannot be tokenized or parsed."""
++
++
++Token = tuple[str, str]
++Predicate = Callable[[Expense], bool]
++
++
++def tokenize(q: str) -> list[tuple[str, str]]:
++    tokens: list[Token] = []
++    i = 0
++    n = len(q)
++    while i < n:
++        ch = q[i]
++        if ch.isspace():
++            i += 1
++        elif ch == "(":
++            tokens.append(("LPAREN", "("))
++            i += 1
++        elif ch == ")":
++            tokens.append(("RPAREN", ")"))
++            i += 1
++        elif ch == '"':
++            end = q.find('"', i + 1)
++            if end == -1:
++                raise QueryError("閉じていない引用符があります")
++            body = q[i + 1 : end]
++            if body == "":
++                raise QueryError("空の引用符は使えません")
++            tokens.append(("TERM", body))
++            i = end + 1
++        else:
++            j = i
++            while j < n and not (q[j].isspace() or q[j] in '()"'):
++                j += 1
++            word = q[i:j]
++            i = j
++            if word in ("AND", "OR", "NOT"):
++                tokens.append((word, word))
++            elif word.startswith("cat:"):
++                value = word[len("cat:") :]
++                if value == "":
++                    raise QueryError("cat: の後ろに値がありません")
++                tokens.append(("CAT", value))
++            else:
++                tokens.append(("TERM", word))
++    return tokens
++
++
++class _Parser:
++    """Recursive-descent parser that builds a predicate directly."""
++
++    def __init__(self, tokens: list[Token]) -> None:
++        self.tokens = tokens
++        self.pos = 0
++
++    def _peek(self) -> str | None:
++        if self.pos < len(self.tokens):
++            return self.tokens[self.pos][0]
++        return None
++
++    def _take(self) -> Token:
++        tok = self.tokens[self.pos]
++        self.pos += 1
++        return tok
++
++    def parse(self) -> Predicate:
++        if not self.tokens:
++            raise QueryError("クエリが空です")
++        pred = self._or()
++        if self.pos != len(self.tokens):
++            raise QueryError(f"余分なトークンがあります: {self.tokens[self.pos][1]!r}")
++        return pred
++
++    def _or(self) -> Predicate:
++        left = self._and()
++        while self._peek() == "OR":
++            self._take()
++            left = _either(left, self._and())
++        return left
++
++    def _and(self) -> Predicate:
++        left = self._not()
++        while self._peek() in ("AND", "NOT", "TERM", "CAT", "LPAREN"):
++            if self._peek() == "AND":
++                self._take()
++            left = _both(left, self._not())
++        return left
++
++    def _not(self) -> Predicate:
++        if self._peek() == "NOT":
++            self._take()
++            return _negate(self._not())
++        return self._primary()
++
++    def _primary(self) -> Predicate:
++        kind = self._peek()
++        if kind == "TERM":
++            return _term(self._take()[1])
++        if kind == "CAT":
++            return _cat(self._take()[1])
++        if kind == "LPAREN":
++            self._take()
++            pred = self._or()
++            if self._peek() != "RPAREN":
++                raise QueryError("閉じ括弧がありません")
++            self._take()
++            return pred
++        if kind is None:
++            raise QueryError("演算子の後ろに項がありません")
++        raise QueryError(f"項が必要な位置に {self.tokens[self.pos][1]!r} があります")
++
++
++def _either(a: Predicate, b: Predicate) -> Predicate:
++    return lambda e: a(e) or b(e)
++
++
++def _both(a: Predicate, b: Predicate) -> Predicate:
++    return lambda e: a(e) and b(e)
++
++
++def _negate(a: Predicate) -> Predicate:
++    return lambda e: not a(e)
++
++
++def _term(value: str) -> Predicate:
++    needle = value.casefold()
++
++    def pred(e: Expense) -> bool:
++        return needle in e.memo.casefold() or needle in e.category.casefold()
++
++    return pred
++
++
++def _cat(value: str) -> Predicate:
++    wanted = value.casefold()
++
++    def pred(e: Expense) -> bool:
++        return e.category.casefold() == wanted
++
++    return pred
++
++
++def _compile(q: str) -> Predicate:
++    return _Parser(tokenize(q)).parse()
++
++
++def matches(q: str, e: Expense) -> bool:
++    return _compile(q)(e)
++
++
++def filter_rows(q: str, rows: list[Expense]) -> list[Expense]:
++    pred = _compile(q)
++    return [r for r in rows if pred(r)]
+diff --git a/src/kakeibo/recurring.py b/src/kakeibo/recurring.py
+new file mode 100644
+index 0000000..f3c1fa0
+--- /dev/null
++++ b/src/kakeibo/recurring.py
+@@ -0,0 +1,70 @@
++"""Detect recurring expenses (same category and amount, roughly monthly)."""
++
++from __future__ import annotations
++
++import calendar
++from dataclasses import dataclass
++from datetime import date
++from itertools import pairwise
++
++from kakeibo.core import Expense
++
++
++def add_month(d: date) -> date:
++    """Return the same day in the next month, clamped to that month's last day."""
++    year, month = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
++    last = calendar.monthrange(year, month)[1]
++    return date(year, month, min(d.day, last))
++
++
++@dataclass(frozen=True)
++class Recurring:
++    category: str
++    amount: int
++    days: tuple[date, ...]
++    next_expected: date
++
++
++def find_recurring(
++    rows: list[Expense], min_count: int = 3, tolerance: int = 3
++) -> list[Recurring]:
++    """Find (category, amount) series that recur about monthly.
++
++    Dates within a group are de-duplicated and sorted. Adjacent dates d_i, d_{i+1}
++    are linked when |d_{i+1} - add_month(d_i)| <= tolerance days. Each maximal
++    linked run with at least ``min_count`` dates yields one Recurring.
++    """
++    if min_count < 2:
++        raise ValueError("min_count は 2 以上である必要があります")
++    if tolerance < 0:
++        raise ValueError("tolerance は 0 以上である必要があります")
++
++    groups: dict[tuple[str, int], set[date]] = {}
++    for e in rows:
++        groups.setdefault((e.category, e.amount), set()).add(e.day)
++
++    found: list[Recurring] = []
++    for (category, amount), day_set in groups.items():
++        days = sorted(day_set)
++        run: list[date] = [days[0]] if days else []
++        for prev, cur in pairwise(days):
++            if abs((cur - add_month(prev)).days) <= tolerance:
++                run.append(cur)
++            else:
++                if len(run) >= min_count:
++                    found.append(_make(category, amount, run))
++                run = [cur]
++        if len(run) >= min_count:
++            found.append(_make(category, amount, run))
++
++    found.sort(key=lambda r: (r.category, r.amount, r.days[0]))
++    return found
++
++
++def _make(category: str, amount: int, run: list[date]) -> Recurring:
++    return Recurring(
++        category=category,
++        amount=amount,
++        days=tuple(run),
++        next_expected=add_month(run[-1]),
++    )
+diff --git a/tests/test_bankimport.py b/tests/test_bankimport.py
+new file mode 100644
+index 0000000..33009f3
+--- /dev/null
++++ b/tests/test_bankimport.py
+@@ -0,0 +1,235 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.bankimport import (
++    DEFAULT_MAPPING,
++    import_rows,
++    parse_amount,
++    parse_date,
++)
++from kakeibo.core import Expense
++
++BANK_HEADER = "利用日,分類,利用金額,利用店名,カード\n"
++
++
++# --- parse_amount -------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("text", "expected"),
++    [
++        (" ￥1,234,567 ", 1234567),
++        ("-¥300", -300),
++        ("980円", 980),
++        ("0", 0),
++        ("-0", 0),
++        ("¥1,000円", 1000),
++        ("￥1円", 1),
++        ("1,23,4", 1234),  # カンマの位置は検査しない
++        ("1,", 1),
++    ],
++)
++def test_parse_amount_accepts(text, expected):
++    assert parse_amount(text) == expected
++
++
++@pytest.mark.parametrize(
++    "text",
++    [
++        "",
++        "   ",
++        "円",
++        "12.5",
++        "1 200",
++        "--5",
++        "¥-5",
++        "１２３",
++        "-",
++        "¥",
++        "5円円",
++        "円5",
++        "¥ 300",
++        "5-",
++    ],
++)
++def test_parse_amount_rejects(text):
++    with pytest.raises(ValueError):
++        parse_amount(text)
++
++
++# --- parse_date ---------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("text", "expected"),
++    [
++        ("2026/1/5", date(2026, 1, 5)),
++        ("2026-01-05", date(2026, 1, 5)),
++        ("2026/1/05", date(2026, 1, 5)),
++        (" 2026/11/18 ", date(2026, 11, 18)),
++        ("2024/02/29", date(2024, 2, 29)),
++    ],
++)
++def test_parse_date_accepts(text, expected):
++    assert parse_date(text) == expected
++
++
++@pytest.mark.parametrize(
++    "text",
++    [
++        "",
++        "2026/1-5",
++        "2026-1/5",
++        "26/1/5",
++        "2026/02/30",
++        "2026/13/1",
++        "2026/1/100",
++        "2026.1.5",
++        "2026/1/5/",
++        "２０２６/1/5",
++        "2026/1",
++    ],
++)
++def test_parse_date_rejects(text):
++    with pytest.raises(ValueError):
++        parse_date(text)
++
++
++# --- DEFAULT_MAPPING ----------------------------------------------------------
++
++
++def test_default_mapping_values():
++    assert DEFAULT_MAPPING == {
++        "date": "利用日",
++        "category": "分類",
++        "amount": "利用金額",
++        "memo": "利用店名",
++    }
++
++
++# --- import_rows: basics ------------------------------------------------------
++
++
++def test_import_rows_default_mapping_ignores_extra_columns():
++    text = BANK_HEADER + '2026/11/1,食費,"1,200",スーパーA,xx\n'
++    rows, errors = import_rows(text)
++    assert errors == []
++    assert rows == [Expense(date(2026, 11, 1), "食費", 1200, "スーパーA")]
++
++
++def test_import_rows_keeps_input_order():
++    text = BANK_HEADER + "2026/11/2,交通,300,駅,\n" + "2026/11/1,食費,¥500,店,\n"
++    rows, errors = import_rows(text)
++    assert errors == []
++    assert [r.day for r in rows] == [date(2026, 11, 2), date(2026, 11, 1)]
++    assert [r.amount for r in rows] == [300, 500]
++
++
++def test_import_rows_quoted_comma_in_memo():
++    text = BANK_HEADER + '2026/11/1,食費,100,"コンビニ, 本店",\n'
++    rows, errors = import_rows(text)
++    assert errors == []
++    assert rows[0].memo == "コンビニ, 本店"
++
++
++def test_import_rows_strips_category_and_memo_and_applies_category_map():
++    text = BANK_HEADER + "2026/11/1, 食費 ,100,  店名  ,\n"
++    rows, errors = import_rows(text, category_map={"食費": "食料品"})
++    assert errors == []
++    assert rows == [Expense(date(2026, 11, 1), "食料品", 100, "店名")]
++
++
++def test_category_map_does_not_touch_unmapped_categories():
++    text = BANK_HEADER + "2026/11/1,交通,100,,\n"
++    rows, _ = import_rows(text, category_map={"食費": "食料品"})
++    assert rows[0].category == "交通"
++
++
++def test_import_rows_custom_mapping_and_missing_memo_gives_empty_memo():
++    text = "日付,費目,金額\n2026-11-01,食費,100\n"
++    mapping = {"date": "日付", "category": "費目", "amount": "金額"}
++    rows, errors = import_rows(text, mapping)
++    assert errors == []
++    assert rows == [Expense(date(2026, 11, 1), "食費", 100, "")]
++
++
++def test_import_rows_blank_lines_are_skipped_but_counted():
++    text = BANK_HEADER + "\n2026/11/1,食費,abc,,\n"
++    rows, errors = import_rows(text)
++    assert rows == []
++    assert errors == [(3, "amount")]
++
++
++def test_import_rows_error_line_is_start_line_of_multiline_record():
++    text = BANK_HEADER + '2026/11/1,食費,100,"1行目\n2行目",\n' + "bad,食費,100,,\n"
++    rows, errors = import_rows(text)
++    assert rows[0].memo == "1行目\n2行目"
++    assert errors == [(4, "date")]
++
++
++# --- import_rows: errors ------------------------------------------------------
++
++
++def test_errors_recorded_in_order_and_row_excluded():
++    text = BANK_HEADER + "x,  ,abc,,\n"
++    rows, errors = import_rows(text)
++    assert rows == []
++    assert errors == [(2, "date"), (2, "amount"), (2, "category")]
++
++
++def test_only_bad_row_is_excluded_and_good_rows_remain():
++    text = (
++        BANK_HEADER
++        + "2026/11/1,食費,100,,\n"
++        + "2026/11/2,,100,,\n"
++        + "2026/11/3,交通,200,,\n"
++    )
++    rows, errors = import_rows(text)
++    assert errors == [(3, "category")]
++    assert [r.amount for r in rows] == [100, 200]
++
++
++def test_short_row_missing_values_are_empty_and_reported():
++    text = BANK_HEADER + "2026/11/1\n"
++    rows, errors = import_rows(text)
++    assert rows == []
++    assert errors == [(2, "amount"), (2, "category")]
++
++
++def test_short_row_without_memo_column_value_gives_empty_memo():
++    text = "利用日,分類,利用金額,利用店名\n2026/11/1,食費,100\n"
++    rows, errors = import_rows(text)
++    assert errors == []
++    assert rows[0].memo == ""
++
++
++# --- import_rows: header / mapping validation ---------------------------------
++
++
++@pytest.mark.parametrize("key", ["date", "category", "amount"])
++def test_mapping_missing_required_key_raises(key):
++    mapping = {k: v for k, v in DEFAULT_MAPPING.items() if k != key}
++    with pytest.raises(ValueError):
++        import_rows(BANK_HEADER, mapping)
++
++
++def test_mapping_memo_is_optional():
++    mapping = {k: v for k, v in DEFAULT_MAPPING.items() if k != "memo"}
++    rows, errors = import_rows(BANK_HEADER, mapping)
++    assert rows == [] and errors == []
++
++
++def test_mapping_column_missing_from_header_raises():
++    with pytest.raises(ValueError):
++        import_rows("日付,分類,利用金額\n", None)
++
++
++def test_mapping_memo_column_missing_from_header_raises():
++    with pytest.raises(ValueError):
++        import_rows("利用日,分類,利用金額\n", None)
++
++
++def test_empty_text_raises_because_header_is_missing():
++    with pytest.raises(ValueError):
++        import_rows("")
+diff --git a/tests/test_monthdiff.py b/tests/test_monthdiff.py
+new file mode 100644
+index 0000000..e10bd54
+--- /dev/null
++++ b/tests/test_monthdiff.py
+@@ -0,0 +1,255 @@
++from __future__ import annotations
++
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.monthdiff import (
++    DiffRow,
++    available_months,
++    latest_diff,
++    month_diff,
++    render_diff,
++    top_movers,
++)
++
++
++def e(day: str, category: str, amount: int) -> Expense:
++    y, m, d = (int(x) for x in day.split("-"))
++    return Expense(day=date(y, m, d), category=category, amount=amount)
++
++
++# --- month_diff -----------------------------------------------------------
++
++
++def test_basic_rows_and_sort_by_abs_delta() -> None:
++    rows = [
++        e("2026-01-05", "食費", 1000),
++        e("2026-01-06", "日用品", 500),
++        e("2026-02-05", "食費", 1300),
++        e("2026-02-06", "交通", 200),
++    ]
++    got = month_diff(rows, "2026-01", "2026-02")
++    assert got == [
++        DiffRow("日用品", 500, 0, -500, -100.0, "gone"),
++        DiffRow("食費", 1000, 1300, 300, 30.0, "up"),
++        DiffRow("交通", 0, 200, 200, None, "new"),
++    ]
++
++
++def test_status_down_and_same() -> None:
++    rows = [
++        e("2026-01-01", "A", 1000),
++        e("2026-02-01", "A", 800),
++        e("2026-01-01", "B", 300),
++        e("2026-02-01", "B", 300),
++    ]
++    got = {d.category: d for d in month_diff(rows, "2026-01", "2026-02")}
++    assert got["A"].status == "down"
++    assert got["A"].delta == -200
++    assert got["A"].pct == -20.0
++    assert got["B"].status == "same"
++    assert got["B"].delta == 0
++    assert got["B"].pct == 0.0
++
++
++def test_status_uses_presence_not_sum() -> None:
++    # prev has rows but they sum to 0 -> not "new", pct None
++    rows = [
++        e("2026-01-01", "A", 0),
++        e("2026-02-01", "A", 100),
++        # curr has rows summing to 0 -> not "gone"
++        e("2026-01-01", "B", 500),
++        e("2026-02-01", "B", 200),
++        e("2026-02-02", "B", -200),
++    ]
++    got = {d.category: d for d in month_diff(rows, "2026-01", "2026-02")}
++    assert got["A"] == DiffRow("A", 0, 100, 100, None, "up")
++    assert got["B"] == DiffRow("B", 500, 0, -500, -100.0, "down")
++
++
++def test_same_status_when_both_present_and_delta_zero() -> None:
++    rows = [e("2026-01-01", "A", 0), e("2026-02-01", "A", 0)]
++    got = month_diff(rows, "2026-01", "2026-02")
++    assert got == [DiffRow("A", 0, 0, 0, None, "same")]
++
++
++def test_tie_break_by_category_ascending() -> None:
++    rows = [
++        e("2026-01-01", "b", 100),
++        e("2026-02-01", "b", 200),
++        e("2026-01-01", "a", 100),
++        e("2026-02-01", "a", 0),
++        e("2026-02-02", "a", 0),
++    ]
++    # |delta| equal (100 each): a before b
++    got = [d.category for d in month_diff(rows, "2026-01", "2026-02")]
++    assert got == ["a", "b"]
++
++
++def test_pct_rounded_to_one_decimal() -> None:
++    rows = [e("2026-01-01", "A", 3), e("2026-02-01", "A", 4)]
++    (d,) = month_diff(rows, "2026-01", "2026-02")
++    assert d.pct == round(1 / 3 * 100, 1) == 33.3
++
++
++def test_other_months_are_ignored() -> None:
++    rows = [
++        e("2025-12-31", "A", 999),
++        e("2026-01-01", "A", 100),
++        e("2026-03-01", "A", 777),
++    ]
++    got = month_diff(rows, "2026-01", "2026-02")
++    assert got == [DiffRow("A", 100, 0, -100, -100.0, "gone")]
++
++
++def test_empty_rows_gives_empty_list() -> None:
++    assert month_diff([], "2026-01", "2026-02") == []
++
++
++def test_no_rows_in_either_month_gives_empty_list() -> None:
++    rows = [e("2026-05-01", "A", 100)]
++    assert month_diff(rows, "2026-01", "2026-02") == []
++
++
++@pytest.mark.parametrize(
++    "prev,curr",
++    [
++        ("2026-1", "2026-02"),
++        ("2026-01", "2026-2"),
++        ("2026-13", "2026-02"),
++        ("2026-00", "2026-02"),
++        ("2026-01", "2026-1"),
++        ("202601", "2026-02"),
++        ("2026/01", "2026-02"),
++        ("", "2026-02"),
++        ("2026-01", "2026-01-01"),
++        ("26-01", "2026-02"),
++    ],
++)
++def test_invalid_month_format_raises(prev: str, curr: str) -> None:
++    with pytest.raises(ValueError):
++        month_diff([], prev, curr)
++
++
++# --- top_movers -----------------------------------------------------------
++
++
++def _d(cat: str, delta: int, status: str) -> DiffRow:
++    return DiffRow(cat, 0, delta, delta, None, status)
++
++
++def test_top_movers_excludes_same_and_keeps_order() -> None:
++    diffs = [
++        _d("A", 500, "up"),
++        _d("B", 400, "same"),
++        _d("C", -300, "down"),
++        _d("D", 200, "new"),
++        _d("E", 100, "up"),
++    ]
++    got = top_movers(diffs)
++    assert [d.category for d in got] == ["A", "C", "D"]
++
++
++def test_top_movers_n_limits_count() -> None:
++    diffs = [_d("A", 3, "up"), _d("B", 2, "up"), _d("C", 1, "up")]
++    assert [d.category for d in top_movers(diffs, n=2)] == ["A", "B"]
++    assert [d.category for d in top_movers(diffs, n=0)] == []
++    assert [d.category for d in top_movers(diffs, n=10)] == ["A", "B", "C"]
++
++
++def test_top_movers_default_n_is_three() -> None:
++    diffs = [_d(c, 10 - i, "up") for i, c in enumerate("ABCDE")]
++    assert [d.category for d in top_movers(diffs)] == ["A", "B", "C"]
++
++
++def test_top_movers_negative_n_raises() -> None:
++    with pytest.raises(ValueError):
++        top_movers([], n=-1)
++
++
++def test_top_movers_does_not_mutate_input() -> None:
++    diffs = [_d("A", 1, "same"), _d("B", 2, "up")]
++    top_movers(diffs)
++    assert [d.category for d in diffs] == ["A", "B"]
++
++
++# --- render_diff ----------------------------------------------------------
++
++
++def test_render_diff_format() -> None:
++    diffs = [
++        DiffRow("食費", 1000, 1300, 300, 30.0, "up"),
++        DiffRow("日用品", 500, 0, -500, -100.0, "gone"),
++        DiffRow("交通", 0, 200, 200, None, "new"),
++        DiffRow("雑費", 0, 0, 0, 0.0, "same"),
++    ]
++    assert render_diff(diffs) == (
++        "category\tprev\tcurr\tdelta\tpct\n"
++        "食費\t1000\t1300\t+300\t+30.0%\n"
++        "日用品\t500\t0\t-500\t-100.0%\n"
++        "交通\t0\t200\t+200\t-\n"
++        "雑費\t0\t0\t+0\t+0.0%"
++    )
++
++
++def test_render_diff_no_trailing_newline() -> None:
++    out = render_diff([DiffRow("A", 1, 2, 1, 100.0, "up")])
++    assert not out.endswith("\n")
++    assert out.count("\n") == 1
++
++
++def test_render_diff_empty_is_header_only() -> None:
++    assert render_diff([]) == "category\tprev\tcurr\tdelta\tpct"
++
++
++def test_render_diff_zero_pct_with_negative_zero() -> None:
++    # -0.0 must not render as "-0.0%"
++    out = render_diff([DiffRow("A", 0, 0, 0, -0.0, "same")])
++    assert out.splitlines()[1].endswith("\t+0.0%")
++
++
++# --- available_months / latest_diff ---------------------------------------
++
++
++def test_available_months_sorted_unique() -> None:
++    rows = [
++        e("2026-02-01", "A", 1),
++        e("2025-12-31", "A", 1),
++        e("2026-02-20", "B", 1),
++        e("2026-01-01", "A", 1),
++    ]
++    assert available_months(rows) == ["2025-12", "2026-01", "2026-02"]
++
++
++def test_available_months_empty() -> None:
++    assert available_months([]) == []
++
++
++def test_latest_diff_uses_last_two_months() -> None:
++    rows = [
++        e("2026-01-01", "A", 100),
++        e("2026-02-01", "A", 200),
++        e("2026-03-01", "A", 50),
++    ]
++    assert latest_diff(rows) == month_diff(rows, "2026-02", "2026-03")
++    assert latest_diff(rows) == [DiffRow("A", 200, 50, -150, -75.0, "down")]
++
++
++def test_latest_diff_two_months() -> None:
++    rows = [e("2025-12-01", "A", 100), e("2026-01-01", "A", 100)]
++    assert latest_diff(rows) == [DiffRow("A", 100, 100, 0, 0.0, "same")]
++
++
++@pytest.mark.parametrize(
++    "rows",
++    [
++        [],
++        [e("2026-01-01", "A", 100)],
++        [e("2026-01-01", "A", 100), e("2026-01-15", "B", 5)],
++    ],
++)
++def test_latest_diff_fewer_than_two_months_raises(rows: list[Expense]) -> None:
++    with pytest.raises(ValueError):
++        latest_diff(rows)
+diff --git a/tests/test_query.py b/tests/test_query.py
+new file mode 100644
+index 0000000..09c62cd
+--- /dev/null
++++ b/tests/test_query.py
+@@ -0,0 +1,218 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.query import QueryError, filter_rows, matches, tokenize
++
++E1 = Expense(date(2026, 1, 5), "食費", 1200, "ランチ 外食")
++E2 = Expense(date(2026, 1, 6), "交通費", 300, "電車")
++E3 = Expense(date(2026, 2, 1), "Food", 500, "Coffee")
++
++
++# --- tokenize ---
++
++
++def test_tokenize_blank_and_empty_give_no_tokens() -> None:
++    assert tokenize("") == []
++    assert tokenize("   \t ") == []
++
++
++def test_tokenize_parens() -> None:
++    assert tokenize("(a)") == [("LPAREN", "("), ("TERM", "a"), ("RPAREN", ")")]
++
++
++def test_tokenize_quote_keeps_spaces_and_parens() -> None:
++    assert tokenize('"ランチ 外食 (昼)"') == [("TERM", "ランチ 外食 (昼)")]
++
++
++def test_tokenize_quote_has_no_escape() -> None:
++    assert tokenize('"a\\" b') == [("TERM", "a\\"), ("TERM", "b")]
++
++
++def test_tokenize_unclosed_quote_raises() -> None:
++    with pytest.raises(QueryError):
++        tokenize('"abc')
++
++
++def test_tokenize_empty_quote_raises() -> None:
++    with pytest.raises(QueryError):
++        tokenize('""')
++
++
++def test_tokenize_uppercase_operators_only() -> None:
++    assert tokenize("AND OR NOT") == [("AND", "AND"), ("OR", "OR"), ("NOT", "NOT")]
++    assert tokenize("and or not") == [
++        ("TERM", "and"),
++        ("TERM", "or"),
++        ("TERM", "not"),
++    ]
++
++
++def test_tokenize_word_starting_with_operator_is_term() -> None:
++    assert tokenize("NOTE ANDROID") == [("TERM", "NOTE"), ("TERM", "ANDROID")]
++
++
++def test_tokenize_quoted_operator_is_term() -> None:
++    assert tokenize('"AND"') == [("TERM", "AND")]
++
++
++def test_tokenize_cat_prefix() -> None:
++    assert tokenize("cat:食費") == [("CAT", "食費")]
++
++
++def test_tokenize_quoted_cat_prefix_is_term() -> None:
++    assert tokenize('"cat:食費"') == [("TERM", "cat:食費")]
++
++
++def test_tokenize_empty_cat_raises() -> None:
++    with pytest.raises(QueryError):
++        tokenize("cat:")
++
++
++def test_tokenize_word_stops_before_paren() -> None:
++    assert tokenize("cat:食費)") == [("CAT", "食費"), ("RPAREN", ")")]
++
++
++# --- grammar errors ---
++
++
++@pytest.mark.parametrize(
++    "q",
++    [
++        "   ",
++        "()",
++        "(a",
++        "a)",
++        "a OR",
++        "OR a",
++        "a AND AND b",
++        "a AND",
++        "NOT",
++        "a OR OR b",
++        "a AND )",
++    ],
++)
++def test_grammar_errors_raise(q: str) -> None:
++    with pytest.raises(QueryError):
++        matches(q, E1)
++
++
++def test_empty_query_raises_even_with_no_rows() -> None:
++    with pytest.raises(QueryError):
++        filter_rows("", [])
++
++
++def test_invalid_query_raises_even_with_no_rows() -> None:
++    with pytest.raises(QueryError):
++        filter_rows("a OR", [])
++
++
++# --- evaluation ---
++
++
++def test_term_matches_memo_or_category_substring() -> None:
++    assert matches("ランチ", E1)
++    assert not matches("ランチ", E2)
++    assert matches("交通", E2)  # category substring
++
++
++def test_term_is_casefolded() -> None:
++    assert matches("coffee", E3)
++    assert matches("FOOD", E3)
++    assert not matches("food", E1)
++
++
++def test_cat_is_exact_match() -> None:
++    assert matches("cat:食費", E1)
++    assert not matches("cat:食", E1)
++
++
++def test_cat_is_casefolded_and_exact() -> None:
++    assert matches("cat:food", E3)
++    assert matches("cat:Food", E3)
++    assert not matches("cat:ood", E3)
++
++
++def test_implicit_and_between_terms() -> None:
++    assert matches("ランチ 外食", E1)
++    assert not matches("ランチ 電車", E1)
++
++
++def test_explicit_or() -> None:
++    assert matches("電車 OR ランチ", E1)
++    assert matches("電車 OR ランチ", E2)
++    assert not matches("電車 OR ランチ", E3)
++
++
++def test_and_binds_tighter_than_or() -> None:
++    # ランチ OR (電車 AND Coffee): E1 matches via the left side.
++    assert matches("ランチ OR 電車 Coffee", E1)
++    # ((ランチ OR 電車) AND Coffee) would reject E1.
++    assert not matches("ランチ OR 電車 Coffee", E3)
++
++
++def test_not_binds_tighter_than_and() -> None:
++    # (NOT 食費) AND 電車
++    assert matches("NOT 食費 電車", E2)
++    assert not matches("NOT 食費 電車", E1)
++    # NOT (食費 AND 電車) would accept E3; (NOT 食費) AND 電車 does not.
++    assert not matches("NOT 食費 電車", E3)
++
++
++def test_not_with_parens() -> None:
++    assert not matches("NOT (食費 OR 電車)", E1)
++    assert not matches("NOT (食費 OR 電車)", E2)
++    assert matches("NOT (食費 OR 電車)", E3)
++
++
++def test_double_not() -> None:
++    assert matches("NOT NOT ランチ", E1)
++    assert not matches("NOT NOT ランチ", E2)
++
++
++def test_implicit_and_before_not() -> None:
++    assert matches("電車 NOT ランチ", E2)
++    assert not matches("電車 NOT ランチ", E1)
++
++
++def test_explicit_and_with_not() -> None:
++    assert matches("電車 AND NOT ランチ", E2)
++    assert not matches("ランチ AND NOT 外食", E1)
++
++
++def test_parens_override_precedence() -> None:
++    # ((ランチ OR 電車) AND Coffee): E1 has no Coffee, so it is rejected.
++    assert not matches("(ランチ OR 電車) Coffee", E1)
++    assert matches("(ランチ OR 電車) 外食", E1)
++
++
++def test_quoted_term_with_space() -> None:
++    assert matches('"ランチ 外食"', E1)
++    assert not matches('"ランチ 電車"', E1)
++
++
++def test_lowercase_and_is_a_term_not_operator() -> None:
++    # "and" is searched as a literal term, so E1 (no "and" text) is rejected.
++    assert not matches("ランチ and 外食", E1)
++    assert matches("ランチ and", Expense(date(2026, 1, 1), "x", 1, "ランチ and"))
++
++
++# --- filter_rows ---
++
++
++def test_filter_rows_keeps_input_order() -> None:
++    rows = [E2, E1, E3]
++    assert filter_rows("ランチ OR 電車", rows) == [E2, E1]
++
++
++def test_filter_rows_no_match_is_empty() -> None:
++    assert filter_rows("存在しない", [E1, E2, E3]) == []
++
++
++def test_filter_rows_empty_rows_valid_query() -> None:
++    assert filter_rows("ランチ", []) == []
++
++
++def test_filter_rows_cat_exact() -> None:
++    assert filter_rows("cat:Food", [E1, E2, E3]) == [E3]
+diff --git a/tests/test_recurring.py b/tests/test_recurring.py
+new file mode 100644
+index 0000000..80902cf
+--- /dev/null
++++ b/tests/test_recurring.py
+@@ -0,0 +1,223 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.recurring import Recurring, add_month, find_recurring
++
++
++def e(day: str, category: str = "rent", amount: int = 80000, memo: str = "") -> Expense:
++    return Expense(date.fromisoformat(day), category, amount, memo)
++
++
++# --- add_month -------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "src, expected",
++    [
++        (date(2026, 1, 31), date(2026, 2, 28)),  # clamp to non-leap Feb
++        (date(2024, 1, 31), date(2024, 2, 29)),  # clamp to leap Feb
++        (date(2026, 12, 15), date(2027, 1, 15)),  # year rollover
++        (date(2026, 11, 30), date(2026, 12, 30)),  # 30 -> 30 (Dec has 31)
++        (date(2026, 3, 31), date(2026, 4, 30)),  # clamp to 30-day month
++        (date(2026, 11, 18), date(2026, 12, 18)),  # ordinary case
++    ],
++)
++def test_add_month(src, expected):
++    assert add_month(src) == expected
++
++
++# --- find_recurring: validation -------------------------------------------
++
++
++def test_min_count_below_2_raises():
++    with pytest.raises(ValueError):
++        find_recurring([], min_count=1)
++
++
++def test_negative_tolerance_raises():
++    with pytest.raises(ValueError):
++        find_recurring([], tolerance=-1)
++
++
++def test_min_count_2_and_tolerance_0_are_accepted():
++    rows = [e("2026-01-10"), e("2026-02-10")]
++    assert len(find_recurring(rows, min_count=2, tolerance=0)) == 1
++
++
++# --- find_recurring: basic behaviour --------------------------------------
++
++
++def test_empty_input_returns_empty():
++    assert find_recurring([]) == []
++
++
++def test_three_monthly_payments_detected():
++    rows = [e("2026-01-05"), e("2026-02-05"), e("2026-03-05")]
++    assert find_recurring(rows) == [
++        Recurring(
++            category="rent",
++            amount=80000,
++            days=(date(2026, 1, 5), date(2026, 2, 5), date(2026, 3, 5)),
++            next_expected=date(2026, 4, 5),
++        )
++    ]
++
++
++def test_two_payments_below_default_min_count_not_reported():
++    rows = [e("2026-01-05"), e("2026-02-05")]
++    assert find_recurring(rows) == []
++
++
++def test_min_count_threshold_is_inclusive():
++    rows = [e("2026-01-05"), e("2026-02-05")]
++    result = find_recurring(rows, min_count=2)
++    assert len(result) == 1
++    assert result[0].days == (date(2026, 1, 5), date(2026, 2, 5))
++
++
++def test_memo_is_ignored_when_grouping():
++    rows = [
++        e("2026-01-05", memo="a"),
++        e("2026-02-05", memo="b"),
++        e("2026-03-05", memo=""),
++    ]
++    assert len(find_recurring(rows)) == 1
++
++
++def test_different_amount_is_a_different_group():
++    rows = [
++        e("2026-01-05", amount=100),
++        e("2026-02-05", amount=100),
++        e("2026-03-05", amount=101),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_different_category_is_a_different_group():
++    rows = [
++        e("2026-01-05", category="a"),
++        e("2026-02-05", category="b"),
++        e("2026-03-05", category="a"),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_duplicate_dates_in_group_count_once():
++    # Two rows on the same day must not satisfy min_count alone.
++    rows = [e("2026-01-05"), e("2026-01-05"), e("2026-02-05")]
++    assert find_recurring(rows) == []
++
++
++def test_unsorted_input_is_sorted_in_days():
++    rows = [e("2026-03-05"), e("2026-01-05"), e("2026-02-05")]
++    (r,) = find_recurring(rows)
++    assert r.days == (date(2026, 1, 5), date(2026, 2, 5), date(2026, 3, 5))
++
++
++# --- find_recurring: tolerance ---------------------------------------------
++
++
++def test_gap_exactly_at_tolerance_links():
++    # expected 2026-02-05; actual 2026-02-08 is +3 days
++    rows = [e("2026-01-05"), e("2026-02-08"), e("2026-03-08")]
++    (r,) = find_recurring(rows, tolerance=3)
++    assert len(r.days) == 3
++
++
++def test_gap_beyond_tolerance_splits_run():
++    # expected 2026-02-05; actual 2026-02-09 is +4 days -> not linked
++    rows = [e("2026-01-05"), e("2026-02-09"), e("2026-03-09")]
++    assert find_recurring(rows, tolerance=3) == []
++
++
++def test_tolerance_zero_requires_exact_day():
++    rows = [e("2026-01-05"), e("2026-02-06"), e("2026-03-06")]
++    assert find_recurring(rows, tolerance=0) == []
++
++
++def test_early_payment_within_tolerance_links():
++    # expected 2026-02-05; actual 2026-02-02 is -3 days
++    rows = [e("2026-01-05"), e("2026-02-02"), e("2026-03-02")]
++    (r,) = find_recurring(rows, tolerance=3)
++    assert r.days == (date(2026, 1, 5), date(2026, 2, 2), date(2026, 3, 2))
++
++
++# --- find_recurring: run splitting -----------------------------------------
++
++
++def test_break_splits_and_short_run_is_dropped():
++    # Run A: 3 dates (kept). Break. Run B: 2 dates (dropped).
++    rows = [
++        e("2026-01-05"),
++        e("2026-02-05"),
++        e("2026-03-05"),
++        e("2026-06-05"),
++        e("2026-07-05"),
++    ]
++    result = find_recurring(rows, min_count=3)
++    assert len(result) == 1
++    assert result[0].days == (date(2026, 1, 5), date(2026, 2, 5), date(2026, 3, 5))
++
++
++def test_break_splits_into_two_qualifying_runs():
++    rows = [
++        e("2026-01-05"),
++        e("2026-02-05"),
++        e("2026-03-05"),
++        e("2026-08-05"),
++        e("2026-09-05"),
++        e("2026-10-05"),
++    ]
++    result = find_recurring(rows, min_count=3)
++    assert [r.days[0] for r in result] == [date(2026, 1, 5), date(2026, 8, 5)]
++    assert [r.next_expected for r in result] == [date(2026, 4, 5), date(2026, 11, 5)]
++
++
++def test_link_is_checked_against_add_month_of_previous_date():
++    # 01-31 -> expected 02-28; 02-28 -> expected 03-28. Clamping must link them.
++    rows = [e("2026-01-31"), e("2026-02-28"), e("2026-03-28")]
++    (r,) = find_recurring(rows, tolerance=0)
++    assert r.days == (date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 28))
++
++
++# --- find_recurring: output shape and ordering ----------------------------
++
++
++def test_next_expected_uses_last_date_of_run():
++    rows = [e("2026-01-31"), e("2026-02-28"), e("2026-03-31")]
++    (r,) = find_recurring(rows, tolerance=3)
++    assert r.next_expected == date(2026, 4, 30)
++
++
++def test_results_sorted_by_category_then_amount_then_first_day():
++    rows = [
++        # category "b", amount 5
++        e("2026-03-01", "b", 5),
++        e("2026-02-01", "b", 5),
++        e("2026-01-01", "b", 5),
++        # category "a", amount 9
++        e("2026-05-01", "a", 9),
++        e("2026-04-01", "a", 9),
++        e("2026-03-01", "a", 9),
++        # category "a", amount 2
++        e("2026-02-01", "a", 2),
++        e("2026-01-01", "a", 2),
++        e("2026-03-01", "a", 2),
++    ]
++    keys = [(r.category, r.amount) for r in find_recurring(rows)]
++    assert keys == [("a", 2), ("a", 9), ("b", 5)]
++
++
++def test_same_group_multiple_runs_sorted_by_first_day():
++    rows = [
++        e("2026-08-01"),
++        e("2026-09-01"),
++        e("2026-10-01"),
++        e("2026-01-01"),
++        e("2026-02-01"),
++        e("2026-03-01"),
++    ]
++    firsts = [r.days[0] for r in find_recurring(rows, min_count=3)]
++    assert firsts == [date(2026, 1, 1), date(2026, 8, 1)]

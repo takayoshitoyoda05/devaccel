@@ -436,8 +436,11 @@ def main() -> int:
         elif copies > 1:
             lines.append(f"- unit {i}: no copy passed the gate")
     log.write_text("\n".join(full), encoding="utf-8")
-    print("\n".join(lines))
-    print(f"(full unit reports: {log.relative_to(root)})")
+    # compact on stdout (a Claude session reading this pays for every line); the reports go to the log and PR
+    for u in sorted(done, key=lambda x: (x["i"], x["k"])):
+        if u["status"] != "ok" and u["status"] != "superseded":
+            print(f"- unit {u['i']} ({u['branch']}): {clean(u['status'])}")
+    print(f"(unit reports: {log.relative_to(root)})")
     print(f"units: {len(ok)}/{len(items)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
     (root / ".devaccel" / "batch-last.json").write_text(json.dumps(  # machine-readable (cost of the units)
         {"branch": a.branch, "units": len(items), "ok": len(ok), "secs": round(time.time() - t0),
@@ -452,7 +455,8 @@ def main() -> int:
     notes.parent.mkdir(exist_ok=True)
     title = a.title or f"batch: {len(ok)} units ({slug})"
     notes.write_text(title + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
-    print(f"[timing] units phase {round(time.time() - t0)}s", flush=True)
+    if os.environ.get("DEVACCEL_TIMING"):
+        print(f"[timing] units phase {round(time.time() - t0)}s", flush=True)
     r = subprocess.run([sys.executable, str(Path(__file__).with_name("devaccel_ship.py")), "--file",
                         str(notes.relative_to(root)), "--branch", a.branch, "--units", *ok], cwd=root)
     cleanup(root, units, a.keep, branches=r.returncode == 0)  # integrated: the unit branches are no longer needed

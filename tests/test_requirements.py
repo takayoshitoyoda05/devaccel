@@ -1775,10 +1775,13 @@ class R18BatchEndToEndTest(R6ShipTest):
         self.assertNotIn("BROKEN", sh(self.root, "git", "show", "batch/t:app.py").stdout)
         self.assertEqual(sh(self.root, "git", "diff", "main", "batch/t", "--", ".claude").stdout, "")
         self.assertIn("check fail", r.stdout)
-        self.assertNotIn("\x1b", r.stdout)
-        self.assertNotIn("\x07", r.stdout)
-        self.assertIn("@\u200bsomeone", r.stdout)
-        self.assertNotIn("<!--", r.stdout)
+        body = (self.root / ".devaccel/ship.md").read_text() + (self.root / ".devaccel/batch-t.log").read_text()
+        for out in (r.stdout, body):
+            self.assertNotIn("\x1b", out)
+            self.assertNotIn("\x07", out)
+            self.assertNotIn("<!--", out)
+        self.assertIn("`", body)  # unit text sits in code spans in the PR body
+        self.assertIn("@\u200bsomeone", body)
         self.assertEqual(sh(self.root, "git", "worktree", "list").stdout.count("\n"), 1)  # worktrees removed
         self.assertEqual(sh(self.root, "git", "branch", "--list", "unit/*").stdout.strip(), "")
 
