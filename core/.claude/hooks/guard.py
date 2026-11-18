@@ -16,6 +16,7 @@ On internal error it asks instead of allowing.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
-from devaccel_common import emit, load_config, read_stdin_json, trusted_root  # noqa: E402
+from devaccel_common import emit, git, load_config, read_stdin_json, trusted_root  # noqa: E402
 
 # rm with both -r and -f aimed at a broad target (/, ~, $HOME, *, ., .., .git)
 _RM = re.compile(
@@ -186,7 +187,7 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
     # be plain reads, so `FOO=1 python3 …`/export/source cannot appear; a "x=y" inside a title is just text)
     if runs and (len(runs) > 1 or any(not READERS.search(s) for s in segs_flat if s not in runs)):
         # allowlist, not a denylist: the script runs alone (only plain reads may share the command)
-        return "deny", "devaccel_pr/land は単独のコマンドで実行してください(環境変数・cd・関数定義などと並べない)。"
+        return "deny", "devaccel のスクリプトは単独のコマンドで実行してください(環境変数・cd・関数定義などと並べない)。スクリプトを読むだけなら Read ツールを使う。"
     if PR_SCRIPT.search(flat) and PIPE.search(flat) and not all(READERS.search(s) for s in segs_flat):
         return "deny", "devaccel_pr/land を名指しするコマンドで、他のコマンドへのパイプは使えません。"
     for s in segs_flat:
@@ -256,13 +257,51 @@ def decide(command: str, cfg: dict, cwd: Path | None = None, project: Path | Non
     return None
 
 
+PROMPT_FILE = ".devaccel/prompt.md"
+NUMBERED = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?\d+\.(?:\*\*)?[ \t]+", re.M)
+
+
+def capture_prompt(data: dict, root: Path) -> None:
+    """For `devaccel_batch.py .devaccel/prompt.md`: write the user's latest numbered request there, so the
+    session doesn't retype it (measured ~20 s and ~$0.07 for 12 tasks). Only the user's own messages (not tool
+    results); the latest one with at least two numbered items; otherwise the file is removed (never stale)."""
+    out = root / PROMPT_FILE
+    best = ""
+    try:
+        for line in Path(str(data.get("transcript_path") or "")).read_text(encoding="utf-8").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("type") != "user" or e.get("isMeta") or e.get("isSidechain"):
+                continue
+            c = (e.get("message") or {}).get("content")
+            text = c if isinstance(c, str) else "\n".join(
+                b.get("text", "") for b in c or [] if isinstance(b, dict) and b.get("type") == "text")
+            if len(NUMBERED.findall(text)) >= 2:
+                best = text
+    except OSError:
+        best = ""
+    if out.is_symlink() or (out.parent.exists() and out.parent.is_symlink()):
+        return
+    if best:
+        out.parent.mkdir(exist_ok=True)
+        out.write_text(best, encoding="utf-8")
+    else:
+        out.unlink(missing_ok=True)
+
+
 def main() -> int:
     data = read_stdin_json()
     command = (data.get("tool_input") or {}).get("command", "")
     if not command:
         return 0
     project = trusted_root(data)  # lock and config come from the main checkout, never a worktree
-    verdict = decide(command, load_config(project), Path(data.get("cwd") or project), project)
+    cwd = Path(data.get("cwd") or project)
+    verdict = decide(command, load_config(project), cwd, project)
+    if verdict is None and BATCH_RUN.search(command) and f" {PROMPT_FILE} " in f" {command.strip()} ":
+        top = git(cwd, "rev-parse", "--show-toplevel").strip()
+        capture_prompt(data, Path(top) if top else cwd)
     if verdict:
         decision, why = verdict
         emit(

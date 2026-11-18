@@ -1914,3 +1914,33 @@ class R24BatchFromClaudeTest(R6ShipTest):
             r = sh(self.root, "python3", ".claude/hooks/devaccel_batch.py", *args, env=env_cc)
             self.assertEqual(r.returncode, 2, args)
             self.assertIn("only `.devaccel/", r.stderr, args)
+
+
+class R25PromptCaptureTest(ReqKit):
+    """The guard writes the user's latest numbered request to .devaccel/prompt.md for the batch run."""
+
+    def run_guard(self, cmd: str, transcript: list[dict]) -> None:
+        tp = self.tmp / "t.jsonl"
+        tp.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in transcript) + "\n")
+        sh(self.root, "python3", ".claude/hooks/guard.py", stdin=json.dumps(
+            {"tool_input": {"command": cmd}, "cwd": str(self.root), "transcript_path": str(tp)}))
+
+    def test_latest_numbered_user_message_is_captured_and_stale_file_removed(self):
+        cmd = "python3 .claude/hooks/devaccel_batch.py .devaccel/prompt.md --branch batch/x"
+        old = {"type": "user", "message": {"content": "1. old a\n2. old b\n"}}
+        new = {"type": "user", "message": {"content": [{"type": "text", "text": "前提\n1. new a\n2. new b\n"}]}}
+        tool = {"type": "user", "message": {"content": [{"type": "tool_result", "content": "1. x\n2. y\n3. z"}]}}
+        later = {"type": "user", "message": {"content": "続けて"}}
+        self.run_guard(cmd, [old, new, tool, later])
+        self.assertEqual((self.root / ".devaccel/prompt.md").read_text(), "前提\n1. new a\n2. new b\n")
+        self.run_guard(cmd, [later])
+        self.assertFalse((self.root / ".devaccel/prompt.md").exists())  # never a stale request
+        self.run_guard("python3 .claude/hooks/devaccel_batch.py .devaccel/tasks.md --branch batch/x", [new])
+        self.assertFalse((self.root / ".devaccel/prompt.md").exists())  # only for the prompt.md form
+
+    def test_split_accepts_headings_and_bold_numbers(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        head, items = b.split_tasks("共通\n## 1. a\nx\n## 2. b\n**3.** c\n4. d\n")
+        self.assertEqual(head, "共通")
+        self.assertEqual(len(items), 4)

@@ -31,7 +31,8 @@ sys.path.append(str(Path(__file__).resolve().parent))
 from devaccel_common import git, load_config  # noqa: E402
 from stop_gate import run_check  # noqa: E402
 
-ITEM = re.compile(r"^\s*(\d+)\.\s+", re.M)
+# "1. ", also as a markdown heading or bold ("## 1. ", "**1.** ") — how a session tends to rewrite a list
+ITEM = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?(\d+)\.(?:\*\*)?[ \t]+", re.M)
 # never auto-committed from a unit's tree, never inlined into a prompt (secrets, keys, devaccel/Claude state)
 SKIP_NEW = re.compile(r"(^|/)(\.?env|[^/]*\.env|\.env\.[^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore)|id_(rsa|ed25519|ecdsa|dsa)"
                       r"(\.pub)?|\.netrc|\.npmrc|\.pypirc|credentials(\.[^/]*)?|secrets?(\.[^/]*)?|[^/]*\.tfstate)$"
@@ -212,8 +213,9 @@ def main() -> int:
     cfg = load_config(root)
     base = cfg["scale"]["base_branch"]
     head, items = split_tasks(a.tasks.read_text(encoding="utf-8"))
-    if not items:
-        print("no tasks found (items must start with '1. ', '2. ', ...)", file=sys.stderr)
+    if not items or (os.environ.get("CLAUDECODE") and len(items) < 2):
+        print(f"{len(items)} task(s) found: a fan-out needs items starting with '1. ', '2. ', ... (one per line "
+              "start); for a single task just implement it", file=sys.stderr)
         return 2
     slug = re.sub(r"[^\w-]", "-", a.branch.split("/")[-1])[:40] or "batch"
     # the unit's rules and model come from the devaccel-unit agent definition (the main checkout's copy);
