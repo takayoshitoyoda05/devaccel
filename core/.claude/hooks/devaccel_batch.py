@@ -45,6 +45,18 @@ def split_tasks(text: str) -> tuple[str, list[str]]:
     return head, items
 
 
+def task_warnings(item: str) -> list[str]:
+    """Cheap checks for the things that make units iterate (see the devaccel-batch skill)."""
+    w = []
+    if not re.search(r"`[\w./-]+\.[A-Za-z]{1,5}`", item):
+        w.append("編集するファイルが `path` の形で名指しされていない")
+    if not re.search(r"test", item, re.I):
+        w.append("テスト(ファイルか確かめ方)の指定がない")
+    if len(item) < 80:
+        w.append("短すぎる(型・境界の例・例外を書くと単位の往復が減る)")
+    return w
+
+
 def context_files(root: Path, text: str, max_files: int = 3, max_bytes: int = 8192) -> str:
     """Inline small existing files the task text names (`path/like.py`): the unit starts with the types and
     helpers it must use instead of spending turns reading them (and guessing wrong)."""
@@ -212,6 +224,9 @@ def main() -> int:
 
     running, done, won, speculated = [], [], {}, set()
     pending = list(units)
+    for n, it in enumerate(items, 1):
+        for msg in task_warnings(it):
+            print(f"warning: task {n}: {msg}", flush=True)
     limit, why = plan_jobs(len(units), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
     print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # anchor: <root>/.claude/worktrees path

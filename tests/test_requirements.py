@@ -1682,3 +1682,13 @@ class R14ContextTest(ReqKit):
         self.assertIn("--- app.py", ctx)
         self.assertNotIn("big.py", ctx)
         self.assertNotIn("passwd", ctx)
+
+
+class R15TaskLintTest(unittest.TestCase):
+    def test_vague_task_warns_and_specified_task_does_not(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        self.assertEqual(len(b.task_warnings("1. 何かいい感じに直して")), 3)
+        good = ("1. 集計: `src/x/agg.py` に `total(rows: list[int]) -> int` を追加。空なら 0、負数は ValueError。"
+                "テストは `tests/test_agg.py`。既存ファイルは変えない。")
+        self.assertEqual(b.task_warnings(good), [])
