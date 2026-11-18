@@ -83,7 +83,7 @@ def main() -> int:
         base = cfg["scale"]["base_branch"]
         sh(root, "fetch", "-q", "origin", base)
         start = f"origin/{base}" if git(root, "rev-parse", "-q", "--verify", f"origin/{base}").strip() else base
-        sw = sh(root, "switch", "-c", a.branch, start)
+        sw = sh(root, "switch", "--no-track", "-c", a.branch, start)  # no upstream: .git/config is not writable in the sandbox
         if sw.returncode != 0:
             print("could not create the work branch: " + (sw.stderr.strip() or sw.stdout.strip())[:200], file=sys.stderr)
             return 2
