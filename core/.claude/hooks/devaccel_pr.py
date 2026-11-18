@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from devaccel_common import git, load_config, match_any  # noqa: E402
+from devaccel_common import git, load_config, match_any, trusted_root  # noqa: E402
 from stop_gate import SKIP_RE  # noqa: E402
 
 # "Changes can't modify their own checks": touching the verification machinery always
@@ -136,14 +136,15 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
     # display only: behaviour changed but no docs touched (parallel units drift apart here)
     docs_untouched = any(not match_any(f, DOCS) for f in files) and not any(match_any(f, DOCS) for f in files)
 
-    escalations = 0
-    log = root / ".claude" / "state" / "gate-log.jsonl"
+    escalations = 0  # the gate logs in the main checkout (worktrees are deleted); count this branch only
+    log = trusted_root({"cwd": str(root)}) / ".claude" / "state" / "gate-log.jsonl"
     if log.exists():
         for line in log.read_text(encoding="utf-8").splitlines():
             try:
-                escalations += json.loads(line).get("result") == "escalate"
+                e = json.loads(line)
             except ValueError:
-                pass
+                continue
+            escalations += e.get("result") == "escalate" and e.get("branch", head) == head
 
     reasons = []
     if not check_ok:

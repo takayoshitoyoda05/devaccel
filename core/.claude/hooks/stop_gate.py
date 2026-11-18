@@ -204,7 +204,7 @@ def main() -> int:
         return 0
 
     sig = signature(root, relevant)
-    state = load_state(root)
+    state = load_state(anchor)
     sid = data.get("agent_id") or data.get("session_id", "default")  # each /batch unit has its own rounds
     sess = state.setdefault(sid, {"ok": "", "seen": "", "streak": 0, "noticed": []})
     sess["t"] = time.time()
@@ -218,6 +218,7 @@ def main() -> int:
     base = base_ref(root, cfg["scale"]["base_branch"])
     event = {
         "session": sid,
+        "branch": branch,  # devaccel_pr counts escalations for its own branch
         "mode": mode,
         "result": result,
         "secs": round(secs, 1),
@@ -227,29 +228,29 @@ def main() -> int:
     reply: dict = {}
 
     if result == "timeout":
-        log_event(root, event)
+        log_event(anchor, event)
         reply["systemMessage"] = (
             f"[devaccel] check.sh fast が {gate['timeout_sec']}s で打ち切られました。"
             "検査は未完了です。fast の段を減らすか /devaccel-setup で再計測してください。"
         )
     elif result == "missing":
-        log_event(root, event)
+        log_event(anchor, event)
     elif result == "pass":
         sess["ok"], sess["streak"] = sig, 0
-        log_event(root, event)
+        log_event(anchor, event)
     else:
         stage, tail = failed_section(output)
         event["stage"] = stage
         max_rounds = int(gate["max_rounds"])
         if mode == "observe":
             event["result"] = "would_block"
-            log_event(root, event)
-            save_state(root, state)
+            log_event(anchor, event)
+            save_state(anchor, state)
             return 0
         sess["streak"] += 1
         event["streak"] = sess["streak"]
         if sess["streak"] <= max_rounds:
-            log_event(root, event)
+            log_event(anchor, event)
             reply["decision"] = "block"
             reply["reason"] = (
                 f"[devaccel] check.sh fast の段 `{stage}` が失敗しました"
@@ -258,7 +259,7 @@ def main() -> int:
             )
         else:
             event["result"] = "escalate"
-            log_event(root, event)
+            log_event(anchor, event)
             sess["streak"] = 0
             reply["decision"] = "block"
             reply["reason"] = (
@@ -275,9 +276,9 @@ def main() -> int:
             sess["noticed"] = sess["noticed"] + [k for k, _ in fresh]  # once per kind per session
             note = "[devaccel] " + " / ".join(m for _, m in fresh)
             reply["systemMessage"] = (reply.get("systemMessage", "") + "\n" + note).strip()
-            log_event(root, {"session": sid, "result": "notice", "notes": [m for _, m in fresh]})
+            log_event(anchor, {"session": sid, "result": "notice", "notes": [m for _, m in fresh]})
 
-    save_state(root, state)
+    save_state(anchor, state)
     emit(reply)
     return 0
 

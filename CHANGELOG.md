@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.4 (2026-11-18)
+- **修正(0.6.0 の退行)**: `Read(/.claude/worktrees/**)` の deny を削除。Read deny は Edit も止めるため、/batch の単位が自分の worktree を編集できず全滅した。既存プロジェクトは settings.json から手で削除。
+- ゲートの記録と状態を本体(trusted root)に書く。単位の worktree に書いていたため、worktree の片付けと一緒に消えていた(ゲート自体は単位内で動いていたことを実機の SubagentStop 入力で確認)。記録に `branch` を追加し、PR スクリプトは自分のブランチの判断依頼だけを数える。
+
 ## 0.6.3 (2026-11-18)
 - settings 生成: `CLAUDE_CODE_SUBAGENT_MODEL=sonnet`(/batch の単位・Explore などサブエージェントの既定モデル)。既存プロジェクトは settings.json の env に手で追加。
 

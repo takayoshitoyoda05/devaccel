@@ -139,6 +139,9 @@ class KitTest(unittest.TestCase):
                env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce"},
                stdin=json.dumps({"session_id": "s", "agent_id": "a1", "cwd": str(wt)}))
         self.assertEqual(json.loads(r.stdout or "{}").get("decision"), "block", r.stdout + r.stderr)
+        log = (self.root / ".claude/state/gate-log.jsonl").read_text()  # kept in the main checkout
+        self.assertIn('"session": "a1"', log)
+        self.assertIn('"branch": "unit"', log)
         # the unit cannot switch its gate off or neuter check.sh in its own worktree
         (wt / ".claude/project.json").write_text('{"gate": {"mode": "off"}}')
         (wt / "scripts/check.sh").write_text("#!/usr/bin/env bash\necho '== ok: tests (0s)'\n")

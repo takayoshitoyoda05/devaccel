@@ -258,8 +258,9 @@ def render_settings(presets: list[str]) -> dict:
                      "Bash(git * --out*)", "Bash(git * --ext*)", "Bash(gh *)",
                      "Bash(git push --force*)", "Bash(git push -f *)", "Bash(git push * --force*)",
                      "Bash(git remote add *)", "Bash(git remote set-url *)",
-                     # token hygiene: never worth reading (sibling worktrees, venv, lockfile)
-                     "Read(/.claude/worktrees/**)", "Read(/.venv/**)", "Read(/uv.lock)"],
+                     # token hygiene: never worth reading. NOT .claude/worktrees/**: a Read deny also
+                     # blocks Edit there, and /batch units work inside .claude/worktrees/<unit>/ (0.6.4)
+                     "Read(/.venv/**)", "Read(/uv.lock)"],
         },
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [
