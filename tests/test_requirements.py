@@ -1606,3 +1606,27 @@ class R9BatchSafetyTest(ReqKit):
         sh(self.root, "git", "config", "core.fsmonitor", f"touch {marker}; echo")
         c.git(self.root, "status", "--porcelain")
         self.assertFalse(marker.exists())
+
+
+class R10ForgedLinkTest(ReqKit):
+    def test_gate_blocks_redirected_worktree_link_without_running_git_there(self):
+        """A unit that points its .git file at a forged git dir (with a command-running config) is blocked,
+        and the forged config never executes."""
+        wt = self.root / ".claude" / "worktrees" / "u9"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "u9", str(wt))
+        (wt / "app.py").write_text("X = 5\n")
+        evil = self.tmp / "evil"
+        sh(self.tmp, "git", "init", "-q", str(evil))
+        marker = self.tmp / "pwned"
+        sh(evil, "git", "config", "core.fsmonitor", f"touch {marker}; echo")
+        sh(evil, "git", "config", "filter.x.clean", f"touch {marker}; cat")
+        fake = evil / ".git" / "worktrees" / "u9"
+        fake.mkdir(parents=True)
+        (fake / "commondir").write_text(str(self.root / ".git") + "\n")  # looks like the real repo to git
+        (fake / "HEAD").write_text("ref: refs/heads/main\n")
+        (fake / "config.worktree").write_text(f"[core]\n\tfsmonitor = touch {marker}; echo\n")
+        (fake / "gitdir").write_text(str(wt / ".git") + "\n")
+        (wt / ".git").write_text(f"gitdir: {fake}\n")
+        d, _ = self.gate(wt, agent="u9")
+        self.assertEqual(d.get("decision"), "block")
+        self.assertFalse(marker.exists())

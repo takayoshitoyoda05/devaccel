@@ -20,6 +20,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
 from devaccel_common import (  # noqa: E402
+    worktree_link_ok,
     check_script_for,
     confined,
     emit,
@@ -245,7 +246,10 @@ def main() -> int:
     cwd = str(data.get("cwd") or "")
     if "/.claude/worktrees/" in cwd + "/":
         unit = True
-        if "/.claude/worktrees/" not in str(root) + "/":  # resolved to the main checkout: link broken
+        wt_top = Path(str(Path(cwd).resolve()).split("/.claude/worktrees/")[0]) / ".claude" / "worktrees" / \
+            str(Path(cwd).resolve()).split("/.claude/worktrees/")[1].split("/")[0]
+        # broken or redirected .git link: no git runs here (a forged git dir could carry commands)
+        if "/.claude/worktrees/" not in str(root) + "/" or not worktree_link_ok(wt_top, anchor):
             # a unit must not escape its gate by breaking .git: block like a failure, escalate after max_rounds
             sid = str(data.get("agent_id") or data.get("session_id") or "default")
             sess = load_session(anchor, sid)

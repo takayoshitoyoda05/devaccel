@@ -81,6 +81,21 @@ def trusted_root(data: dict | None = None) -> Path:
     return Path(common).parent if common.endswith("/.git") else cwd
 
 
+def worktree_link_ok(tree: Path, anchor: Path) -> bool:
+    """A devaccel worktree's .git file must point at <anchor>/.git/worktrees/<x> (read as a plain file, no git:
+    the file is agent-writable, and git would honour config in whatever git dir it names)."""
+    try:
+        line = (tree / ".git").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not line.startswith("gitdir: "):
+        return False
+    target = Path(line[len("gitdir: "):].strip())
+    if not target.is_absolute():
+        target = tree / target
+    return target.resolve().parent == (anchor / ".git" / "worktrees").resolve()
+
+
 def project_root(data: dict | None = None) -> Path:
     """The tree being *checked* (not trusted). CLAUDE_PROJECT_DIR stays the main checkout even inside
     a worktree (/batch units), so prefer the hook's cwd when it is a worktree of the same repo."""
