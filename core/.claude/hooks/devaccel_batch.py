@@ -115,6 +115,8 @@ def main() -> int:
                     help="run the K longest tasks (by text length, a proxy for size) on sonnet; the slowest unit "
                          "sets the wall clock")
     ap.add_argument("--no-context", action="store_true", help="do not inline the files the tasks name")
+    ap.add_argument("--no-speculate", action="store_true",
+                    help="don't start a backup copy of a straggling unit once half the units have passed")
     ap.add_argument("--hedge", type=int, default=1, help="run each task N times; the first copy to pass wins")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees afterwards")
     ap.add_argument("--dry-run", action="store_true", help="split and show the units only")
@@ -195,7 +197,19 @@ def main() -> int:
             return "no commit"
         return "ok" if gate_passed(root, u["branch"], u["t"]) else "gate not passed"
 
-    running, done, won = [], [], {}
+    def backup(u: dict) -> dict | None:
+        """A second copy of a straggler's task in a fresh worktree (speculative execution)."""
+        tag = f"{slug}-{u['i']}s"
+        br, wt = f"unit/{tag}", root / ".claude" / "worktrees" / tag
+        r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", br, str(wt), start],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        v = {"i": u["i"], "k": 9, "branch": br, "wt": wt, "cmd": u["cmd"], "backup": True}
+        units.append(v)
+        return v
+
+    running, done, won, speculated = [], [], {}, set()
     pending = list(units)
     limit, why = plan_jobs(len(units), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
     print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
@@ -210,6 +224,22 @@ def main() -> int:
                                       stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
             running.append(u)
         time.sleep(0.5)
+        passed = sorted(x["secs"] for x in done if x.get("status") == "ok")
+        if not a.no_speculate and len(passed) * 2 >= len(items) and len(running) < limit:
+            med = passed[len(passed) // 2]
+            for u in list(running):  # a straggler gets one backup copy; the first copy to pass wins
+                late = time.time() - u["t"] > max(1.4 * med, med + 15)
+                if late and u["i"] not in won and u["i"] not in speculated and len(running) < limit:
+                    v = backup(u)
+                    if v is not None:
+                        speculated.add(u["i"])
+                        v["t"] = time.time()
+                        v["p"] = subprocess.Popen(v["cmd"], cwd=v["wt"], stdout=subprocess.PIPE,
+                                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+                                                  env=env, start_new_session=True)
+                        running.append(v)
+                        print(f"unit {u['i']} is straggling ({round(time.time() - u['t'])}s vs median {med}s): "
+                              "started a backup copy", flush=True)
         for u in list(running):
             if u["p"].poll() is None:
                 continue
