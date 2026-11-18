@@ -117,6 +117,9 @@ install が `.claude/settings.json` にサンドボックス設定を書く。�
 
 ## 開発
 
-```bash
-python3 -m unittest discover -s tests -v
-```
+品質の担保は 4 層。単体テストでは Claude Code 本体・サンドボックスとの組み合わせの不具合を捕まえられない(0.6〜0.8 の退行はすべてこの種類)ので、3 を必ず挟む。
+
+1. **CI**(`.github/workflows/ci.yml`): ruff・pyright・単体テスト(guard / ゲート / 振り分けの欠陥注入 / land / install・update・doctor)。
+2. 手元: `python3 -m unittest discover -s tests -v`
+3. **リリース前スモーク**(実際の Claude Code、約 $0.3): `python3 tests/smoke/release_smoke.py` — サンドボックス内の Bash 1 回の遅延と、worktree の単位が拒否なしにコミットと PR 本文まで行けるかを確認。
+4. 大きい変更は、結論を伝えずにコードだけ渡した別エージェントでレビュー(`/code-review`、ultra は使わない)。計測は `tests/bench/`。
