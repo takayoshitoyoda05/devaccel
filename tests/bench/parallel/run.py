@@ -3,7 +3,8 @@
 Arms (choose with --arms):
   seq_old   one session, implements in order, then the old 5-6 turn PR flow (notes, add, commit, push, PR script)
   seq_ship  one session, implements in order, then devaccel-pr (one-command devaccel_ship.py)
-  par       /devaccel-batch: devaccel-unit (haiku) units implement only, parent integrates with ship --units -> 1 PR
+  par       /devaccel-batch as a user would call it (the skill may choose sequential for small work)
+  par_force /devaccel-batch, told to always run devaccel-unit (haiku) units in parallel, then ship --units
 Measured per arm: wall clock until the PR exists, cost (+ per-model breakdown), turns, PR labels,
 held-out tests on the integrated result. Each arm's PRs/branches/worktrees are cleaned up afterwards.
 
@@ -96,8 +97,10 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
     sh(["git", "checkout", "-q", "main"], trial)
     sh(["git", "pull", "-q"], trial)
     before = {p["number"] for p in open_prs(trial)}
-    if arm == "par":
-        prompt = "/devaccel-batch " + tasks + "\n" + TAIL
+    if arm in ("par", "par_force"):
+        force = ("\n計測のため、使う条件(件数・規模)にかかわらず、必ず devaccel-unit を単位の数だけ並列に起動して実装し、"
+                 "ship --units で統合して。" if arm == "par_force" else "")
+        prompt = "/devaccel-batch " + tasks + force + "\n" + TAIL
     else:
         sh(["git", "checkout", "-q", "-B", f"bench/{arm}", "main"], trial)
         how = OLD_PR if arm == "seq_old" else "最後に devaccel-pr スキルで PR を 1 本作って。"
