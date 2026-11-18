@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.1 (2026-11-18)
+修正後の再監査 2 本と自動レビューの指摘を修正。テスト 112 → 125 本(すべてミューテーションで失敗を確認)。
+- guard: コミットメッセージを判定から外すのは、コマンド全体が素の `git commit … -m "…"` 1 つで改行を含まないときだけ(0.10.0 のこの処理は `echo 'git commit -m ' ; sudo … ; echo '` で中間のコマンドを隠せた。v0.10.0 タグにはこの穴がある)。`(rm -rf /)`・`$(rm -rf ~)`・`rm -rf ./*`・`rm -rf ~/.` を拒否。
+- 隔離: pid/ipc/uts 名前空間を分け、新しいセッション(端末への文字注入を防ぐ)、標準入力なし。`$HOME` の許可リストを必要な下位ディレクトリに限定(`~/.cargo/credentials.toml`・`~/.gitconfig` などは見えない)。入れ子の `.env` と本体側の `.env` も隠す。
+- ゲート: 状態ファイル・project.json の型違い(トップレベルが配列等を含む)で落ちない。壊れた worktree でも通知ではなくブロックし、上限回数で人へ。エラーの記録に session/scope/mode/branch。
+- PR: 証拠は HEAD を取り出したきれいなツリーで作る(未追跡・ignore されたファイルが結果に効かない)。pytest は別プロセスで収集した件数と実行件数を照合(偽の要約を出して `os._exit(0)` するテストを検出、テスト 0 件のプロジェクトは失敗にしない)。
+- doctor: denyWrite の全項目を確認、matcher `Bash|Edit` も配線ありと判定。install: core・lock・.gitignore もシンボリックリンク越しに書かない。settings: `.claude/state`・lock・skills・`settings.local.json` の Edit に確認、`settings.local.json` も denyWrite。CI と生成 workflow の Actions を SHA で固定。
+- 文書: README・requirements・traceability・design の古い記述と数値を修正。難課題を sonnet・各 3 回で再計測(正確さ・コスト・時間とも同等)。
+
 ## 0.10.0 (2026-11-18)
 公開前の独立監査 4 本(脆弱性・約束の検証・改善余地・初見利用者)と自動レビューの指摘を修正。テスト 85 → 112 本(すべてミューテーションで失敗を確認)。
 - **H1 検査の隔離(D16)**: ゲートと land は check.sh を bubblewrap で実行(読み取り専用、`$HOME` は許可リスト、書けるのは作業ツリーだけ、`.git` と本体の検証基盤は読み取り専用、`.env` を隠し、環境変数は最小限)。フックはサンドボックスの外で動くため、エージェントの書いたテストが利用者の全権限で動いていた。bwrap が無ければ未検査と表示。

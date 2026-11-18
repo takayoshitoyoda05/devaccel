@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
+sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
 from devaccel_common import (  # noqa: E402
     check_script_for,
     confined,
@@ -107,7 +107,7 @@ def run_check(root: Path, timeout: int, anchor: Path | None = None,
     cmd, env = ["bash", "-c", text, "check.sh", "fast"], {**os.environ}
     if sandbox:  # check.sh runs tests the agent wrote: never with the user's full rights (hooks are unsandboxed)
         protect = [root / ".claude", root / "scripts" / "check.sh"]
-        wrapped = confined(cmd, root, protect)
+        wrapped = confined(cmd, root, protect, mask_env_in=[anchor] if anchor and anchor != root else None)
         if wrapped is None:
             return "missing", 0, "bubblewrap (bwrap) が無いので check.sh を隔離して実行できません(gate.sandbox)", 0.0
         cmd, env = wrapped
@@ -193,9 +193,14 @@ def load_session(root: Path, sid: str) -> dict:
         raw = json.loads(_state_path(root, sid).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raw = {}
-    sess = dict(SESSION_DEFAULT, **(raw if isinstance(raw, dict) else {}))
-    if not isinstance(sess["noticed"], list):
-        sess["noticed"] = []
+    raw = raw if isinstance(raw, dict) else {}
+    sess = dict(SESSION_DEFAULT)
+    for k, d in SESSION_DEFAULT.items():  # wrong types fall back (a crash would fail open)
+        v = raw.get(k, d)
+        sess[k] = v if isinstance(v, type(d)) and not (isinstance(d, int) and isinstance(v, bool)) else d
+    if isinstance(raw.get("stage"), str):
+        sess["stage"] = raw["stage"]
+    sess["noticed"] = [x for x in sess["noticed"] if isinstance(x, str)]
     return sess
 
 
@@ -223,8 +228,12 @@ def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[
 # ---------- main ----------
 
 
+CTX: dict = {}  # for the error log: what we knew when it failed
+
+
 def main() -> int:
     data = read_stdin_json()
+    CTX.update({"session": str(data.get("agent_id") or data.get("session_id") or "")})
     root = project_root(data)  # what is checked (may be a /batch worktree)
     anchor = trusted_root(data)  # config and check.sh come from here, not from the worktree
     cfg = load_config(anchor)
@@ -237,15 +246,28 @@ def main() -> int:
     if "/.claude/worktrees/" in cwd + "/":
         unit = True
         if "/.claude/worktrees/" not in str(root) + "/":  # resolved to the main checkout: link broken
-            log_event(anchor, {"session": str(data.get("agent_id") or ""), "scope": "unit", "result": "missing",
+            # a unit must not escape its gate by breaking .git: block like a failure, escalate after max_rounds
+            sid = str(data.get("agent_id") or data.get("session_id") or "default")
+            sess = load_session(anchor, sid)
+            sess["streak"] += 1
+            sig = "broken-worktree:" + cwd
+            if sess["escalated"] == sig:
+                return 0
+            reason = "作業単位の worktree が git として壊れていて検査できません(.git リンクを元に戻してください)。"
+            reply = _block_or_escalate(sess, sig, "worktree", reason, int(gate["max_rounds"]))
+            log_event(anchor, {"session": sid, "scope": "unit", "mode": "enforce", "stage": "worktree",
+                               "result": "escalate" if "systemMessage" in reply else "fail",
                                "error": "worktree is not its own git checkout"})
-            emit({"systemMessage": "[devaccel] 作業単位の worktree が git として壊れていて検査できません(未検証)。"})
+            emit(reply)
+            save_session(anchor, sid, sess)
             return 0
     mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
+    CTX.update({"scope": "unit" if unit else "session", "mode": mode})
     if mode == "off" or not is_git_repo(root):
         return 0
 
     branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    CTX["branch"] = branch
     if branch and not unit and match_any(branch, gate["skip_branches"]):  # units cannot opt out by renaming
         return 0
 
@@ -354,7 +376,7 @@ if __name__ == "__main__":
     except Exception as e:  # never break the session because of the gate itself, but leave a trace
         print(f"[devaccel] stop_gate internal error: {e}", file=sys.stderr)
         try:
-            log_event(trusted_root(None), {"result": "error", "error": repr(e)[:300]})
+            log_event(trusted_root(None), {**CTX, "result": "error", "error": repr(e)[:300]})
         except Exception:
             pass
         sys.exit(0)

@@ -22,14 +22,14 @@ import sys
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
+sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
 from devaccel_common import emit, load_config, read_stdin_json, trusted_root  # noqa: E402
 
 # rm with both -r and -f aimed at a broad target (/, ~, $HOME, *, ., .., .git)
 _RM = re.compile(
     r"\brm\s+(?=[^;&|]*(-[a-zA-Z]*[rR]|--recursive))(?=[^;&|]*(-[a-zA-Z]*f|--force))[^;&|]*?"
-    r"(?:\s|^)(?:/|~/?|~/\*|\$HOME/?|\$\{HOME\}/?|\$HOME/\*|\$\{HOME\}/\*|\*|\./?|\.\./?|\.git/?|/\*)"
-    r"(?=\s|$|;|&|\|)"
+    r"(?:\s|^)(?:/|~/?|~/\*|~/\.|\$HOME/?|\$\{HOME\}/?|\$HOME/\*|\$\{HOME\}/\*|\*|\./?|\./\*|\.\./?|\.git/?|/\*)"
+    r"(?=\s|$|;|&|\||\))"  # ")" ends a target too: (rm -rf /), $(rm -rf ~)
 )
 
 DENY: list[tuple[re.Pattern, str]] = [

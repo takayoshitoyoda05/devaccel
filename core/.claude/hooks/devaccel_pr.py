@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
+sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
 from devaccel_common import check_script_for, confined, git, load_config, match_any, trusted_root  # noqa: E402
 from stop_gate import SKIP_RE  # noqa: E402
 
@@ -84,12 +84,49 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
     out = (r.stdout + r.stderr).splitlines()
     ok = r.returncode == 0
     stages = [ln for ln in out if re.match(r"== (ok|failed|missing): [\w-]+ \(", ln)]  # no forged free text
-    if (ok and "pytest" in base_check and "== ok: tests (" in "\n".join(out)
-            and not re.search(r"\b[1-9]\d* passed\b", "\n".join(out))):
-        # pytest reported success without a single passed test (os._exit(0) in a test, testpaths elsewhere...)
-        ok = False
-        stages.append("== failed: tests (0 passed reported)")
+    if ok and "pytest" in base_check and "== ok: tests (" in "\n".join(out):
+        # cross-check with a separate collection: a test that prints a fake summary and os._exit(0)s,
+        # or one that stops pytest early, leaves "ran" != "collected"
+        ran = _pytest_ran("\n".join(out))
+        collected = _pytest_collected(base_check, workdir, sandbox, int(cfg["gate"]["timeout_sec"]))
+        if collected is None or (collected > 0 and ran != collected):
+            ok = False
+            stages.append(f"== failed: tests (ran {ran} of {collected} collected)")
     return ok, stages, ("" if ok else "\n".join(out[-30:])), round(time.time() - t0, 1)
+
+
+_OUTCOMES = r"(\d+) (passed|failed|skipped|xfailed|xpassed|errors?|deselected)"
+
+
+def _pytest_ran(output: str) -> int:
+    """Total from pytest's final summary line ("3 passed, 1 skipped in 0.1s"); 0 if none."""
+    lines = [ln for ln in output.splitlines() if re.search(_OUTCOMES + r".* in [\d.]+s", ln)]
+    if not lines:
+        return 0
+    return sum(int(n) for n, kind in re.findall(_OUTCOMES, lines[-1]) if kind != "deselected")
+
+
+def _pytest_collected(check_text: str, workdir: Path, sandbox: bool, timeout: int) -> int | None:
+    m = re.search(r'^R="([^"]*)"', check_text, re.M)
+    runner = m.group(1) if m else ""
+    cmd = ["bash", "-c", f"{runner} pytest --collect-only -q -p no:cacheprovider"]
+    env = {**os.environ}
+    if sandbox:
+        wrapped = confined(cmd, workdir)
+        if wrapped is None:
+            return None
+        cmd, env = wrapped
+    try:
+        r = run(cmd, workdir, timeout=timeout * 2, env=env)
+    except subprocess.TimeoutExpired:
+        return None
+    text = r.stdout + r.stderr
+    if r.returncode == 5 or "no tests collected" in text:
+        return 0
+    m2 = re.search(r"(\d+) tests? collected", text)
+    if r.returncode != 0 or not m2:
+        return None
+    return int(m2.group(1))
 
 
 def static_triage(root: Path, cfg: dict, base: str, ref: str) -> tuple[list[str], list[str], list[str]]:
@@ -146,7 +183,11 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
             acs += [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
                     if re.match(r"\s*- \[[ xX]\] ", ln)]
 
-    check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, root)
+    # judge the commit, not the working tree: untracked/ignored files (a stray conftest.py) must not count
+    with tempfile.TemporaryDirectory(prefix="devaccel-pr-") as snap:
+        arch = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", "HEAD"], capture_output=True)
+        subprocess.run(["tar", "-x", "-C", snap], input=arch.stdout, capture_output=True)
+        check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, Path(snap))
     base_sha = (git(root, "rev-parse", "-q", "--verify", f"origin/{base_branch}").strip()
                 or git(root, "rev-parse", "-q", "--verify", base_branch).strip())
     # display only: behaviour changed but no docs touched (parallel units drift apart here)

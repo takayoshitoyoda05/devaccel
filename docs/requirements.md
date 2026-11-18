@@ -22,7 +22,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 
 ### 1.3 目標(評価軸)
 
-1. トークン削減
+1. トークン削減(ユーザーの目標。実測では対話のトークンは減っておらず、キットの価値は無人経路の検証に絞った。D14・D15)
 2. 正確さ
 3. 高速開発
 4. 多様なプロジェクトへの対応と、配布後の変化への追随
@@ -144,7 +144,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | GRD-09 | guard は疑似端末ラッパー(`script`、`unbuffer`、`expect`、`empty`、`socat`)と、`.claude/hooks/` を指すワイルドカード・ブレース展開、`cd .claude/hooks` を deny しなければならない。 | 0.5.3 | unit |
 | GRD-10 | guard は内部エラー時に許可してはならず(ask に倒す)、`project.json` の不正な正規表現で組み込み規則を無効にしてはならず、有効な `guard.deny_regex` / `ask_regex` は適用しなければならない。 | 0.1.1 | unit |
 | GRD-11 | guard は通常の開発コマンド(具体的なパスの `rm -rf`、`git commit -F`、`2>&1`、検査語を含む引用符つき文字列やヒアドキュメントでのファイル作成、`.env` という語を含むだけのコマンド)を deny / ask にしてはならない。 | 0.1.12、0.2.0、D5b | unit |
-| GRD-12 | guard は PR/land スクリプトの横(作業単位の `.claude/hooks/`)に lock 外のファイル(`json.py` 等、`__pycache__`)があれば実行を拒否しなければならない(モジュールのすり替え)。フックは自分のディレクトリを `sys.path` の末尾に追加しなければならない。 | 0.10.0 監査 H3 | unit |
+| GRD-12 | guard は PR/land スクリプトの横(作業単位の `.claude/hooks/`)に lock 外のファイル(`json.py` 等、`__pycache__`)があれば実行を拒否しなければならない(モジュールのすり替え)。(sys.path の順序はスクリプト実行では防御にならないため、余剰ファイルの拒否と sandbox の denyWrite で守る。) | 0.10.0 監査 H3 | unit |
 
 ### 2.7 PR(`devaccel_pr.py`)
 
@@ -154,7 +154,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | PR-02 | PR 本文はスクリプトが機械的に組み立て、振り分けラベルと理由、`check.sh full` の結果と段、変更規模、実動作確認の記録、設計書と受け入れ条件、失敗時の出力末尾を含まなければならない。 | D11 | unit |
 | PR-03 | 検査は base(merge-base)の `scripts/check.sh full` をブランチの木に対して実行したものでなければならず、ブランチ側で `check.sh` を弱めても結果に影響してはならない。設定は trusted root から読み、判定の前に origin の base を fetch しなければならない。 | 0.3.1、0.5.0、0.8.3 | integration |
 | PR-04 | 次のいずれかに当たる PR は理由つきで `needs-human` にしなければならない: (a) base の `check.sh full` が失敗・timeout・欠如、(b) 実動作確認の記録が空、(c) 変更ファイル数が `large_if_files_over` 超、(d) `risky_paths` に一致、(e) テストファイルの削除、(f) 既存テストの行削除、(g) skip / xfail の追加、(h) 同じブランチでゲートがエスカレーションを記録、(i) 変更した設計書に未チェックの受け入れ条件。 | 0.3.1、0.7.0、0.6.4 | integration |
-| PR-05 | 検証基盤(`scripts/check.sh`、`.claude/**`、`.github/**`、`CLAUDE.md`、`AGENTS.md`、`conftest.py`、`pytest.ini`、`setup.cfg`、`tox.ini`、`pyrightconfig.json`、`ruff.toml`、`pyproject.toml` のツール設定行)に触れる PR は、`project.json` の内容にかかわらず常に `needs-human` にしなければならない。 | 0.3.1、D6 | integration |
+| PR-05 | 検証基盤(`scripts/check.sh`、`.claude/**`、`.github/**`、`CLAUDE.md`、`AGENTS.md`、`conftest.py`、`pytest.ini`、`setup.cfg`、`tox.ini`、`pyrightconfig.json`、`ruff.toml`、`pyproject.toml`(0.10.0 以降は変更すべて。入れ子の同名ファイルと `.gitattributes` も)に触れる PR は、`project.json` の内容にかかわらず常に `needs-human` にしなければならない。 | 0.3.1、D6 | integration |
 | PR-06 | PR-04・PR-05 のどれにも当たらない変更(S / M 規模、テストは追加のみ、確認の記録あり、検査通過)は `evidence-ok` にしなければならない。docs 未更新は表示だけで判定に使ってはならない。 | 0.7.0、D12 | integration |
 | PR-07 | `--verify-notes` は、リポジトリ内か一時ディレクトリにある 4096 バイト以下のファイルだけを受け付け、`.env*` という名前・認証情報らしい内容・存在しないファイルは明確なエラーで拒否しなければならない。 | 0.4.0、0.8.3 | unit |
 | PR-08 | 本文の最終行は `<!-- devaccel:evidence base=<sha> head=<sha> -->` でなければならず、記録や受け入れ条件に含まれる同じ文字列は無害化して、偽のマーカーを作れないようにしなければならない。 | 0.5.0 | unit |

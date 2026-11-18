@@ -9,8 +9,8 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 - 正確さは LLM の審査ではなく **機械の検査 + 実際に動かす確認** で担保する。
 
 **正直な現状(2026-11 の実測。各 2 回、n が小さい)**
-- 小さな機能追加 3 課題(sonnet): 正確さは素の Claude Code と同等(隠しテスト全通過)。0.8.3 で時間 約 37〜40 秒 対 39 秒、コスト +4〜12%。トークンは**減っていない**。
-- 罠つき難課題 3 課題(haiku、0.7.2 時点): 正確さは同等、時間は約 2 倍(最新版では未再計測)。
+- 小さな機能追加 3 課題(sonnet): 正確さは素の Claude Code と同等(隠しテスト全通過)。0.8.3 で時間 約 37〜40 秒 対 39 秒、コスト +4〜12%(条件と回によって差がある。D14)。トークンは**減っていない**。
+- 罠つき難課題 3 課題(sonnet、各 3 回、0.10.0): 正確さは同等(9/9 対 9/9)、コスト・時間とも同等(中央値 $0.199 / 46 秒 対 $0.200 / 44 秒)。
 - 振り分けが仕込んだ欠陥を見逃さないことは**合成テスト**で確認(8 種)。実際の PR での誤検知・見逃し率は未計測(実 PR は十数本)。
 - 並列(`/batch`)が逐次より速いかは**未計測**。`/devaccel-tune` による継続調整は実データでは未実証。
 - 計測は `tests/bench/`、記録は docs/design.md D14。ベンチとリリース前スモークの対象(試験用プロジェクト)は非公開(`--trial` に自分の小さな Python CLI を指定し、`tests/bench/tasks` を合わせれば同じ手順で測れる)。
@@ -27,7 +27,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.10.0   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.10.1   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
@@ -55,6 +55,8 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `.claude/skills/devaccel-{setup,tune,batch}` | core | 手動専用(説明は常駐しない) |
 | `.claude/skills/devaccel-pr` + `hooks/devaccel_pr.py` | core | 証拠つき PR と `evidence-ok` / `needs-human` の振り分け |
 | `hooks/devaccel_land.py` | core | 並列 PR を最新 base 上でまとめて再検証し、通ったものをマージ(人が実行) |
+| `hooks/devaccel_common.py`・`hooks/devaccel_report.py` | core | 共通処理(隔離実行を含む)・ゲート記録の要約(doctor / tune) |
+| `.worktreeinclude`・`docs/design/TEMPLATE.md`・`docs/adr/TEMPLATE.md` | project | worktree に持ち込むファイル・設計書と ADR のひな形 |
 | `CLAUDE.md` | project | 進め方(S/M/L)と検証の作法 |
 | `.claude/skills/design` | project | L 規模: 質問 → 受け入れ条件つき設計書 → 仕様照合 |
 | `.claude/skills/verify-app` | project | 「完了」前に実際に動かす手順(setup が生成) |
@@ -69,14 +71,14 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 
 - 置き場所で既定が違う(0.8.0): 対話セッション `mode` = `off`(人が見ている。実測で正確さの上積みなし・時間だけ増えた)、/batch の単位(worktree)`unit_mode` = `enforce`(誰も見ていない。失敗段を返して直させ、3 回直しても通らなければ 4 回目の失敗でユーザーへ)。値は `off` / `observe`(記録のみ)/ `enforce`。
 - 個人で一時的に変える: `.claude/settings.local.json` に `{"env": {"DEVACCEL_GATE_MODE": "off"}}`(doctor が表示)。
-- `spike/*` ブランチ、docs だけの変更、前回から変化のないターンでは走らない。
+- `spike/*` ブランチ(対話セッションのみ。作業単位はブランチ名で止められない)、docs だけの変更、前回から変化のないターンでは走らない。
 - 失敗段の修正を `max_rounds`(3)回しても通らなければ(4 回目の失敗で)、Claude は修正をやめてユーザーに判断を仰ぐ。何も変えずにもう一度止めても失敗は再提示される。作業単位では、コミット済みで base に未マージの変更も検査対象。検査できなかった場合(check.sh なし・timeout・内部エラー)は記録し、enforce では表示する。
 - 個人の一時的な上書き `DEVACCEL_GATE_MODE` は対話セッションだけに効く(作業単位のゲートは止まらない)。
 
 ## 注意
 
 - settings.json の `allow` は信頼ダイアログ承認後に有効(deny/ask とフックは常に有効)。
-- 既存の `.claude/settings.json` があるプロジェクトでは マージしない。install が表示するフック(3 イベント)を自分で追記する。
+- 既存の `.claude/settings.json` があるプロジェクトでは マージしない。install が表示する設定一式(hooks・permissions・sandbox・env)を自分でマージし、doctor で確認する。
 - チーム利用: `scripts/check.sh`・`.claude/`・`.github/workflows/` を CODEOWNERS とブランチ保護で守ると、ゲートを緩める変更に人の承認が必要になる。
 - セッション途中でモデルを変えない、スキルに `model:` を書かない(キャッシュが作り直しになる)。
 

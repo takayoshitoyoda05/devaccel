@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
+sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
 from devaccel_common import load_config, project_root  # noqa: E402
 
 

@@ -1,4 +1,4 @@
-> **0.9.0・0.10.0 で更新**: この表は監査時点(テスト 34 本・要件 94 件)のもの。その後 `tests/test_requirements.py` に 51 本(0.9.0)と、0.10.0 の監査修正分を追加し(65 通りのミューテーションで各テストが失敗することを確認)、§2 の穴のうち SET-01..08、INST-01..06、UPD-01/03、DOC-01..08、GATE-03/05..15/16(単位のコミット済み変更)、GRD-01..06/08..11 を埋めた。空振りしていた 2 本(GATE-08 の docs スキップ、GATE-03 の unit_mode 改ざん)も修正。残りは requirements.md §5。
+> **0.9.0・0.10.0 で更新**: この表は監査時点(テスト 34 本・要件 94 件)のもの。その後 `tests/test_requirements.py` に 51 本(0.9.0)と 0.10.x の監査修正分を追加した。追加したテストはすべて、対応するコードを戻すと失敗することを確認済み(各回の内訳は test_requirements.py 冒頭の表)。§2 の穴のうち SET-01..08、INST-01..06、UPD-01/03、DOC-01..08、GATE-03/05..15/16(単位のコミット済み変更)、GRD-01..06/08..11 を埋めた。空振りしていた 2 本(GATE-08 の docs スキップ、GATE-03 の unit_mode 改ざん)も修正。残りは requirements.md §5。
 
 # devaccel requirement ↔ test traceability
 
@@ -231,3 +231,15 @@ Ordered by (chance a regression goes unnoticed) × (impact). Most are cheap: the
 | PERF-01..03 | bench | bench + an automated threshold check | summarize.py prints medians but never compares them with the +5% / +10% / ≥ vanilla limits, so the "verification" is a human reading a table. |
 | PERF-04 | e2e-smoke | e2e-smoke (align threshold) | The requirement says <2 s; smoke uses 3.0 s. One of them should change. |
 | DOC-03 | unit | unit (fix the text first) | The requirement text ("display" for SubagentStop) contradicts §4 #9 (problem since 0.9.0). Also, GATE-15 cites 0.9.0 while the target is 0.8.4. |
+
+
+## 0.10.x で追加した要件の対応
+
+| ID | covered? | テスト |
+|---|---|---|
+| DOC-10 | yes | test_requirements.py::AuditDoctorTest(hooks_wired_structural、doctor_runs_kit_report_isolated、required_denies_and_denywrite)、R3 の doctor 系 |
+| SET-11 | yes | AuditDoctorTest::test_AUD_generated_denywrite、R3 の settings 系 |
+| GATE-17 | yes(bwrap がある環境) | ConfinementTest::test_GATE17_check_runs_confined、R3 の .env/$HOME 系 |
+| GATE-18 | yes | GateHardeningTest::test_GATE_unit_cannot_opt_out、UnitCommittedTest、R3 の壊れた worktree |
+| PR-12 | yes | TriageEvasionTest(6 本)、AuditPrTest、R3 の HEAD スナップショット |
+| GRD-12 | partial | ShadowTest(余剰ファイルで拒否)。sys.path の順序は防御にならない(スクリプトのディレクトリは常に sys.path[0])ため、要件の後半は撤回 |

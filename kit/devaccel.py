@@ -184,6 +184,7 @@ def read_lock(root: Path) -> tuple[dict, dict]:
 
 
 def write_lock(root: Path, files: list[str]) -> None:
+    _no_symlink(root, LOCK)
     lines = ["# devaccel lock — one line per core file (sorted). Do not edit by hand.",
              f"version {kit_version()}", f"ref {kit_ref()}"]
     lines += [f"{sha(root / f)}  {f}" for f in sorted(files)]
@@ -225,7 +226,8 @@ SANDBOX = {
     # denyWrite: the trusted root's verification machinery and gate state (Bash writes; Edit is ask-gated).
     # Paths only (no globs); /batch worktrees under .claude/worktrees/ stay writable.
     "filesystem": {"denyWrite": ["./.claude/hooks", "./.claude/skills", "./.claude/state", "./.claude/devaccel.lock",
-                                 "./.claude/project.json", "./.claude/settings.json", "./scripts/check.sh"],
+                                 "./.claude/project.json", "./.claude/settings.json", "./.claude/settings.local.json",
+                                 "./scripts/check.sh"],
                    "denyRead": ["./**/.env", "./**/.env.*", "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker/config.json", "~/.kube", "~/.npmrc", "~/.pypirc"]},
 }
 NET_DOMAINS = {"python": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]}
@@ -273,6 +275,8 @@ def render_settings(presets: list[str]) -> dict:
                 "Edit(./.claude/settings.json)",
                 "Edit(./.claude/project.json)",
                 "Edit(./.github/workflows/**)",
+                "Edit(./.claude/state/**)", "Edit(./.claude/devaccel.lock)", "Edit(./.claude/skills/**)",
+                "Edit(./.claude/settings.local.json)",
                 # the same machinery inside /batch worktrees (.claude/worktrees/<unit>/...)
                 "Edit(**/scripts/check.sh)", "Edit(**/.claude/hooks/**)", "Edit(**/.claude/settings.json)",
                 "Edit(**/.claude/project.json)", "Edit(**/.github/workflows/**)",
@@ -297,6 +301,16 @@ def render_settings(presets: list[str]) -> dict:
                 {"type": "command", "command": HOOK_CMDS["stop"], "timeout": 120}]}],
         },
     }
+
+
+def _no_symlink(root: Path, rel: str) -> None:
+    """Refuse to write rel if it or any parent under root is a symlink (would write outside the project)."""
+    p = root / rel
+    if p.is_symlink():
+        raise SystemExit(f"error: {p} is a symlink; refusing to write through it")
+    for parent in p.relative_to(root).parents:
+        if (root / parent).is_symlink():
+            raise SystemExit(f"error: {root / parent} is a symlink; refusing to write {rel} through it")
 
 
 def write_new(root: Path, rel: str, content: str | None = None, src: Path | None = None) -> bool:
@@ -332,6 +346,7 @@ def cmd_install(root: Path) -> int:
         return 1
     for rel in core_files():
         dst = root / rel
+        _no_symlink(root, rel)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(CORE / rel, dst)
         created.append(rel)
@@ -364,6 +379,7 @@ def cmd_install(root: Path) -> int:
     text = gi.read_text() if gi.exists() else ""
     missing = [ln for ln in GITIGNORE_LINES if ln not in text.splitlines()]
     if missing:
+        _no_symlink(root, ".gitignore")
         gi.write_text(text + ("" if text.endswith("\n") or not text else "\n") + "\n".join(missing) + "\n")
 
     write_lock(root, core_files())
@@ -456,7 +472,7 @@ def hooks_wired(settings: Path) -> bool:
 
     def wired(event: str, script: str, matcher: str | None = None) -> bool:
         for entry in hooks.get(event, []) if isinstance(hooks.get(event), list) else []:
-            if matcher and entry.get("matcher") != matcher:
+            if matcher and matcher not in str(entry.get("matcher", "")).split("|"):
                 continue
             if any(script in str(h.get("command", "")) for h in entry.get("hooks", [])):
                 return True
@@ -549,7 +565,8 @@ def cmd_doctor(root: Path) -> int:
         sb = {}
     if sb.get("enabled") and not sb.get("autoAllowBashIfSandboxed"):
         notes.append("sandbox.autoAllowBashIfSandboxed is off: /batch units will stop on permission prompts")
-    if sb.get("enabled") and "./.claude/hooks" not in (sb.get("filesystem", {}).get("denyWrite") or []):
+    want_dw = render_settings([])["sandbox"]["filesystem"]["denyWrite"]
+    if sb.get("enabled") and set(want_dw) - set(sb.get("filesystem", {}).get("denyWrite") or []):
         problems.append("sandbox.filesystem.denyWrite does not protect ./.claude/hooks etc.  → merge the "
                         "sandbox block printed by install.sh (CHANGELOG 0.10.0)")
     bad_denies = [r for r in ("Read(/uv.lock)", "Read(/.venv/**)", "Read(/.claude/worktrees/**)")

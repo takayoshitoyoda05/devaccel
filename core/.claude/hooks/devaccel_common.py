@@ -106,7 +106,8 @@ def load_config(root: Path) -> dict:
     path = root / ".claude" / "project.json"
     if path.exists():
         try:
-            cfg = _merge(DEFAULTS, json.loads(path.read_text(encoding="utf-8")))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            cfg = _merge(DEFAULTS, loaded if isinstance(loaded, dict) else {})
         except ValueError as e:
             print(f"[devaccel] .claude/project.json is invalid JSON: {e}", file=sys.stderr)
     # Personal override (put in .claude/settings.local.json "env"). Shown by doctor.
@@ -187,12 +188,14 @@ def check_script_for(text: str) -> str | None:
 HOME = Path.home()
 # $HOME is replaced by an empty tmpfs; only these come back. Toolchains read-only, tool caches writable
 # (the same caches Claude Code's sandbox lets the agent write), the tree writable except its .git.
-HOME_RO = [".local", ".cargo", ".rustup", ".pyenv", ".nvm", ".volta", ".bun", ".deno", ".sdkman", "go", ".gitconfig"]
+HOME_RO = [".local/bin", ".local/lib", ".local/share/uv", ".cargo/bin", ".rustup/toolchains", ".pyenv/versions",
+           ".pyenv/shims", ".nvm/versions", ".volta/bin", ".volta/tools", ".bun/bin", ".deno/bin", "go/bin"]
 CACHE_RW = [".cache/uv", ".cache/pip", ".cache/pyright-python", ".cache/ruff"]
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TZ", "UV_CACHE_DIR", "UV_PYTHON", "XDG_CACHE_HOME")
 
 
-def confined(cmd: list[str], tree: Path, protect: list[Path] | None = None) -> tuple[list[str], dict] | None:
+def confined(cmd: list[str], tree: Path, protect: list[Path] | None = None,
+             mask_env_in: list[Path] | None = None) -> tuple[list[str], dict] | None:
     """Wrap cmd in bubblewrap. Hooks run outside Claude Code's sandbox, and check.sh runs tests the agent
     wrote, so it must not get the user's full rights: read-only filesystem, empty $HOME (allowlist above),
     only `tree` writable, its .git and `protect` read-only (a writable .git = git config/hooks executed by
@@ -217,8 +220,12 @@ def confined(cmd: list[str], tree: Path, protect: list[Path] | None = None) -> t
     for p in [tree / ".git", *(protect or [])]:
         if p.exists():
             args += ["--ro-bind", str(p), str(p)]
-    for p in list(tree.glob(".env")) + list(tree.glob(".env.*")):
-        args += ["--ro-bind", "/dev/null", str(p)]
+    for top in [tree, *(mask_env_in or [])]:  # every .env (nested too) in the tree and e.g. the main checkout
+        for dirpath, dirnames, filenames in os.walk(top):
+            dirnames[:] = [d for d in dirnames if d not in (".git", ".venv", "node_modules", "__pycache__", "worktrees")]
+            for f in filenames:
+                if f == ".env" or f.startswith(".env."):
+                    args += ["--ro-bind", "/dev/null", os.path.join(dirpath, f)]
     env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
     return args + ["--"] + cmd, env
 

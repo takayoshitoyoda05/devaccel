@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-sys.path.append(str(Path(__file__).resolve().parent))  # append: a planted json.py must not shadow the stdlib
+sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is already sys.path[0]; planted modules are refused by guard _pr_script_intact)
 from devaccel_common import git, load_config, match_any, trusted_root  # noqa: E402
 from devaccel_pr import DOCS, github_repo, run, run_base_check, static_triage  # noqa: E402
 

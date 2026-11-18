@@ -72,6 +72,23 @@ the file was then restored (git diff --stat core kit = empty).
 | AUD auto-merge   | pr main: --match-head-commit dropped from gh pr merge                             | yes |
 | AUD report       | report summarize: notice counted by full text n[:100]                             | yes |
 | AUD notice log   | stop_gate: notice event without branch/mode/scope                                 | yes |
+| R3 state types   | stop_gate load_session: back to dict(SESSION_DEFAULT, **raw) (no per-key types)  | yes |
+| R3 cfg toplevel  | common load_config: _merge(DEFAULTS, loaded) without the isinstance(dict) check   | yes |
+| R3 error ctx     | stop_gate __main__: error event without **CTX                                     | yes |
+| R3 broken wt     | stop_gate: broken-worktree reply = plain block (no _block_or_escalate);           | yes |
+|                  | separately: `escalated == sig -> return 0` removed                                |     |
+| R3 .env mask     | common confined: back to tree.glob(".env*"); separately: run_check                | yes |
+|                  | mask_env_in=None (fixture under /var/tmp: the sandbox hides /tmp)                 |     |
+| R3 HOME          | common HOME_RO back to whole dirs (.local, .cargo, ..., .gitconfig)               | yes |
+| R3 guard         | guard _RM lookahead without `\\)`; separately: `./\\*` / `~/\\.` targets removed;    | yes |
+|                  | _COMMIT_MSG.search (not fullmatch); `\\s*` after -m; commit blanking disabled     |     |
+| R3 doctor dW     | kit cmd_doctor: denyWrite check back to `./.claude/hooks` only                    | yes |
+| R3 matcher       | kit hooks_wired: matcher compared with != (no `|` split)                          | yes |
+| R3 install sym   | kit cmd_install: _no_symlink(root, rel) removed; separately: write_lock's         | yes |
+|                  | _no_symlink removed                                                               |     |
+| R3 gen settings  | kit ask drops Edit(./.claude/state/**); separately: denyWrite drops               | yes |
+|                  | ./.claude/settings.local.json                                                     |     |
+| R3 PR snapshot   | pr collect: run_base_check(..., root) instead of the HEAD snapshot                | yes |
 """
 
 from __future__ import annotations
@@ -83,6 +100,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -555,7 +573,8 @@ class GateHardeningTest(ReqKit):
         sh(self.root, "git", "worktree", "add", "-q", "-b", "unit2", str(wt2))
         (wt2 / ".git").rename(wt2 / "git.bak")
         d, _ = self.gate(wt2, agent="u2")
-        self.assertIn("未検証", d.get("systemMessage", ""))
+        self.assertEqual(d.get("decision"), "block")  # breaking .git does not let the unit stop
+        self.assertIn("壊れて", d.get("reason", ""))
 
 
 class DoctorTest(ReqKit):
@@ -873,7 +892,8 @@ class GuardReqTest(unittest.TestCase):
                     "echo 'git commit -m ' ; sudo reboot ; echo '",
                     'git commit -m "x" && git push origin main',
                     "git commit -m 'a' ; rm -rf /",
-                    "git commit -m\n'sudo' -s", "git commit -m 'x'\nsudo reboot"]:
+                    "git commit -m\n'sudo' -s", "git commit -m 'x'\nsudo reboot",
+                    "(rm -rf /)", "echo $(rm -rf ~)", 'git commit -m "$(rm -rf ~)"', "rm -rf ./*", "rm -rf ~/."]:
             self.assertEqual(self.v(cmd), "deny", cmd)
         for cmd in ['git commit -m "Add push docs"', 'git commit -m "use eval in parser"',
                     "git commit -m 'explain gh pr flow'", 'git commit -m "remove sudo usage"',
@@ -1100,16 +1120,22 @@ class AuditPrTest(ReqKit):
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
 
+    @unittest.skipUnless(shutil.which("pytest"), "pytest required for the collection cross-check")
     def test_AUD_pytest_zero_passed_is_failure(self):
-        """AUD: base check runs pytest, reports `== ok: tests (` but no "N passed" -> needs-human, tests failed."""
+        """AUD/PR-12: base check runs pytest and says ok, but ran != separately collected (here 0 of 1)."""
+        (self.root / "test_one.py").write_text("def test_one():\n    assert True\n")
+        self.commit("a test")
         r = self.pr('# runs pytest\necho "== ok: tests (0s)"\n', "--dry-run")
         ev = self.ev(r)
         self.assertEqual(ev["label"], "needs-human", ev)
-        self.assertIn("tests (0 passed reported)", r.stdout)
+        self.assertIn("failed: tests (ran 0 of 1 collected)", r.stdout)  # ran vs. separately collected count
 
+    @unittest.skipUnless(shutil.which("pytest"), "pytest required for the collection cross-check")
     def test_AUD_pytest_with_passed_stays_ok(self):
-        """AUD (control): the same check reporting "3 passed" stays evidence-ok."""
-        r = self.pr('# runs pytest\necho "3 passed in 0.1s"\necho "== ok: tests (0s)"\n', "--dry-run")
+        """AUD (control): ran == collected (1 of 1) stays evidence-ok; a project with no tests is not a failure."""
+        (self.root / "test_one.py").write_text("def test_one():\n    assert True\n")
+        self.commit("a test")
+        r = self.pr('# runs pytest\necho "1 passed in 0.1s"\necho "== ok: tests (0s)"\n', "--dry-run")
         self.assertEqual(self.ev(r)["label"], "evidence-ok", r.stdout)
 
     def test_AUD_forged_stage_lines_not_copied(self):
@@ -1183,6 +1209,214 @@ class AuditGateLogTest(ReqKit):
         self.assertEqual(len(notes), 1, self.log())
         self.assertEqual((notes[0].get("branch"), notes[0].get("scope"), notes[0].get("mode")),
                          ("main", "session", "enforce"))
+
+
+
+# ====================================================================== R3 (third review round)
+class R3GateStateTest(ReqKit):
+    def state(self, sid: str = "s") -> Path:
+        return self.root / ".claude/state/gate" / f"{sid}.json"
+
+    def test_R3_state_wrong_types(self):
+        """R3: wrong-typed values in a session state file (or a non-dict file) fall back to defaults; the
+        failing tree still blocks and the gate does not crash (a crash would fail open)."""
+        (self.root / "app.py").write_text("BROKEN\n")
+        self.state().parent.mkdir(parents=True, exist_ok=True)
+        for raw in ['{"streak": "x"}', '{"noticed": "x"}', "[1, 2]", '{"streak": null, "reason": 5}']:
+            with self.subTest(raw):
+                self.state().write_text(raw)
+                d, r = self.gate(self.root, mode="enforce")
+                self.assertEqual(d.get("decision"), "block", r.stderr)
+                self.assertNotIn("internal error", r.stderr)
+        for over in [{"streak": None}, {"reason": 5}, {"streak": "x", "noticed": "x"}]:
+            with self.subTest(over):  # the repeat path (unchanged failed tree) reads streak and reason
+                self.state().unlink(missing_ok=True)
+                self.assertEqual(self.gate(self.root, mode="enforce")[0].get("decision"), "block")
+                st = json.loads(self.state().read_text())
+                st.update(over)
+                self.state().write_text(json.dumps(st))
+                d, r = self.gate(self.root, mode="enforce")
+                self.assertEqual(d.get("decision"), "block", r.stderr)
+                self.assertNotIn("internal error", r.stderr)
+
+    def test_R3_config_not_an_object(self):
+        """R3: project.json whose top level is [], "x" or null falls back to the defaults (unit still blocks)."""
+        wt = self.worktree()
+        (wt / "app.py").write_text("BROKEN\n")
+        for i, top in enumerate(["[]", '"x"', "null"]):
+            with self.subTest(top):
+                (self.root / ".claude/project.json").write_text(top)
+                d, r = self.gate(wt, agent=f"u{i}")
+                self.assertEqual(d.get("decision"), "block", r.stderr)
+                self.assertNotIn("internal error", r.stderr)
+
+    def test_R3_error_log_has_context(self):
+        """R3: an exception after session/scope/mode/branch are known is logged with them."""
+        (self.root / "app.py").write_text("BROKEN\n")
+        (self.root / ".claude/state").mkdir(exist_ok=True)
+        (self.root / ".claude/state/gate").write_text("not a dir")  # load_session's mkdir raises
+        d, r = self.gate(self.root, mode="enforce")
+        self.assertIn("internal error", r.stderr)
+        ev = self.log()[-1]
+        self.assertEqual(ev["result"], "error", ev)
+        self.assertEqual((ev.get("session"), ev.get("scope"), ev.get("mode"), ev.get("branch")),
+                         ("s", "session", "enforce", "main"), ev)
+
+    def test_R3_broken_worktree_escalates_then_stops(self):
+        """R3: a unit under <main>/.claude/worktrees/ with a broken .git link blocks; after max_rounds+1
+        identical stops it escalates (systemMessage) once, then the next stop returns {}."""
+        wt = self.root / ".claude" / "worktrees" / "u"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "unitb", str(wt))
+        (wt / ".git").rename(wt / "git.bak")
+        replies = [self.gate(wt, agent="ub")[0] for _ in range(5)]
+        self.assertEqual([r.get("decision") for r in replies[:4]], ["block"] * 4, replies)
+        self.assertFalse([r for r in replies[:3] if "systemMessage" in r], replies)
+        self.assertIn("systemMessage", replies[3])
+        self.assertEqual(replies[4], {})
+        self.assertEqual([e["result"] for e in self.log() if e.get("session") == "ub"], ["fail"] * 3 + ["escalate"])
+
+
+class R3ConfinementTest(ReqKit):
+    def setUp(self):
+        # outside /tmp: the sandbox mounts an empty tmpfs on /tmp, which would hide the main checkout
+        # from a unit's check.sh and make the main-checkout .env assertion vacuous
+        if not os.access("/var/tmp", os.W_OK):
+            self.skipTest("/var/tmp not writable")
+        saved, tempfile.tempdir = tempfile.tempdir, "/var/tmp"
+        try:
+            ReqKit.setUp(self)
+        finally:
+            tempfile.tempdir = saved
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap required")
+    def test_R3_nested_and_main_env_masked(self):
+        """R3: .env files nested in the tree, and the main checkout's .env seen from a unit, read empty
+        (the main checkout itself stays readable: app.py is)."""
+        self.set_check(f'mkdir -p .devaccel\ncat sub/.env > .devaccel/p1 2>/dev/null\n'
+                       f'cat "{self.root}/.env" > .devaccel/p2 2>/dev/null\n'
+                       f'cat "{self.root}/app.py" > .devaccel/p3 2>/dev/null\n'
+                       'echo "== stage: tests"\necho "== ok: tests (0s)"\n')
+        wt = self.worktree()
+        (self.root / "sub").mkdir()
+        (self.root / "sub/.env").write_text("SECRET=nested\n")
+        (self.root / ".env").write_text("SECRET=main\n")
+        (self.root / "app.py").write_text("X = 7\n")
+        d, r = self.gate(self.root, mode="enforce")
+        self.assertNotIn("decision", d, r.stderr)
+        self.assertEqual((self.root / ".devaccel/p1").read_text(), "", "nested .env readable in the sandbox")
+        (wt / "app.py").write_text("X = 8\n")
+        d, r = self.gate(wt, agent="u")
+        self.assertNotIn("decision", d, r.stderr)
+        self.assertIn("X = 7", (wt / ".devaccel/p3").read_text())  # the main checkout is visible...
+        self.assertEqual((wt / ".devaccel/p2").read_text(), "", "main checkout .env readable from a unit")
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap required")
+    def test_R3_home_allowlist_only(self):
+        """R3: inside the sandbox $HOME shows only allowlisted toolchain subpaths (.local/bin), not
+        ~/.cargo/credentials.toml, ~/.gitconfig or other parts of ~/.local."""
+        home = self.tmp / "home"
+        for rel in [".local/bin/tool", ".local/state/secret", ".cargo/credentials.toml", ".gitconfig"]:
+            (home / rel).parent.mkdir(parents=True, exist_ok=True)
+            (home / rel).write_text("x\n")
+        probe = self.root / ".devaccel/home"
+        self.set_check(f'mkdir -p .devaccel\n(cd "$HOME" && find . -not -type d | sort) > "{probe}"\n'
+                       'echo "== stage: tests"\necho "== ok: tests (0s)"\n')
+        (self.root / "app.py").write_text("X = 9\n")
+        r = run(self.root, "python3", ".claude/hooks/stop_gate.py",
+                env={"CLAUDE_PROJECT_DIR": str(self.root), "DEVACCEL_GATE_MODE": "enforce", "HOME": str(home)},
+                stdin=json.dumps({"session_id": "h", "cwd": str(self.root)}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("decision", r.stdout, r.stdout)
+        seen = probe.read_text().split()
+        self.assertIn("./.local/bin/tool", seen)
+        for leak in ["./.cargo/credentials.toml", "./.gitconfig", "./.local/state/secret"]:
+            self.assertNotIn(leak, seen)
+
+
+class R3GuardTest(unittest.TestCase):
+    def test_R3_guard_subshells_and_commit_forms(self):
+        """R3: rm in subshells / ./* / ~/. and commit-message tricks are denied; a plain commit with flags
+        around a message that mentions eval is allowed."""
+        for cmd in ["(rm -rf /)", "echo $(rm -rf ~)", "rm -rf ./*", "rm -rf ~/.",
+                    "echo 'git commit -m ' ; sudo reboot ; echo '", "git commit -m\n'sudo' -s"]:
+            r = guard.decide(cmd, DEFAULTS)
+            self.assertEqual(r and r[0], "deny", cmd)
+        self.assertIsNone(guard.decide('git commit -q -m "use eval" --no-verify', DEFAULTS))
+
+
+class R3KitTest(ReqKit):
+    mutate = DoctorTest.mutate
+    edit_settings = DoctorTest.edit_settings
+    assertProblem = DoctorTest.assertProblem
+
+    def test_R3_doctor_denywrite_complete(self):
+        """R3: denyWrite missing any generated entry (./scripts/check.sh) is a problem."""
+        self.edit_settings(lambda st: st["sandbox"]["filesystem"]["denyWrite"].remove("./scripts/check.sh"))
+        self.assertProblem("denyWrite does not protect")
+
+    def test_R3_doctor_matcher_alternation_is_wired(self):
+        """R3: a PreToolUse matcher "Bash|Edit" still wires the guard (no problem)."""
+        def rematch(st):
+            for e in st["hooks"]["PreToolUse"]:
+                e["matcher"] = "Bash|Edit"
+        self.edit_settings(rematch)
+        _, out = self.doctor()
+        self.assertNotIn("hooks not wired", out)
+
+    def test_R3_install_refuses_symlinked_dirs(self):
+        """R3: .claude/hooks or .claude symlinked out of the project: install refuses, nothing written outside."""
+        for i, link in enumerate([".claude/hooks", ".claude"]):
+            with self.subTest(link):
+                d = self.fresh(f"r3sym{i}")
+                out = self.tmp / f"r3out{i}"
+                out.mkdir()
+                (d / ".claude").mkdir(exist_ok=link != ".claude")
+                if link == ".claude":
+                    (d / ".claude").rmdir()
+                os.symlink(out, d / link)
+                r = sh(d, str(KIT / "install.sh"))
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertEqual(list(out.iterdir()), [])
+
+    def test_R3_lock_not_written_through_symlink(self):
+        """R3: a dangling .claude/devaccel.lock symlink: install refuses to write the lock outside."""
+        d = self.fresh("r3lock")
+        out = self.tmp / "r3lockout"
+        out.mkdir()
+        (d / ".claude").mkdir()
+        os.symlink(out / "lock", d / ".claude/devaccel.lock")
+        r = sh(d, str(KIT / "install.sh"))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertFalse((out / "lock").exists())
+
+    def test_R3_generated_asks_and_denywrite(self):
+        """R3: generated settings ask before editing state/lock/skills/settings.local.json; denyWrite has
+        ./.claude/settings.local.json."""
+        st = self.settings()
+        for rule in ["Edit(./.claude/state/**)", "Edit(./.claude/devaccel.lock)", "Edit(./.claude/skills/**)",
+                     "Edit(./.claude/settings.local.json)"]:
+            self.assertIn(rule, st["permissions"]["ask"])
+        self.assertIn("./.claude/settings.local.json", st["sandbox"]["filesystem"]["denyWrite"])
+
+
+class R3PrSnapshotTest(ReqKit):
+    ev = AuditPrTest.ev
+    CHECK = 'if [ -e BROKEN ]; then echo "== failed: tests (0s)"; exit 1; fi\necho "== ok: tests (0s)"\n'
+
+    def test_R3_pr_judges_head_not_worktree(self):
+        """R3: devaccel_pr runs the check on a HEAD snapshot: an untracked BROKEN file does not change the
+        label, a committed one does."""
+        self.set_check(self.CHECK)
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        self.commit("change")
+        (self.root / "BROKEN").write_text("x\n")
+        nf = self.tmp / "notes.txt"
+        nf.write_text("ran: uv run app -> ok")
+        args = ("python3", ".claude/hooks/devaccel_pr.py", "--title", "t", "--verify-notes", str(nf), "--dry-run")
+        self.assertEqual(self.ev(run(self.root, *args))["label"], "evidence-ok")
+        self.commit("broken")
+        self.assertEqual(self.ev(run(self.root, *args))["label"], "needs-human")
 
 
 if __name__ == "__main__":
