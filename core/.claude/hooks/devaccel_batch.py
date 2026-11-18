@@ -201,6 +201,14 @@ def main() -> int:
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
+    if os.environ.get("CLAUDECODE"):  # started by the model, outside the sandbox: the guard's grammar, re-checked
+        tf = Path(os.path.realpath(a.tasks))
+        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run") and v != ap.get_default(k)]
+        if (tf.parent != (root / ".devaccel").resolve() or tf.suffix != ".md" or tf.is_symlink()
+                or Path(a.tasks).is_symlink() or not re.fullmatch(r"batch/[\w-]+", a.branch) or extra):
+            print("from Claude Code only `.devaccel/<name>.md --branch batch/<name> [--dry-run]` is allowed "
+                  "(other options: run it from a terminal)", file=sys.stderr)
+            return 2
     cfg = load_config(root)
     base = cfg["scale"]["base_branch"]
     head, items = split_tasks(a.tasks.read_text(encoding="utf-8"))
@@ -290,6 +298,10 @@ def main() -> int:
         commits = git(root, "rev-list", "--count", f"{start}..{u['branch']}").strip()
         if commits in ("", "0"):
             return "no commit"
+        changed = git(root, "diff", "--name-only", "-z", start, u["branch"]).split("\0")
+        touched = [f for f in changed if f and SKIP_NEW.search(f)]
+        if touched:  # e.g. the unit committed by itself: secrets or devaccel/Claude config are never integrated
+            return "touches protected files: " + ", ".join(touched[:3])
         subprocess.run([*safe, "checkout", "-q", "--", "."], capture_output=True)  # tree == commit
         subprocess.run([*safe, "clean", "-q", "-f", "-d"], capture_output=True)  # (ignored files stay: .venv)
         sha = git(root, "rev-parse", u["branch"]).strip()
@@ -320,7 +332,9 @@ def main() -> int:
     pending = list(units)
     limit, why = plan_jobs(len(units), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
     print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # anchor: <root>/.claude/worktrees path
+    # a fresh session per unit: drop the parent session's markers (the anchor comes from the worktree path)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")}
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(max_workers=max(1, limit))  # settling (commit + own check) overlaps the units
     settling: dict = {}
@@ -413,7 +427,8 @@ def main() -> int:
                                                              if u.get("check_tail") and u["status"] != "ok" else ""))
         if copies > 1 and won.get(u["i"]) is not u:
             continue
-        summary = clean(" ".join(str(j.get("result") or "").split())[:160])
+        # in a code span: no markdown links/images, HTML, mentions or closing keywords render in the PR body
+        summary = "`" + clean(" ".join(str(j.get("result") or "").split())[:160]).replace("`", "'") + "`"
         lines.append(f"- unit {u['i']} ({u['branch']}, {u['secs']}s): {u['status']} — {summary}")
     for i in range(1, len(items) + 1):
         if i in won:
@@ -424,6 +439,9 @@ def main() -> int:
     print("\n".join(lines))
     print(f"(full unit reports: {log.relative_to(root)})")
     print(f"units: {len(ok)}/{len(items)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
+    (root / ".devaccel" / "batch-last.json").write_text(json.dumps(  # machine-readable (cost of the units)
+        {"branch": a.branch, "units": len(items), "ok": len(ok), "secs": round(time.time() - t0),
+         "cost_usd": round(cost, 4), "ts": time.time()}), encoding="utf-8")
 
     cleanup(root, units, a.keep)
     if not ok:

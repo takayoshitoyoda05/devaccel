@@ -149,13 +149,24 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
         force = ("\n計測のため、使う条件(件数・規模)にかかわらず、必ず devaccel-unit を単位の数だけ並列に起動して実装し、"
                  "ship --units で統合して。" if arm_base == "par_force" else "")
         prompt = "/devaccel-batch " + tasks + force + "\n" + TAIL
+    elif arm_base == "auto":  # no routing hint: the session decides (fan-out for >=4 independent tasks) and ships
+        prompt = tasks + "\n" + TAIL
     else:
         sh(["git", "checkout", "-q", "-B", f"bench/{arm}", "main"], trial)
         how = OLD_PR if arm_base == "seq_old" else "最後に devaccel-pr スキルで PR を 1 本作って。"
         prompt = tasks + "\n上の各件を 1 つのセッションで順番に実装し、" + how + TAIL
+    t_start = time.time()
     j, wall = claude(prompt, trial, model)
     new = [p for p in open_prs(trial) if p["number"] not in before]
-    rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "turns": j.get("num_turns"),
+    fan = trial / ".devaccel" / "batch-last.json"  # nested fan-out units are billed outside this session's JSON
+    fan_cost = None
+    if fan.exists():
+        fj = json.loads(fan.read_text())
+        if fj.get("ts", 0) >= t_start:
+            fan_cost = fj.get("cost_usd")
+    if fan_cost is not None and j.get("total_cost_usd") is not None:
+        j["total_cost_usd"] = round(j["total_cost_usd"] + fan_cost, 4)
+    rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "fanout_cost": fan_cost, "turns": j.get("num_turns"),
            "models": usage(j), "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new],
            "result_tail": (j.get("result") or "")[-300:]}
     patch = HERE / "patches" / f"{dt.datetime.now():%m%d-%H%M%S}-{arm}.patch"

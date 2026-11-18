@@ -8,8 +8,8 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 - **対話には挟まない**: 常駐は短い `CLAUDE.md`(約15行)とスキル説明 3 行。対話セッションのゲートは既定 off。
 - 正確さは LLM の審査ではなく **機械の検査 + 実際に動かす確認** で担保する。
 
-**実測(2026-11、`tests/bench/`、docs/design.md D14・D17。比較対象は素の Claude Code(sonnet)を 1 セッションで順に使った場合。隠しテストは全回満点)**
-- **束の作業(独立した 8〜12 件)**: `devaccel_batch.py`(親なしファンアウト、単位は haiku)で、12 件 176 秒・$0.60 → **64〜79 秒・$0.06〜0.11(約 2.2〜2.75 倍速・約 1/6〜1/10)**。中規模 4 件は中央値で約 1.8 倍速・約 1/9。伏せた状態での品質採点は同等以上。
+**実測(2026-11、`tests/bench/`、docs/design.md D14・D17。比較対象は素の Claude Code(sonnet)を 1 セッションで順に使った場合。隠しテストは小 8 件のファンアウト 1 回で 1 件落ちたのを除き満点。生データは `tests/bench/parallel/results.jsonl`)**
+- **束の作業(独立した 4 件以上。件数が多く 1 件が重いほど効く)**: `devaccel_batch.py`(親なしファンアウト、単位は haiku)で、12 件は逐次 176 秒・$0.60(1 回)→ **64〜77 秒・$0.058〜0.07(0.12.3 以降の 3 回。約 2.3〜2.75 倍速・約 1/9)**。中規模 4 件は中央値で約 1.8 倍速・約 1/9。小さい 8 件では 1.1〜1.7 倍速・約 1/4〜1/5 にとどまる。伏せた状態での品質採点(sonnet の採点者、手元の記録のみでリポジトリには未収録)は同等以上。
 - **対話の 1 件**: 素の Claude Code とほぼ同等(時間・コスト・正確さ)。トークン削減はしない。小さな作業 1〜3 件なら逐次のほうが速い。
 - 未計測: 実際の PR での振り分けの誤検知・見逃し率、`/devaccel-tune` の継続調整の効果、Python 以外。
 
@@ -25,7 +25,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.10.3   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.13.0   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
@@ -95,7 +95,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 4. 任意: `.claude/project.json` の `"parallel": {"auto_merge": true}` で `evidence-ok` を自動マージ(GitHub 側で auto-merge を許可し、`check` ワークフローを必須チェックにしたブランチ保護が必要)。最初は off で振り分けの精度を見て、evidence-ok のリバートが出ない期間が続いてから。
 5. 押し出しの規則: push は作業ブランチから origin の同名ブランチへだけ(main/master・デフォルトブランチ・force・他リモート不可)。シェルの `git push origin HEAD` は guard が、`devaccel_ship.py` の push はスクリプト自身が同じ規則で検査する。`gh` は直接使えず、PR は lock と一致する `devaccel_pr.py` / `devaccel_ship.py` だけが作る。サンドボックス内のコマンドは確認なしで動く(`autoAllowBashIfSandboxed`)ので、並列の単位が確認待ちで止まらない。**本当の境界は GitHub 側**: guard は文字列判定の best-effort(`bash -c` 等の経由も拒否するが、完全ではない)。デフォルトブランチを保護する(PR 必須・force push 禁止・`check` を必須チェック)のが最後の砦で、`~/devaccel/protect.sh`(人が実行、確認あり)で設定できる。Claude も同じアカウントで動くため「承認必須」は個人開発では自分を締め出すだけなので入れない。サーバーが保証するのは「main に直接入らない・CI が赤いものはマージできない」まで。プランによっては非公開リポジトリでブランチ保護が使えないので、その場合は guard と PR 判定のみが頼り。より厳密にするなら、push と PR 作成だけができる fine-grained token を使う。
 6. **統合(land)**: 各 PR の証拠は分岐時点の base に対するもの。兄弟 PR が先に入ると古くなる(テキスト衝突、「単独では緑・合わせると赤」)。マージは `python3 .claude/hooks/devaccel_land.py --merge`(人が実行)で行う: `evidence-ok` の PR をコード → docs の順に最新 base へ一時 worktree で 1 本ずつ合わせ、そのつど base 側の `check.sh full` を実行。衝突・失敗した PR は理由つきで `needs-human` に落とし(昇格はしない)、通った PR を squash merge する(検証した木 = マージ後の木。途中で base が動いたら止まる)。`--merge` なしは検証と降格だけ、`--dry-run` は何も変えない。重なるファイルを持つ PR は最初に表示される。落ちた PR は担当の作業ツリーで `git merge origin/main` → push → devaccel-pr 再実行で直す(force push 不要)。
-7. 並列度は settings.json の `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`(既定 3)。単位(サブエージェント)のモデルは `CLAUDE_CODE_SUBAGENT_MODEL`(既定 `sonnet`。単位は親のキャッシュを共有しないので単価が効く。計画役のメインは自分のモデルのまま)。並列数だけトークンも増える(公式)。`/devaccel-tune` が PR の振り分け実績(件数・マージ・リバート)を見て閾値を調整する。
+7. 並列度は settings.json の `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`(devaccel の設定では 8)。単位(サブエージェント)のモデルは `CLAUDE_CODE_SUBAGENT_MODEL`(既定 `sonnet`。単位は親のキャッシュを共有しないので単価が効く。計画役のメインは自分のモデルのまま)。並列数だけトークンも増える(公式)。`/devaccel-tune` が PR の振り分け実績(件数・マージ・リバート)を見て閾値を調整する。
 
 ## 守りの分担
 

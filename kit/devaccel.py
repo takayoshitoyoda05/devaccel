@@ -250,11 +250,15 @@ def render_settings(presets: list[str]) -> dict:
              "Bash(git show --stat)", "Bash(uv sync)",
              # parallel-PR flow (guard enforces: work branch only, origin only, verified script)
              "Bash(git add *)", "Bash(git commit *)", "Bash(git push origin HEAD)",
-             "Bash(python3 .claude/hooks/devaccel_pr.py *)", "Bash(python3 .claude/hooks/devaccel_ship.py *)"]
+             "Bash(python3 .claude/hooks/devaccel_pr.py *)", "Bash(python3 .claude/hooks/devaccel_ship.py *)",
+             # fan-out: its nested `claude -p` units need the API, so it runs outside the sandbox (below); the
+             # guard admits only the exact form, the lock pins the script, and every unit is itself sandboxed
+             "Bash(python3 .claude/hooks/devaccel_batch.py *)"]
     for p in presets:
         for n in PRESETS[p]:
             allow += PIECES[n]["allow"]
     sandbox = json.loads(json.dumps(SANDBOX))
+    sandbox["excludedCommands"] = ["python3 .claude/hooks/devaccel_batch.py *"]
     domains = sorted(set(BASE_DOMAINS) | {d for p in presets for d in NET_DOMAINS.get(p, [])})
     if domains:
         sandbox["network"] = {"allowedDomains": domains}

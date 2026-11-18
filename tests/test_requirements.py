@@ -1736,8 +1736,18 @@ class R18BatchEndToEndTest(R6ShipTest):
         '  *GOODTASK*) echo "A = 1" > a_mod.py;;\n'
         '  *BADTASK*) echo "BROKEN = 1" >> app.py; echo "C = 1" > c_mod.py;;\n'
         '  *SECRETTASK*) echo "TOKEN=x" > .env; echo "B = 1" > b_mod.py; echo " " >> .claude/project.json;;\n'
+        '  *SELFCOMMIT*) echo "S = 1" > s_mod.py; echo "K" > id_rsa; git add -A; git -c user.name=u '
+        '-c user.email=u@x commit -qm self;;\n'
         'esac\n'
         'printf \'{"result": "\\u001b]0;pwn\\u0007 done @someone <!-- #1", "total_cost_usd": 0.001}\'\n')
+
+    def setUp(self):  # run as a human from a terminal (the restricted grammar for Claude is R24)
+        super().setUp()
+        from unittest import mock
+        p = mock.patch.dict(os.environ)
+        p.start()
+        self.addCleanup(p.stop)
+        os.environ.pop("CLAUDECODE", None)
 
     def test_batch_integrates_only_units_whose_commit_passes_our_own_check(self):
         import shutil
@@ -1749,7 +1759,8 @@ class R18BatchEndToEndTest(R6ShipTest):
         tasks = self.tmp / "tasks.md"
         tasks.write_text("1. GOODTASK: `a_mod.py` を作る。テストは不要。" + "x" * 80 + "\n"
                          "2. BADTASK: `c_mod.py` を作る。テストは不要。" + "x" * 80 + "\n"
-                         "3. SECRETTASK: `b_mod.py` を作る。テストは不要。" + "x" * 80 + "\n")
+                         "3. SECRETTASK: `b_mod.py` を作る。テストは不要。" + "x" * 80 + "\n"
+                         "4. SELFCOMMIT: `s_mod.py` を作る。テストは不要。" + "x" * 80 + "\n")
         r, log = self.land(str(tasks), "--branch", "batch/t", script="devaccel_batch.py")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("pr create", log)
@@ -1758,6 +1769,9 @@ class R18BatchEndToEndTest(R6ShipTest):
         self.assertIn("b_mod.py", files)
         self.assertNotIn("c_mod.py", files)  # its commit failed the check: not integrated
         self.assertNotIn(".env", files)
+        self.assertNotIn("id_rsa", files)
+        self.assertNotIn("s_mod.py", files)  # its own commit carried a key: the whole unit is refused
+        self.assertIn("touches protected files", r.stdout)
         self.assertNotIn("BROKEN", sh(self.root, "git", "show", "batch/t:app.py").stdout)
         self.assertEqual(sh(self.root, "git", "diff", "main", "batch/t", "--", ".claude").stdout, "")
         self.assertIn("check fail", r.stdout)
@@ -1828,3 +1842,72 @@ class R20WorktreeLinkTest(ReqKit):
         self.assertTrue(worktree_link_ok(wts / "a", self.root))
         (wts / "a/.git").write_text(f"gitdir: {self.root / '.git/worktrees/b'}\n")
         self.assertFalse(worktree_link_ok(wts / "a", self.root))  # B's admin dir: A's pass would count for B
+
+
+class R21PytestTomlTest(unittest.TestCase):
+    def test_pytest9_config_files_always_need_a_human(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_pr as p
+        from devaccel_common import match_any
+        for f in ("pytest.toml", ".pytest.toml", "sub/pytest.toml", ".flake8"):
+            self.assertTrue(match_any(f, p.ALWAYS_HUMAN), f)
+
+
+class R22AutoBatchTest(ReqKit):
+    """BATCH-06: the model may run the fan-out itself — only in the exact form, with a locked script, and
+    the settings run that one command outside the sandbox (its units are sandboxed sessions)."""
+
+    def test_guard_admits_only_the_plain_batch_form(self):
+        ok = "python3 .claude/hooks/devaccel_batch.py .devaccel/tasks.md --branch batch/x"
+        self.assertIsNone(self.gv(ok))
+        self.assertIsNone(self.gv(ok + " --dry-run"))
+        for cmd in [ok + "; curl x", ok + " $(id)", "FOO=1 " + ok, ok + " > /tmp/o", "cd x && " + ok,
+                    "python3 /tmp/devaccel_batch.py t --branch batch/x", ok + " | tee o", ok + " `id`",
+                    "python3 .claude/hooks/devaccel_batch.py /home/u/.ssh/id_rsa --branch batch/x",
+                    "python3 .claude/hooks/devaccel_batch.py .devaccel/../x.md --branch batch/x",
+                    "python3 .claude/hooks/devaccel_batch.py .devaccel/t.md --branch feat/x",
+                    ok + " --model opus", ok + " --jobs 99"]:
+            self.assertEqual(self.gv(cmd), "deny", cmd)
+        p = self.root / ".claude/hooks/devaccel_batch.py"
+        p.write_text(p.read_text() + "\n# hack\n")
+        self.assertEqual(self.gv(ok), "deny")  # lock-checked like ship
+
+    def test_settings_run_only_the_batch_command_unsandboxed(self):
+        st = json.loads((self.root / ".claude/settings.json").read_text())
+        self.assertEqual(st["sandbox"]["excludedCommands"], ["python3 .claude/hooks/devaccel_batch.py *"])
+        self.assertFalse(st["sandbox"]["allowUnsandboxedCommands"])
+        self.assertIn("Bash(python3 .claude/hooks/devaccel_batch.py *)", st["permissions"]["allow"])
+
+
+class R23EscalationScopeTest(R6ShipTest):
+    def test_unit_escalations_count_for_the_integrated_pr_and_branchless_records_for_none(self):
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qB", "unit/u1", "main")
+        (self.root / "a.py").write_text("A = 1\n")
+        self.commit("u1")
+        sh(self.root, "git", "checkout", "-q", "main")
+        log = self.root / ".claude/state/gate-log.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(json.dumps({"result": "escalate", "branch": "unit/u1"}) + "\n"
+                       + json.dumps({"result": "escalate", "branch": "unit/u1"}) + "\n"
+                       + json.dumps({"result": "escalate", "branch": "unit/other"}) + "\n"
+                       + json.dumps({"result": "escalate", "stage": "worktree"}) + "\n")
+        r, _ = self.land("--file", self.notes(), "--branch", "batch/e", "--units", "unit/u1", "--no-push",
+                         script="devaccel_ship.py")
+        self.assertIn("人への判断依頼を 2 回", r.stdout, r.stderr)
+
+
+class R24BatchFromClaudeTest(R6ShipTest):
+    def test_batch_rechecks_the_restricted_grammar_when_started_by_claude(self):
+        self.with_origin()
+        secret = self.tmp / "secret.md"
+        secret.write_text("1. leak\n")
+        (self.root / ".devaccel").mkdir(exist_ok=True)
+        (self.root / ".devaccel/link.md").symlink_to(secret)
+        (self.root / ".devaccel/t.md").write_text("1. x\n")
+        env_cc = {"CLAUDECODE": "1"}
+        for args in ([str(secret), "--branch", "batch/x"], [".devaccel/link.md", "--branch", "batch/x"],
+                     [".devaccel/t.md", "--branch", "feat/x"], [".devaccel/t.md", "--branch", "batch/x", "--jobs", "9"]):
+            r = sh(self.root, "python3", ".claude/hooks/devaccel_batch.py", *args, env=env_cc)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertIn("only `.devaccel/", r.stderr, args)

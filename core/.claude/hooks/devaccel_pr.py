@@ -32,8 +32,9 @@ from stop_gate import SKIP_RE  # noqa: E402
 # needs a human, whatever project.json says (project.json itself is in this list).
 # Any change to a tool/test configuration file needs a human (pyproject.toml always: [tool.*] edits can
 # silently narrow what lint/types/tests check; keyword matching missed that).
-_CFG = ["conftest.py", "pytest.ini", ".pytest.ini", "setup.cfg", "tox.ini", "pyrightconfig.json", "ruff.toml",
-        ".ruff.toml", "pyproject.toml", ".gitattributes", "noxfile.py", ".coveragerc", "mypy.ini", ".mypy.ini"]
+_CFG = ["conftest.py", "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "setup.cfg", "tox.ini",
+        "pyrightconfig.json", "ruff.toml", ".ruff.toml", ".flake8", "pyproject.toml", ".gitattributes", "noxfile.py",
+        ".coveragerc", "mypy.ini", ".mypy.ini"]
 ALWAYS_HUMAN = ["scripts/check.sh", ".claude/**", ".github/**", "CLAUDE.md", "AGENTS.md",
                 *_CFG, *[f"**/{n}" for n in _CFG]]
 
@@ -243,7 +244,12 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1)
     # display only: behaviour changed but no docs touched (parallel units drift apart here)
     docs_untouched = any(not match_any(f, DOCS) for f in files) and not any(match_any(f, DOCS) for f in files)
 
-    escalations = 0  # the gate logs in the main checkout (worktrees are deleted); count this branch only
+    # the gate logs in the main checkout (worktrees are deleted): count this branch and the unit branches it
+    # integrated (merge subjects "integrate <branch>"; a forged subject can only add reasons, never remove them).
+    # Records without a branch (e.g. a broken unit worktree) belong to no PR.
+    mine = {head} | set(re.findall(r"^integrate (\S+)$", git(root, "log", "--merges", "--format=%s",
+                                                             f"{base}..HEAD") if base else "", re.M))
+    escalations = 0
     log = trusted_root({"cwd": str(root)}) / ".claude" / "state" / "gate-log.jsonl"
     if log.exists():
         for line in log.read_text(encoding="utf-8").splitlines():
@@ -251,7 +257,7 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1)
                 e = json.loads(line)
             except ValueError:
                 continue
-            escalations += e.get("result") == "escalate" and e.get("branch", head) == head
+            escalations += e.get("result") == "escalate" and e.get("branch") in mine
 
     reasons = []
     if not check_ok:

@@ -1,3 +1,5 @@
+> **0.11〜0.13 の追加分**(このファイル下の表は 0.8.4 時点): SHIP-01..06 → `test_requirements.py` R6ShipTest・R7ShipBranchTest・R17ShipDryRunTest。BATCH-01..05 → R18BatchEndToEndTest(スタブの `claude` で fan-out → 単位ごとの自前検査 → 統合 → PR、秘密・設定の除外、出力の無害化、後始末、事前検査)、R19BatchHelpersTest、R12/R13(並列数・単一の判定)、R14(参照ファイル)、R15(依頼の点検)、R16(PR の隔離)、R20(worktree リンクの付け替え)。PR-12 → TriageEvasionTest・R21。実機の `claude -p` を使う経路は `tests/bench/parallel/run.py` で計測(テストではない)。
+
 > **0.9.0・0.10.0 で更新**: この表は監査時点(テスト 34 本・要件 94 件)のもの。その後 `tests/test_requirements.py` に 51 本(0.9.0)と 0.10.x の監査修正分を追加した。追加したテストはすべて、対応するコードを戻すと失敗することを確認済み(各回の内訳は test_requirements.py 冒頭の表)。§2 の穴のうち SET-01..08、INST-01..06、UPD-01/03、DOC-01..08、GATE-03/05..15/16(単位のコミット済み変更)、GRD-01..06/08..11 を埋めた。空振りしていた 2 本(GATE-08 の docs スキップ、GATE-03 の unit_mode 改ざん)も修正。残りは requirements.md §5。
 
 # devaccel requirement ↔ test traceability
