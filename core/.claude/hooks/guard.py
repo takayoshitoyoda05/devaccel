@@ -221,8 +221,8 @@ def _compile_extra(patterns: list, label: str) -> list[tuple[re.Pattern, str]]:
 # Only messages without $ or backticks are blanked: those would be expanded by the shell.
 # Only when the WHOLE command is one plain `git commit [flags] -m "msg" [flags]`: blanking a quoted span
 # inside a longer command would let `echo 'git commit -m ' ; sudo x ; echo '` hide the middle command.
-_COMMIT_MSG = re.compile(r"""\s*git\s+commit((?:\s+-[A-Za-z-]+)*)\s+(?:-m|--message)[= ]?\s*"""
-                         r"""("[^"$`\\\n]*"|'[^'\n]*')((?:\s+-[A-Za-z-]+)*)\s*""")
+_COMMIT_MSG = re.compile(r"""[ \t]*git[ \t]+commit((?:[ \t]+-[A-Za-z-]+)*)[ \t]+(?:-m|--message)[= ]?[ \t]*"""
+                         r"""("[^"$`\\\n\r]*"|'[^'\n\r]*')((?:[ \t]+-[A-Za-z-]+)*)[ \t]*""")  # no \s: newline = separator
 
 
 def decide(command: str, cfg: dict, cwd: Path | None = None, project: Path | None = None) -> tuple[str, str] | None:

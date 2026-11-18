@@ -872,7 +872,8 @@ class GuardReqTest(unittest.TestCase):
                     'git commit -m "$(git push origin main)"',
                     "echo 'git commit -m ' ; sudo reboot ; echo '",
                     'git commit -m "x" && git push origin main',
-                    "git commit -m 'a' ; rm -rf /"]:
+                    "git commit -m 'a' ; rm -rf /",
+                    "git commit -m\n'sudo' -s", "git commit -m 'x'\nsudo reboot"]:
             self.assertEqual(self.v(cmd), "deny", cmd)
         for cmd in ['git commit -m "Add push docs"', 'git commit -m "use eval in parser"',
                     "git commit -m 'explain gh pr flow'", 'git commit -m "remove sudo usage"',
