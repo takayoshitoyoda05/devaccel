@@ -1442,3 +1442,14 @@ class R4SnapshotTest(ReqKit):
         sh(empty, "git", "init", "-q")
         (self.tmp / "snap2").mkdir()
         self.assertFalse(devaccel_pr.export_head(empty, self.tmp / "snap2"))
+
+
+class R5GuardTitleTest(ReqKit):
+    def test_R5_pr_title_with_equals_is_allowed(self):
+        """GRD-11: `x=y` inside a PR title is text, not an env change (a /batch unit was refused 3 times)."""
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        self.assertIsNone(self.gv('python3 .claude/hooks/devaccel_pr.py --title "Add to_json (ensure_ascii=False)" '
+                                  '--verify-notes .devaccel/pr-notes.md'))
+        for cmd in ["PYTHONPATH=.devaccel python3 .claude/hooks/devaccel_pr.py --title x",
+                    "export PATH=x; python3 .claude/hooks/devaccel_pr.py --title x"]:
+            self.assertEqual(self.gv(cmd), "deny", cmd)

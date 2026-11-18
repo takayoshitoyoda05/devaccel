@@ -12,7 +12,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 - 小さな機能追加 3 課題(sonnet): 正確さは素の Claude Code と同等(隠しテスト全通過)。0.8.3 で時間 約 37〜40 秒 対 39 秒、コスト +4〜12%(条件と回によって差がある。D14)。トークンは**減っていない**。
 - 罠つき難課題 3 課題(sonnet、各 3 回、0.10.0): 正確さは同等(9/9 対 9/9)、コスト・時間とも同等(中央値 $0.199 / 46 秒 対 $0.200 / 44 秒)。
 - 振り分けが仕込んだ欠陥を見逃さないことは**合成テスト**で確認(8 種)。実際の PR での誤検知・見逃し率は未計測(実 PR は十数本)。
-- 並列(`/batch`)が逐次より速いかは**未計測**。`/devaccel-tune` による継続調整は実データでは未実証。
+- 並列は**この規模では速くない**: 互いに独立した 4 課題で、逐次(1 セッション)93 秒・$0.24 に対し、並列(/devaccel-batch + land)129 秒・$0.80(各 1 回、D14)。単位ごとのコールドスタートと PR の固定費が効く。並列が得になる件数・規模は未確認(少なくとも小さな作業 4 件では逐次を推奨)。`/devaccel-tune` による継続調整は実データでは未実証。
 - 計測は `tests/bench/`、記録は docs/design.md D14。ベンチとリリース前スモークの対象(試験用プロジェクト)は非公開(`--trial` に自分の小さな Python CLI を指定し、`tests/bench/tasks` を合わせれば同じ手順で測れる)。
 
 **これは何でないか**: セキュリティ境界ではない(guard は文字列判定の best-effort。本当の境界はサンドボックスと GitHub のブランチ保護)。トークン削減キットでもない。Python 以外は検査の段を自分で書く(`/devaccel-setup` が提案)。macOS は未検証。
@@ -27,7 +27,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.10.2   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.10.3   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
@@ -44,7 +44,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `~/devaccel/protect.sh` | base ブランチの保護(人が実行、確認あり) |
 | `/devaccel-setup` | 初回生成(CLAUDE.md・verify-app・計測)。`--redetect` |
 | `/devaccel-tune` | ゲート記録と PR 振り分けから追加・削除・調整を提案(承認後に適用) |
-| `/devaccel-batch` | 独立した S/M が 4 件以上のとき、コンテキストパックつきで `/batch` を呼ぶ |
+| `/devaccel-batch` | 独立した S/M が多数(目安 5 件以上・各数分以上)のとき、コンテキストパックつきで `/batch` を呼ぶ。小さな作業 4 件では逐次のほうが速く安かった(D14) |
 
 ## 導入されるもの
 
@@ -86,7 +86,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 
 検証ループ(ゲート・verify-app・仕様照合)で 1 本の作業を信頼できるものにし、それを並列に回して、人は振り分けられた PR だけを読む。
 
-1. 独立した S/M 作業の束(4 件以上)を `/devaccel-batch <一覧>` に渡す。コンテキストパックと単位向けの注意を付けて公式 `/batch` を呼ぶ(単位ごとに worktree で並列実装)。L は並列化せず design スキルで 1 本ずつ。
+1. 独立した S/M 作業の大きな束(目安 5 件以上)を `/devaccel-batch <一覧>` に渡す。コンテキストパックと単位向けの注意を付けて公式 `/batch` を呼ぶ(単位ごとに worktree で並列実装)。L は並列化せず design スキルで 1 本ずつ。
 2. 各単位は devaccel-pr スキルで PR を作る。本文はスクリプトが機械的に組み立てる証拠: `check.sh full` の結果、実動作確認の記録、受け入れ条件、変更規模。
 3. ラベルで振り分け:
    - `evidence-ok`: 検査通過・実動作確認あり・S/M・リスクのあるパスなし → 証拠だけ見てマージ
