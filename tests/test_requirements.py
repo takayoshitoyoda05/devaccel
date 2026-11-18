@@ -1421,3 +1421,24 @@ class R3PrSnapshotTest(ReqKit):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R4SnapshotTest(ReqKit):
+    def test_R4_export_head_ignores_export_ignore_and_fails_closed(self):
+        """PR-12: the PR snapshot contains every tracked file (export-ignore in .gitattributes cannot drop a
+        failing test), and an unusable HEAD fails the evidence instead of passing an empty tree."""
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_pr
+        (self.root / ".gitattributes").write_text("tests/test_bad.py export-ignore\n")
+        (self.root / "tests").mkdir(exist_ok=True)
+        (self.root / "tests/test_bad.py").write_text("def test_bad():\n    assert False\n")
+        self.commit("attrs")
+        dest = self.tmp / "snap"
+        dest.mkdir()
+        self.assertTrue(devaccel_pr.export_head(self.root, dest))
+        self.assertTrue((dest / "tests/test_bad.py").exists())
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        sh(empty, "git", "init", "-q")
+        (self.tmp / "snap2").mkdir()
+        self.assertFalse(devaccel_pr.export_head(empty, self.tmp / "snap2"))

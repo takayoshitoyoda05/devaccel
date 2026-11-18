@@ -95,6 +95,36 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
     return ok, stages, ("" if ok else "\n".join(out[-30:])), round(time.time() - t0, 1)
 
 
+def export_head(root: Path, dest: Path) -> bool:
+    """Write HEAD's tracked files into dest from git objects. Not `git archive`: that honours
+    `export-ignore` in the branch's .gitattributes, which would drop a failing test from the check.
+    Symlinks are written as plain files holding the target text (never followed)."""
+    ls = subprocess.run(["git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+                        capture_output=True)
+    if ls.returncode != 0:
+        return False
+    entries = [e for e in ls.stdout.split(b"\0") if e]
+    count = 0
+    for e in entries:
+        meta, _, path = e.partition(b"\t")
+        mode, kind, sha = meta.split()
+        if kind != b"blob":  # submodules are not part of the check
+            continue
+        blob = subprocess.run(["git", "-C", str(root), "cat-file", "blob", sha.decode()], capture_output=True)
+        if blob.returncode != 0:
+            return False
+        rel = os.fsdecode(path)
+        target = (dest / rel).resolve()
+        if dest.resolve() not in target.parents:
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(blob.stdout)
+        if mode == b"100755":
+            target.chmod(0o755)
+        count += 1
+    return count > 0
+
+
 _OUTCOMES = r"(\d+) (passed|failed|skipped|xfailed|xpassed|errors?|deselected)"
 
 
@@ -185,9 +215,10 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str) -> dict:
 
     # judge the commit, not the working tree: untracked/ignored files (a stray conftest.py) must not count
     with tempfile.TemporaryDirectory(prefix="devaccel-pr-") as snap:
-        arch = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", "HEAD"], capture_output=True)
-        subprocess.run(["tar", "-x", "-C", snap], input=arch.stdout, capture_output=True)
-        check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, Path(snap))
+        if export_head(root, Path(snap)):
+            check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, Path(snap))
+        else:  # never judge an empty or partial tree as passing
+            check_ok, stages, tail, check_secs = False, ["== failed: snapshot (HEAD を取り出せない)"], "", 0.0
     base_sha = (git(root, "rev-parse", "-q", "--verify", f"origin/{base_branch}").strip()
                 or git(root, "rev-parse", "-q", "--verify", base_branch).strip())
     # display only: behaviour changed but no docs touched (parallel units drift apart here)
