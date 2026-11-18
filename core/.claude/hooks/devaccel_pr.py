@@ -47,7 +47,8 @@ LABELS = {
 
 
 def run(cmd: list[str], cwd: Path, timeout: int = 600, env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, env=env,
+                          stdin=subprocess.DEVNULL)
 
 
 # check.sh cds via ${DEVACCEL_ROOT:-...} (older ones: `cd "$(dirname "$0")/.."`); point it at the

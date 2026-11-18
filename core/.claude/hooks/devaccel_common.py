@@ -202,8 +202,9 @@ def confined(cmd: list[str], tree: Path, protect: list[Path] | None = None) -> t
     if not bw:
         return None
     tree = tree.resolve()
-    args = [bw, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
-            "--tmpfs", str(HOME), "--die-with-parent"]
+    # --new-session: no TIOCSTI into the user's terminal; own pid/ipc/uts namespaces (network stays shared)
+    args = [bw, "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--new-session", "--die-with-parent",
+            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", str(HOME)]
     for rel in HOME_RO:
         p = HOME / rel
         if p.exists():
