@@ -214,6 +214,8 @@ def main() -> int:
     cfg = load_config(root)
     base = cfg["scale"]["base_branch"]
     head, items = split_tasks(a.tasks.read_text(encoding="utf-8"))
+    if a.tasks.name == "prompt.md" and not a.dry_run:  # written by the guard for this run only: never reused
+        write_nofollow(root / ".devaccel" / "prompt.md", None)
     if not items or (os.environ.get("CLAUDECODE") and len(items) < 2):
         print(f"{len(items)} task(s) found: a fan-out needs items starting with '1. ', '2. ', ... (one per line "
               "start); for a single task just implement it", file=sys.stderr)
