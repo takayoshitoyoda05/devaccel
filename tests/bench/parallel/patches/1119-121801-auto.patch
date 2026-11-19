@@ -1,0 +1,1444 @@
+diff --git a/docs/design/20261119-extra-modules.md b/docs/design/20261119-extra-modules.md
+new file mode 100644
+index 0000000..af96d92
+--- /dev/null
++++ b/docs/design/20261119-extra-modules.md
+@@ -0,0 +1,42 @@
++# extra-modules
++目的: 家計簿に純粋関数の新モジュールを 4 つ足す(予算アラート・外貨換算・レシート OCR 解析・年間まとめ)/ やらないこと: CLI・既存ファイル(`core.py` `__init__.py` 既存テスト)の変更、I/O(ファイル・ネット・時計)、float での金額計算
++共通前提: 標準ライブラリのみ・既存ファイル不変・金額は円の整数・各モジュールは自分のテストだけを足す・`from kakeibo.core import Expense`(`day: date, category: str, amount: int, memo: str`)を使ってよい・不正な引数は `ValueError`(型違いは `TypeError`)で、メッセージは日本語で原因の値を含める
++判断一覧(依頼から決められない点の既定):
++- D1 「もうすぐ超えそう」= 使用額が上限の `warn_percent`%(既定 80)以上で、超えてはいない。ちょうど上限は「超えた」ではなく「もうすぐ」(`core.find_overruns` の `actual > limit` と揃える)。日割りの予測はしない
++- D2 レートの無い日は、同じ通貨の直前の日のレートを `max_gap_days`(既定 7)日まで繰り越して使い、`estimated=True` を付ける。それより古い・直前が無いなら換算せず `missing` に入れる(例外にしない)
++- D3 円への丸めは 1 件ごとに `ROUND_HALF_UP`(0.5 円は切り上げ、負数は絶対値で丸めて符号を戻す)。合計を後から丸めない
++- D4 レシート解析は何があっても例外を出さない。読めない項目は `None` にして理由を `warnings` に入れる。OCR の読み違い(`O`→0、`l` `I`→1)は数字の並びの中でだけ直す
++- D5 年間まとめの月は 12 か月すべてを 0 埋めで返す。カテゴリ割合は「正の純額のカテゴリ」だけを分母にし、返金で純額が 0 以下のカテゴリは割合から外す
++- D6 返金(負の金額)は、予算アラートでは使用額に含め(相殺する)、外貨換算では負のまま換算、年間まとめでは月合計に含める
++
++1. `src/kakeibo/budget_alert.py` + `tests/test_budget_alert.py` — `def check_budget(spent: dict[str, int], limits: dict[str, int], warn_percent: int = 80) -> list[BudgetAlert]`、`@dataclass(frozen=True) class BudgetAlert: category: str; status: Literal["over", "near"]; limit: int; spent: int; over: int`(over = max(0, spent − limit))
++規則: R1 `spent` は 1 か月のカテゴリ別合計(`core.total_by_category` の結果をそのまま渡せる)、`limits` に無いカテゴリは予算なしとして無視、`limits` にあって `spent` に無いカテゴリは使用額 0 として扱いアラートなし / R2 `spent > limit` → `over`、`spent * 100 >= limit * warn_percent` かつ `spent <= limit` → `near`、整数だけで比較する(float 禁止) / R3 上限 0: 使用額 > 0 なら `over`、0 以下ならアラートなし(0 での割り算をしない) / R4 並びは `over` が先、同じ status の中では超過額(`near` は使用割合)の大きい順、同点はカテゴリ名の昇順 / R5 `warn_percent` が 1〜100 の整数でない、上限が負、`bool` を金額に使う → `ValueError`
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E1-1 | spent={"食費": 40000}, limits={"食費": 40000} | `[BudgetAlert("食費","near",40000,40000,0)]` | R2 |
++| E1-2 | spent={"食費": 1}, limits={"食費": 0} | `status="over", over=1` | R3 |
++| E1-3 | spent={"食費": 100}, limits={"食費": 100}, warn_percent=0 | `ValueError` | R5 |
++
++2. `src/kakeibo/fx_convert.py` + `tests/test_fx_convert.py` — `def convert_to_yen(items: list[ForeignExpense], rates: dict[str, dict[date, Decimal]], max_gap_days: int = 7) -> ConvertResult`、`ForeignExpense(day: date, currency: str, amount: Decimal, category: str, memo: str = "")`、`ConvertedExpense(expense: Expense, rate: Decimal, rate_day: date, estimated: bool)`、`ConvertResult(converted: list[ConvertedExpense], missing: list[ForeignExpense])`(すべて frozen dataclass)
++規則: R1 `rates[通貨][日付]` は 1 単位あたりの円(`Decimal`)。通貨コードは前後の空白を除き大文字にして比べる(`usd` `" USD "` は `USD`)。受け付けるコードは英字 3 文字、`JPY` はレート無しでそのまま(rate=1, estimated=False、小数の円は R2 で丸める) / R2 換算額 = amount × rate を D3 の丸めで整数円に / R3 その日のレートがあれば `estimated=False`、無ければ D2(`rate_day` は実際に使った日)。同じ日のレートが無く未来側にしかレートが無い場合も `missing`(未来のレートは使わない) / R4 入出力の並びは入力順を保つ(`converted` と `missing` それぞれ)。`converted` の `Expense` は `day` `category` `memo` を引き継ぐ / R5 `amount` が `float`・`bool` なら `TypeError`、レートが 0 以下・`max_gap_days` が負・通貨コードが不正なら `ValueError`、`rates` に通貨自体が無いなら例外ではなく `missing`
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E2-1 | USD 12.50、rates["USD"]={11/1: 150.2}、日付 11/3 | 1878 円(1877.5 → 切り上げ)、`rate_day=11/1, estimated=True` | R3, D3 |
++| E2-2 | 同上、日付 11/20(max_gap_days=7) | `missing` に入る、`converted` は空 | D2 |
++| E2-3 | USD −3.00(返金)、当日レート 150 | amount=−450 | D3, D6 |
++
++3. `src/kakeibo/receipt_ocr.py` + `tests/test_receipt_ocr.py` — `def parse_receipt(text: str) -> ReceiptInfo`、`@dataclass(frozen=True) class ReceiptInfo: day: date | None; total: int | None; store: str | None; warnings: tuple[str, ...]`
++規則: R1 先に NFKC 正規化(全角数字・`￥`・全角空白を直す)、改行は `\r\n` `\r` `\n` を同じに扱い、空行は無視 / R2 日付の書き方: `2026/11/19` `2026-11-19` `2026.11.19` `2026年11月19日` `2026年 11月 19日`(区切りまわりの空白可)、2 桁年 `26/11/19`(2000 年代)、令和 `令和8年11月19日` `R8.11.19` `R8/11/19`(令和 n 年 = 2018 + n)、時刻が付いていても日付だけ取る。OCR の `O` `o` → 0、`l` `I` → 1 は日付の数字の並びの中だけ直す(`2O26/11/l9` → 2026-11-19)。存在しない日付(2/30)は候補から外して次の候補へ、全部だめなら `None` と警告。複数あれば先に出た有効な日付 / R3 合計の行: キーワード `合計` `総合計` `お会計` `お買上` `お支払` `TOTAL`(大文字小文字無視)。優先は `合計` `総合計` `お会計` `TOTAL` > `お買上` `お支払`、さらに低優先で `小計`(他に無いときだけ使い、警告 `小計から推定` を出す)。同じ優先度が複数あれば最後の行。`税` を含む行(`内消費税` `消費税等` `税込` だけの注記)、`お預り` `お預かり` `釣` `お釣り` `ポイント` `割引` の行は除外(ただし `税込合計 ¥1,080` のように `合計` も含む行は合計として使う) / R4 金額の書き方: `¥1,234` `￥1234` `1,234円` `1234円` `\1,234` `1,234-`、`1.234`(小数点の後がちょうど 3 桁)は桁区切りの OCR 誤りとして 1234、`1 234`(空白区切りの 3 桁組)も可。数字の並びの中の `O` → 0、`l` `I` → 1 を直す。金額はキーワードと同じ行の最後の金額、無ければ次の行の金額。0 以下や読めない金額は `None` と警告 / R5 店名: 先頭から 6 行目までの最初の「店名らしい」行。日付・電話(`TEL` `電話` `03-1234-5678`)・郵便(`〒`)・住所(都道府県名で始まる)・`領収書` `領収証` `レシート` `RECEIPT` `No.` `伝票` `責` を含む行、数字・記号だけの行は店名にしない。前後の空白と `*` `-` `=` の飾りを取り、行内の連続空白は 1 つに。見つからなければ `None` と警告 / R6 `text` が空・空白だけ、または str 以外でも `parse_receipt("")` は全項目 `None` と警告を返す(例外にしない)。str 以外は `TypeError`
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E3-1 | `"ファミリーマート\n2O26/11/l9 12:30\n小計 ¥980\n合計 ¥1.O78\nお預り ¥2,000"` | 店名ファミリーマート・2026-11-19・1078 | R2, R3, R4 |
++| E3-2 | `"R8.11.19\n合計\n¥3,300\n(内消費税 300)"` | 日付 2026-11-19・3300(次の行の金額) | R2, R3, R4 |
++| E3-3 | `"2026/02/30\n小計 500"` | 日付 None・500・警告 2 件 | R2, R3 |
++
++4. `src/kakeibo/year_summary.py` + `tests/test_year_summary.py` — `def summarize_year(rows: list[Expense], year: int) -> YearSummary`、`@dataclass(frozen=True) class YearSummary: year: int; monthly: dict[str, int]; total: int; top_month: str | None; top_month_total: int; shares: dict[str, float]`
++規則: R1 `year` の `YYYY-01`〜`YYYY-12` を昇順で全部 `monthly` に入れる(支出の無い月は 0)。他の年の行は無視。`total` は `monthly` の合計(返金は引く) / R2 `top_month` は月合計が最大の月(`YYYY-MM`)、同点は早い月。全月が 0 以下なら `None`、`top_month_total` は 0 / R3 `shares` は カテゴリ → 百分率(%、小数第 1 位)。対象はその年の行のカテゴリ別純額が正のカテゴリだけ(D5)、分母はそれらの純額の合計。丸めは最大剰余法(0.1% 単位)で、合計がちょうど 100.0 になる。並びは割合の降順、同点はカテゴリ名の昇順。対象が無ければ `{}` / R4 カテゴリは前後の空白を除いた文字列で同じとみなす(大文字小文字・全角半角は区別しない)/ R5 `rows` が空でも例外にしない(全 0・`top_month=None`・`shares={}`)。`year` が 1〜9999 の整数でない(`bool` 含む)→ `ValueError`
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E4-1 | 2026: 食費 1/3 3000、食費 3/2 2000、交通 3/9 5000 | `top_month="2026-03"`(7000)・`shares={"食費": 50.0, "交通": 50.0}`、全 12 か月入り | R1, R2, R3 |
++| E4-2 | 食費 1000、交通 1000、娯楽 1000(割合 33.333…%) | 33.4 / 33.3 / 33.3(同点は名前順で 33.4 を先頭のカテゴリに)、合計 100.0 | R3 |
++| E4-3 | 食費 3000、食費 −3000(返金)、交通 1000 | `shares={"交通": 100.0}` | D5, R3 |
+diff --git a/src/kakeibo/budget_alert.py b/src/kakeibo/budget_alert.py
+new file mode 100644
+index 0000000..c8bc8c3
+--- /dev/null
++++ b/src/kakeibo/budget_alert.py
+@@ -0,0 +1,75 @@
++"""Monthly budget alerts per category (pure functions, integer yen only)."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from fractions import Fraction
++from typing import Literal
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    category: str
++    status: Literal["over", "near"]
++    limit: int
++    spent: int
++    over: int  # max(0, spent - limit)
++
++
++def _check_amounts(obj: object, where: str) -> dict[str, int]:
++    if not isinstance(obj, dict):
++        raise TypeError(f"{where} は辞書である必要があります: {type(obj).__name__}")
++    for cat, yen in obj.items():
++        if yen is True or yen is False:
++            raise ValueError(f"{where}.{cat} に真偽値は使えません: {yen!r}")
++        if not isinstance(yen, int):
++            raise TypeError(f"{where}.{cat} は整数である必要があります: {yen!r}")
++    return obj
++
++
++def check_budget(
++    spent: dict[str, int],
++    limits: dict[str, int],
++    warn_percent: int = 80,
++) -> list[BudgetAlert]:
++    """Compare monthly spending with limits and return alerts.
++
++    - spent > limit            -> "over"
++    - spent >= limit * p/100   -> "near" (and spent <= limit)
++    - limit 0: spent > 0 is "over", otherwise no alert.
++    Result: "over" first, then by overage (over) or usage ratio (near) desc,
++    ties by category name asc.
++    """
++    if isinstance(warn_percent, bool) or not isinstance(warn_percent, int):
++        raise TypeError(f"warn_percent は整数である必要があります: {warn_percent!r}")
++    if not 1 <= warn_percent <= 100:
++        raise ValueError(
++            f"warn_percent は 1〜100 の整数である必要があります: {warn_percent}"
++        )
++    _check_amounts(spent, "spent")
++    _check_amounts(limits, "limits")
++    for cat, limit in limits.items():
++        if limit < 0:
++            raise ValueError(f"上限は 0 以上である必要があります: {cat}={limit}")
++
++    # 並び替えキー: (over=0 / near=1, 超過額または使用割合の負値, カテゴリ名)
++    keyed: list[tuple[tuple[int, Fraction, str], BudgetAlert]] = []
++    for cat, used in spent.items():
++        if cat not in limits:
++            continue  # 予算なしのカテゴリは無視
++        limit = limits[cat]
++        if limit == 0:
++            if used > 0:
++                alert = BudgetAlert(cat, "over", 0, used, used)
++                keyed.append(((0, Fraction(-used), cat), alert))
++            continue
++        if used > limit:
++            over = used - limit
++            alert = BudgetAlert(cat, "over", limit, used, over)
++            keyed.append(((0, Fraction(-over), cat), alert))
++        elif used * 100 >= limit * warn_percent:
++            alert = BudgetAlert(cat, "near", limit, used, 0)
++            keyed.append(((1, -Fraction(used, limit), cat), alert))
++
++    keyed.sort(key=lambda pair: pair[0])
++    return [alert for _, alert in keyed]
+diff --git a/src/kakeibo/fx_convert.py b/src/kakeibo/fx_convert.py
+new file mode 100644
+index 0000000..4f2fa9d
+--- /dev/null
++++ b/src/kakeibo/fx_convert.py
+@@ -0,0 +1,135 @@
++"""Convert foreign-currency expenses to yen (pure functions, no I/O)."""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from datetime import date
++from decimal import ROUND_HALF_UP, Decimal
++
++from kakeibo.core import Expense
++
++_CODE_RE = re.compile(r"[A-Z]{3}")
++_JPY = "JPY"
++
++
++@dataclass(frozen=True)
++class ForeignExpense:
++    day: date
++    currency: str
++    amount: Decimal
++    category: str
++    memo: str = ""
++
++
++@dataclass(frozen=True)
++class ConvertedExpense:
++    expense: Expense
++    rate: Decimal  # yen per 1 unit of the currency
++    rate_day: date  # the day whose rate was actually used
++    estimated: bool  # True when rate_day != expense day (carried over)
++
++
++@dataclass(frozen=True)
++class ConvertResult:
++    converted: list[ConvertedExpense]
++    missing: list[ForeignExpense]
++
++
++def _normalize_code(code: object, where: str) -> str:
++    if not isinstance(code, str):
++        raise TypeError(f"{where} の通貨コードは文字列である必要があります: {code!r}")
++    norm = code.strip().upper()
++    if not _CODE_RE.fullmatch(norm):
++        raise ValueError(f"{where} の通貨コードが不正です(英字3文字): {code!r}")
++    return norm
++
++
++def _as_decimal(value: object, where: str) -> Decimal:
++    if isinstance(value, (bool, float)) or not isinstance(value, (Decimal, int)):
++        raise TypeError(f"{where} は Decimal である必要があります: {value!r}")
++    d = Decimal(value)
++    if not d.is_finite():
++        raise ValueError(f"{where} が有限の数ではありません: {value!r}")
++    return d
++
++
++def _round_yen(value: Decimal) -> int:
++    """Round to whole yen per item: half away from zero (ROUND_HALF_UP on |value|)."""
++    magnitude = int(abs(value).to_integral_value(rounding=ROUND_HALF_UP))
++    return -magnitude if value < 0 else magnitude
++
++
++def _find_rate(
++    by_day: dict[date, Decimal], day: date, max_gap_days: int
++) -> tuple[date, Decimal] | None:
++    if day in by_day:
++        return day, by_day[day]
++    # Only past rates; the nearest earlier day within max_gap_days. Never future rates.
++    candidates = [d for d in by_day if d < day and (day - d).days <= max_gap_days]
++    if not candidates:
++        return None
++    best = max(candidates)
++    return best, by_day[best]
++
++
++def convert_to_yen(
++    items: list[ForeignExpense],
++    rates: dict[str, dict[date, Decimal]],
++    max_gap_days: int = 7,
++) -> ConvertResult:
++    if isinstance(max_gap_days, bool) or not isinstance(max_gap_days, int):
++        raise TypeError(f"max_gap_days は int である必要があります: {max_gap_days!r}")
++    if max_gap_days < 0:
++        raise ValueError(f"max_gap_days は 0 以上である必要があります: {max_gap_days}")
++
++    table: dict[str, dict[date, Decimal]] = {}
++    for cur, by_day in rates.items():
++        code = _normalize_code(cur, "rates のキー")
++        if code in table:
++            raise ValueError(
++                f"通貨コードが重複しています(大文字・空白を除いて比較): {cur!r}"
++            )
++        table[code] = {}
++        for day, raw in by_day.items():
++            if not isinstance(day, date):
++                raise TypeError(
++                    f"rates[{cur!r}] のキーは date である必要があります: {day!r}"
++                )
++            rate = _as_decimal(raw, f"rates[{cur!r}][{day}]")
++            if rate <= 0:
++                raise ValueError(
++                    f"レートは 0 より大きい必要があります: rates[{cur!r}][{day}]={raw}"
++                )
++            table[code][day] = rate
++
++    prepared: list[tuple[ForeignExpense, str, Decimal]] = []
++    for item in items:
++        code = _normalize_code(item.currency, "items")
++        amount = _as_decimal(item.amount, f"amount({item.currency!r})")
++        prepared.append((item, code, amount))
++
++    converted: list[ConvertedExpense] = []
++    missing: list[ForeignExpense] = []
++    for item, code, amount in prepared:
++        if code == _JPY:
++            rate, rate_day, estimated = Decimal(1), item.day, False
++        else:
++            found = _find_rate(table.get(code, {}), item.day, max_gap_days)
++            if found is None:
++                missing.append(item)
++                continue
++            rate_day, rate = found
++            estimated = rate_day != item.day
++        yen = _round_yen(amount * rate)
++        converted.append(
++            ConvertedExpense(
++                expense=Expense(
++                    day=item.day, category=item.category, amount=yen, memo=item.memo
++                ),
++                rate=rate,
++                rate_day=rate_day,
++                estimated=estimated,
++            )
++        )
++    return ConvertResult(converted=converted, missing=missing)
+diff --git a/src/kakeibo/receipt_ocr.py b/src/kakeibo/receipt_ocr.py
+new file mode 100644
+index 0000000..6252da7
+--- /dev/null
++++ b/src/kakeibo/receipt_ocr.py
+@@ -0,0 +1,251 @@
++"""Receipt OCR text parser (pure functions, standard library only).
++
++parse_receipt never raises for bad OCR text: fields that cannot be read become
++None and the reason is recorded in ``warnings``. Only a non-str argument raises.
++"""
++
++from __future__ import annotations
++
++import re
++import unicodedata
++from dataclasses import dataclass
++from datetime import date
++
++__all__ = ["ReceiptInfo", "parse_receipt"]
++
++
++@dataclass(frozen=True)
++class ReceiptInfo:
++    day: date | None
++    total: int | None
++    store: str | None
++    warnings: tuple[str, ...]
++
++
++# A digit as printed by OCR: real digits plus the look-alikes O/o (0) and l/I (1).
++_D = "[0-9OoIl]"
++_OCR = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1"})
++
++
++def _fixnum(s: str) -> int:
++    return int(s.translate(_OCR))
++
++
++# --- R2: dates -----------------------------------------------------------------
++
++_DATE_RES = (
++    (
++        "ad",
++        re.compile(
++            rf"(?<!{_D})(?P<y>{_D}{{4}}|{_D}{{2}})[ \t]*(?P<s>[/.\-])[ \t]*"
++            rf"(?P<m>{_D}{{1,2}})[ \t]*(?P=s)[ \t]*(?P<d>{_D}{{1,2}})(?!{_D})"
++        ),
++    ),
++    (
++        "jp",
++        re.compile(
++            rf"(?<!{_D})(?P<y>{_D}{{4}}|{_D}{{2}})年[ \t]*"
++            rf"(?P<m>{_D}{{1,2}})月[ \t]*(?P<d>{_D}{{1,2}})(?!{_D})日?"
++        ),
++    ),
++    (
++        "reiwa_jp",
++        re.compile(
++            rf"令和[ \t]*(?P<n>{_D}{{1,2}})年[ \t]*"
++            rf"(?P<m>{_D}{{1,2}})月[ \t]*(?P<d>{_D}{{1,2}})(?!{_D})日?"
++        ),
++    ),
++    (
++        "reiwa_ad",
++        re.compile(
++            rf"[Rr](?P<n>{_D}{{1,2}})[ \t]*(?P<s>[/.\-])[ \t]*"
++            rf"(?P<m>{_D}{{1,2}})[ \t]*(?P=s)[ \t]*(?P<d>{_D}{{1,2}})(?!{_D})"
++        ),
++    ),
++)
++
++
++def _date_matches(line: str) -> list[tuple[str, re.Match[str]]]:
++    """Date-shaped matches in one line, in order; overlapping ones are dropped."""
++    found: list[tuple[int, int, str, re.Match[str]]] = []
++    for kind, rx in _DATE_RES:
++        for m in rx.finditer(line):
++            found.append((m.start(), m.end(), kind, m))
++    found.sort(key=lambda t: (t[0], -t[1]))
++    out: list[tuple[str, re.Match[str]]] = []
++    last_end = -1
++    for start, end, kind, m in found:
++        if start < last_end:
++            continue
++        out.append((kind, m))
++        last_end = end
++    return out
++
++
++def _to_date(kind: str, m: re.Match[str]) -> date | None:
++    try:
++        if kind in ("reiwa_jp", "reiwa_ad"):
++            n = _fixnum(m.group("n"))
++            if n < 1:
++                return None
++            year = 2018 + n
++        else:
++            raw = m.group("y")
++            year = _fixnum(raw)
++            if len(raw) == 2:
++                year += 2000
++        return date(year, _fixnum(m.group("m")), _fixnum(m.group("d")))
++    except ValueError:
++        return None
++
++
++def _find_date(lines: list[str]) -> tuple[date | None, str | None]:
++    seen_candidate = False
++    for line in lines:
++        for kind, m in _date_matches(line):
++            seen_candidate = True
++            day = _to_date(kind, m)
++            if day is not None:
++                return day, None
++    if seen_candidate:
++        return None, "有効な日付がありません(存在しない日付のみ)"
++    return None, "日付が見つかりません"
++
++
++# --- R3: total -----------------------------------------------------------------
++
++_P1_WORDS = ("合計", "総合計", "お会計")
++_P2_WORDS = ("お買上", "お支払")
++_EXCLUDE_WORDS = ("お預り", "お預かり", "釣", "お釣り", "ポイント", "割引")
++
++
++def _priority(line: str) -> int | None:
++    """1 = best total keyword, 2 = payment keyword, 3 = subtotal, None = not a total line."""
++    upper = line.upper()
++    if any(w in line for w in _P1_WORDS) or (
++        "TOTAL" in upper and "SUBTOTAL" not in upper
++    ):
++        return 1
++    if any(w in line for w in _P2_WORDS):
++        return 2
++    if "小計" in line or "SUBTOTAL" in upper:
++        return 3
++    return None
++
++
++def _excluded(line: str) -> bool:
++    if any(w in line for w in _EXCLUDE_WORDS):
++        return True
++    # 税 notes (内消費税・消費税等・税込) are excluded unless the line is a 合計 line.
++    return "税" in line and "合計" not in line
++
++
++# --- R4: amounts ---------------------------------------------------------------
++
++_NUM = re.compile(
++    r"(?<![.,0-9OoIl])"
++    r"(?:[0-9OoIl]+(?:,[0-9OoIl]{3})+(?![0-9OoIl.,])"  # 1,234
++    r"|[0-9OoIl]+\.[0-9OoIl]{3}(?![0-9OoIl])"  # 1.234 (OCR for 1,234)
++    r"|[0-9OoIl]+(?: [0-9OoIl]{3})+(?![0-9OoIl])"  # 1 234
++    r"|[0-9OoIl]+(?![0-9OoIl.,]))"  # 1234
++)
++
++
++def _read_amounts(line: str) -> list[int]:
++    """Every readable amount in the line, in order. A leading '-' makes it negative."""
++    out: list[int] = []
++    for m in _NUM.finditer(line):
++        raw = m.group()
++        if not re.search(r"[0-9]", raw):  # e.g. a bare "O" in a word is not a number
++            continue
++        value = int(re.sub(r"[ ,.]", "", raw).translate(_OCR))
++        if m.start() > 0 and line[m.start() - 1] == "-":
++            value = -value
++        out.append(value)
++    return out
++
++
++def _find_total(lines: list[str]) -> tuple[int | None, list[str]]:
++    best: tuple[int, int] | None = None  # (priority, line index); later line wins ties
++    for i, line in enumerate(lines):
++        prio = _priority(line)
++        if prio is None or _excluded(line):
++            continue
++        if best is None or prio <= best[0]:
++            best = (prio, i)
++    if best is None:
++        return None, ["合計が見つかりません"]
++
++    prio, i = best
++    warnings: list[str] = []
++    if prio == 3:
++        warnings.append("小計から推定")
++
++    same_line = _read_amounts(lines[i])
++    value: int | None = None
++    if same_line:
++        value = same_line[-1]
++    elif i + 1 < len(lines):
++        next_line = _read_amounts(lines[i + 1])
++        if next_line:
++            value = next_line[0]
++
++    if value is None:
++        warnings.append("合計の金額が読めません")
++        return None, warnings
++    if value <= 0:
++        warnings.append(f"合計の金額が 0 以下です: {value}")
++        return None, warnings
++    return value, warnings
++
++
++# --- R5: store -----------------------------------------------------------------
++
++_STORE_NG = re.compile(
++    r"TEL|電話|〒|[0-9]{2,4}-[0-9]{2,4}-[0-9]{3,4}"
++    r"|(?i:RECEIPT|No\.)|領収書|領収証|レシート|伝票|責"
++)
++_PREFECTURE = re.compile(
++    r"^(?:北海道|東京都|京都府|大阪府|"
++    r"(?:青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|神奈川|新潟|富山|石川|福井"
++    r"|山梨|長野|岐阜|静岡|愛知|三重|滋賀|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島"
++    r"|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄)県)"
++)
++_LETTER = re.compile(r"[^\W\d_]")
++
++
++def _find_store(lines: list[str]) -> str | None:
++    for line in lines[:6]:
++        if _date_matches(line) or _STORE_NG.search(line) or _PREFECTURE.match(line):
++            continue
++        if not _LETTER.search(line):  # digits and symbols only
++            continue
++        cleaned = re.sub(r"^[\s*=\-]+|[\s*=\-]+$", "", line)
++        cleaned = re.sub(r"\s+", " ", cleaned)
++        if cleaned:
++            return cleaned
++    return None
++
++
++# --- entry point ---------------------------------------------------------------
++
++
++def parse_receipt(text: str) -> ReceiptInfo:
++    if not isinstance(text, str):
++        raise TypeError(f"text は str である必要があります: {type(text).__name__}")
++
++    normalized = unicodedata.normalize("NFKC", text)  # R1
++    lines = [ln.strip() for ln in normalized.splitlines()]
++    lines = [ln for ln in lines if ln]
++
++    day, date_warning = _find_date(lines)
++    total, total_warnings = _find_total(lines)
++    store = _find_store(lines)
++
++    warnings: list[str] = []
++    if date_warning is not None:
++        warnings.append(date_warning)
++    warnings.extend(total_warnings)
++    if store is None:
++        warnings.append("店名が見つかりません")
++    return ReceiptInfo(day=day, total=total, store=store, warnings=tuple(warnings))
+diff --git a/src/kakeibo/year_summary.py b/src/kakeibo/year_summary.py
+new file mode 100644
+index 0000000..56fa87a
+--- /dev/null
++++ b/src/kakeibo/year_summary.py
+@@ -0,0 +1,75 @@
++"""Yearly summary: monthly totals, top month, and category shares (pure functions)."""
++
++from __future__ import annotations
++
++import unicodedata
++from dataclasses import dataclass
++from fractions import Fraction
++
++from kakeibo.core import Expense
++
++
++@dataclass(frozen=True)
++class YearSummary:
++    year: int
++    monthly: dict[str, int]
++    total: int
++    top_month: str | None
++    top_month_total: int
++    shares: dict[str, float]
++
++
++def _check_year(year: object) -> int:
++    # type() is int excludes bool; a single check keeps the spec's ValueError for any non-int.
++    if not (type(year) is int and 1 <= year <= 9999):
++        raise ValueError(f"年は 1〜9999 の整数である必要があります: {year!r}")
++    return year
++
++
++def _key(category: str) -> str:
++    """Category identity: surrounding spaces, case, and full/half width ignored."""
++    return unicodedata.normalize("NFKC", category.strip()).casefold()
++
++
++def _shares(positive: dict[str, int]) -> dict[str, float]:
++    """Percent per category in 0.1% units by largest remainder; sums to exactly 100.0."""
++    if not positive:
++        return {}
++    denom = sum(positive.values())
++    exact = {c: Fraction(v * 1000, denom) for c, v in positive.items()}
++    units = {c: int(q) for c, q in exact.items()}  # all positive, so int() floors
++    left = 1000 - sum(units.values())
++    for c in sorted(positive, key=lambda c: (-(exact[c] - units[c]), c))[:left]:
++        units[c] += 1
++    ordered = sorted(units, key=lambda c: (-units[c], c))
++    return {c: units[c] / 10 for c in ordered}
++
++
++def summarize_year(rows: list[Expense], year: int) -> YearSummary:
++    y = _check_year(year)
++    monthly = {f"{y:04d}-{m:02d}": 0 for m in range(1, 13)}
++    net: dict[str, int] = {}
++    names: dict[str, str] = {}
++    for e in rows:
++        if e.day.year != y:
++            continue
++        monthly[f"{y:04d}-{e.day.month:02d}"] += e.amount
++        k = _key(e.category)
++        names.setdefault(k, e.category.strip())
++        net[k] = net.get(k, 0) + e.amount
++
++    top_month: str | None = None
++    top_month_total = 0
++    for m, v in monthly.items():  # ascending, so ties keep the earliest month
++        if v > 0 and v > top_month_total:
++            top_month, top_month_total = m, v
++
++    positive = {names[k]: v for k, v in net.items() if v > 0}
++    return YearSummary(
++        year=y,
++        monthly=monthly,
++        total=sum(monthly.values()),
++        top_month=top_month,
++        top_month_total=top_month_total,
++        shares=_shares(positive),
++    )
+diff --git a/tests/test_budget_alert.py b/tests/test_budget_alert.py
+new file mode 100644
+index 0000000..39e4e4a
+--- /dev/null
++++ b/tests/test_budget_alert.py
+@@ -0,0 +1,191 @@
++"""Tests for kakeibo.budget_alert."""
++
++from __future__ import annotations
++
++import pytest
++
++from kakeibo.budget_alert import BudgetAlert, check_budget
++
++
++# 例の表 E1-1 / E1-2 / E1-3
++@pytest.mark.parametrize(
++    ("case_id", "spent", "limits", "warn_percent", "expected"),
++    [
++        pytest.param(
++            "E1-1",
++            {"食費": 40000},
++            {"食費": 40000},
++            80,
++            [BudgetAlert("食費", "near", 40000, 40000, 0)],
++            id="E1-1",
++        ),
++        pytest.param(
++            "E1-2",
++            {"食費": 1},
++            {"食費": 0},
++            80,
++            [BudgetAlert("食費", "over", 0, 1, 1)],
++            id="E1-2",
++        ),
++        pytest.param(
++            "E1-3",
++            {"食費": 100},
++            {"食費": 100},
++            0,
++            ValueError,
++            id="E1-3",
++        ),
++    ],
++)
++def test_example_table(
++    case_id: str,
++    spent: dict[str, int],
++    limits: dict[str, int],
++    warn_percent: int,
++    expected: object,
++) -> None:
++    assert case_id
++    if expected is ValueError:
++        with pytest.raises(ValueError):
++            check_budget(spent, limits, warn_percent)
++    else:
++        assert check_budget(spent, limits, warn_percent) == expected
++
++
++# R1: 予算なしのカテゴリは無視、spent に無いカテゴリは使用額 0 でアラートなし
++def test_R1_category_without_limit_is_ignored() -> None:
++    assert check_budget({"娯楽": 99999}, {"食費": 100}) == []
++
++
++def test_R1_limit_without_spent_gives_no_alert() -> None:
++    assert check_budget({}, {"食費": 100}) == []
++
++
++# R2: 超過は over、warn_percent 以上かつ上限以内は near、ちょうど上限は near
++def test_R2_over_when_spent_exceeds_limit() -> None:
++    assert check_budget({"食費": 1001}, {"食費": 1000}) == [
++        BudgetAlert("食費", "over", 1000, 1001, 1)
++    ]
++
++
++def test_R2_limit_exactly_is_near_not_over() -> None:
++    [alert] = check_budget({"食費": 1000}, {"食費": 1000})
++    assert alert.status == "near"
++    assert alert.over == 0
++
++
++def test_R2_near_threshold_is_inclusive() -> None:
++    # 80% ちょうど(800/1000)は near
++    assert check_budget({"食費": 800}, {"食費": 1000}) == [
++        BudgetAlert("食費", "near", 1000, 800, 0)
++    ]
++
++
++def test_R2_below_threshold_gives_no_alert() -> None:
++    # 799/1000 は 79.9% なのでアラートなし
++    assert check_budget({"食費": 799}, {"食費": 1000}) == []
++
++
++def test_R2_warn_percent_is_applied() -> None:
++    assert check_budget({"食費": 500}, {"食費": 1000}, warn_percent=50) == [
++        BudgetAlert("食費", "near", 1000, 500, 0)
++    ]
++
++
++def test_R2_comparison_is_exact_integer() -> None:
++    # 1 円差の境界で float 誤差が出ないこと: 0.8 * 3 は 2.4000000000000004 になる
++    assert check_budget({"食費": 2400}, {"食費": 3000}) == [
++        BudgetAlert("食費", "near", 3000, 2400, 0)
++    ]
++    assert check_budget({"食費": 2399}, {"食費": 3000}) == []
++
++
++# R3: 上限 0
++def test_R3_zero_limit_with_spending_is_over() -> None:
++    assert check_budget({"食費": 5}, {"食費": 0}) == [
++        BudgetAlert("食費", "over", 0, 5, 5)
++    ]
++
++
++def test_R3_zero_limit_with_zero_spending_has_no_alert() -> None:
++    assert check_budget({"食費": 0}, {"食費": 0}) == []
++
++
++def test_R3_zero_limit_with_negative_spending_has_no_alert() -> None:
++    # 返金で使用額が負になった場合も 0 以下としてアラートなし
++    assert check_budget({"食費": -10}, {"食費": 0}) == []
++
++
++# D6: 返金(負の金額)は使用額に含めて相殺する
++def test_D6_refund_offsets_spending_below_threshold() -> None:
++    assert check_budget({"食費": 500}, {"食費": 1000}) == []
++    assert check_budget({"食費": 900 - 400}, {"食費": 1000}) == []
++
++
++# R4: 並び順
++def test_R4_over_comes_before_near() -> None:
++    result = check_budget(
++        {"A": 900, "B": 2000},
++        {"A": 1000, "B": 1000},
++    )
++    assert [a.status for a in result] == ["over", "near"]
++    assert [a.category for a in result] == ["B", "A"]
++
++
++def test_R4_over_sorted_by_overage_desc() -> None:
++    result = check_budget(
++        {"A": 1100, "B": 1500, "C": 1200},
++        {"A": 1000, "B": 1000, "C": 1000},
++    )
++    assert [a.category for a in result] == ["B", "C", "A"]
++
++
++def test_R4_near_sorted_by_usage_ratio_desc() -> None:
++    # 使用割合: X=850/1000=85%, Y=800/900≈88.9%, Z=900/1000=90%(over ではないので near)
++    result = check_budget(
++        {"X": 850, "Y": 800, "Z": 900},
++        {"X": 1000, "Y": 900, "Z": 1000},
++    )
++    assert [a.category for a in result] == ["Z", "Y", "X"]
++
++
++def test_R4_ties_sorted_by_category_name() -> None:
++    result = check_budget(
++        {"いろ": 1100, "あ": 1100},
++        {"いろ": 1000, "あ": 1000},
++    )
++    assert [a.category for a in result] == ["あ", "いろ"]
++
++
++# R5: 不正な引数
++@pytest.mark.parametrize("wp", [0, 101, -1])
++def test_R5_warn_percent_out_of_range(wp: int) -> None:
++    with pytest.raises(ValueError):
++        check_budget({"食費": 1}, {"食費": 10}, warn_percent=wp)
++
++
++def test_R5_warn_percent_must_be_int() -> None:
++    with pytest.raises(TypeError):
++        check_budget({"食費": 1}, {"食費": 10}, warn_percent=80.0)  # type: ignore[arg-type]
++
++
++def test_R5_negative_limit_is_value_error() -> None:
++    with pytest.raises(ValueError):
++        check_budget({"食費": 1}, {"食費": -1})
++
++
++def test_R5_bool_amount_is_value_error() -> None:
++    with pytest.raises(ValueError):
++        check_budget({"食費": True}, {"食費": 10})
++    with pytest.raises(ValueError):
++        check_budget({"食費": 1}, {"食費": False})
++
++
++def test_R5_float_amount_is_type_error() -> None:
++    with pytest.raises(TypeError):
++        check_budget({"食費": 1.5}, {"食費": 10})  # type: ignore[dict-item]
++
++
++def test_R5_error_message_contains_offending_value() -> None:
++    with pytest.raises(ValueError, match="-1"):
++        check_budget({"食費": 1}, {"食費": -1})
+diff --git a/tests/test_fx_convert.py b/tests/test_fx_convert.py
+new file mode 100644
+index 0000000..0fb5dfe
+--- /dev/null
++++ b/tests/test_fx_convert.py
+@@ -0,0 +1,214 @@
++"""Tests for kakeibo.fx_convert (pure functions, no I/O)."""
++
++from __future__ import annotations
++
++from datetime import date
++from decimal import Decimal
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.fx_convert import (
++    ConvertedExpense,
++    ConvertResult,
++    ForeignExpense,
++    convert_to_yen,
++)
++
++
++def _usd(day: date, amount: str, memo: str = "") -> ForeignExpense:
++    return ForeignExpense(
++        day=day, currency="USD", amount=Decimal(amount), category="食費", memo=memo
++    )
++
++
++NOV1 = date(2026, 11, 1)
++NOV3 = date(2026, 11, 3)
++NOV20 = date(2026, 11, 20)
++
++
++# --- 例の表 (E2-*) ---------------------------------------------------------
++
++
++def test_E2_1_gap_rate_rounds_half_up_and_is_estimated() -> None:
++    # E2-1: USD 12.50, rate 150.2 on 11/1, converted on 11/3 -> 1877.5 -> 1878 (R3, D3)
++    result = convert_to_yen([_usd(NOV3, "12.50")], {"USD": {NOV1: Decimal("150.2")}})
++    assert result == ConvertResult(
++        converted=[
++            ConvertedExpense(
++                expense=Expense(day=NOV3, category="食費", amount=1878, memo=""),
++                rate=Decimal("150.2"),
++                rate_day=NOV1,
++                estimated=True,
++            )
++        ],
++        missing=[],
++    )
++
++
++def test_E2_2_rate_older_than_max_gap_is_missing() -> None:
++    # E2-2: same rate, converted on 11/20 with max_gap_days=7 -> missing (D2)
++    result = convert_to_yen(
++        [_usd(NOV20, "12.50")], {"USD": {NOV1: Decimal("150.2")}}, max_gap_days=7
++    )
++    assert result.converted == []
++    assert result.missing == [_usd(NOV20, "12.50")]
++
++
++def test_E2_3_refund_stays_negative_and_keeps_fields() -> None:
++    # E2-3: USD -3.00 at rate 150 on the same day -> -450 yen (D3, D6)
++    result = convert_to_yen(
++        [_usd(NOV3, "-3.00", memo="返金")], {"USD": {NOV3: Decimal(150)}}
++    )
++    assert len(result.converted) == 1
++    item = result.converted[0]
++    assert item.expense == Expense(day=NOV3, category="食費", amount=-450, memo="返金")
++    assert item.rate == Decimal(150)
++    assert item.rate_day == NOV3
++    assert item.estimated is False
++
++
++# --- 規則の端のケース -------------------------------------------------------
++
++
++def test_R1_currency_code_is_stripped_and_uppercased_on_items() -> None:
++    item = ForeignExpense(
++        day=NOV3, currency=" usd ", amount=Decimal(1), category="食費"
++    )
++    result = convert_to_yen([item], {"USD": {NOV3: Decimal(150)}})
++    assert [c.expense.amount for c in result.converted] == [150]
++
++
++def test_R1_currency_code_is_normalized_on_rates_keys() -> None:
++    result = convert_to_yen([_usd(NOV3, "2")], {"usd": {NOV3: Decimal(150)}})
++    assert [c.expense.amount for c in result.converted] == [300]
++
++
++def test_R1_duplicate_currency_after_normalization_is_value_error() -> None:
++    with pytest.raises(ValueError):
++        convert_to_yen([], {"USD": {}, " usd ": {}})
++
++
++def test_R3_same_day_rate_is_not_estimated() -> None:
++    result = convert_to_yen([_usd(NOV3, "1")], {"USD": {NOV3: Decimal(150)}})
++    assert result.converted[0].estimated is False
++    assert result.converted[0].rate_day == NOV3
++
++
++def test_R3_future_rate_is_not_used() -> None:
++    result = convert_to_yen([_usd(NOV1, "1")], {"USD": {NOV3: Decimal(150)}})
++    assert result.converted == []
++    assert len(result.missing) == 1
++
++
++def test_D2_gap_exactly_max_gap_days_is_used() -> None:
++    result = convert_to_yen(
++        [_usd(date(2026, 11, 8), "1")], {"USD": {NOV1: Decimal(150)}}, max_gap_days=7
++    )
++    assert result.converted[0].rate_day == NOV1
++    assert result.converted[0].estimated is True
++
++
++def test_D2_max_gap_zero_disables_carry_over() -> None:
++    result = convert_to_yen(
++        [_usd(NOV3, "1")], {"USD": {NOV1: Decimal(150)}}, max_gap_days=0
++    )
++    assert result.converted == []
++    assert len(result.missing) == 1
++
++
++def test_D2_uses_nearest_previous_rate() -> None:
++    rates = {"USD": {date(2026, 11, 1): Decimal(100), date(2026, 11, 4): Decimal(200)}}
++    result = convert_to_yen([_usd(NOV3, "1")], rates)
++    assert result.converted[0].rate == Decimal(100)
++    assert result.converted[0].rate_day == NOV1
++
++
++def test_R1_unknown_currency_in_rates_is_missing_not_error() -> None:
++    result = convert_to_yen([_usd(NOV3, "1")], {"EUR": {NOV3: Decimal(160)}})
++    assert result.converted == []
++    assert len(result.missing) == 1
++
++
++def test_R1_JPY_passes_through_with_rate_one() -> None:
++    item = ForeignExpense(
++        day=NOV3, currency="JPY", amount=Decimal(1200), category="食費"
++    )
++    result = convert_to_yen([item], {})
++    assert result.converted == [
++        ConvertedExpense(
++            expense=Expense(day=NOV3, category="食費", amount=1200, memo=""),
++            rate=Decimal(1),
++            rate_day=NOV3,
++            estimated=False,
++        )
++    ]
++
++
++def test_R1_JPY_fraction_rounds_half_up() -> None:
++    item = ForeignExpense(
++        day=NOV3, currency="JPY", amount=Decimal("1200.5"), category="食費"
++    )
++    result = convert_to_yen([item], {})
++    assert result.converted[0].expense.amount == 1201
++
++
++def test_D3_negative_half_rounds_away_from_zero_with_sign() -> None:
++    result = convert_to_yen([_usd(NOV3, "-0.5")], {"USD": {NOV3: Decimal(1)}})
++    assert result.converted[0].expense.amount == -1
++
++
++def test_D3_rounding_is_per_item_not_on_total() -> None:
++    items = [_usd(NOV3, "0.5"), _usd(NOV3, "0.5")]
++    result = convert_to_yen(items, {"USD": {NOV3: Decimal(1)}})
++    assert [c.expense.amount for c in result.converted] == [1, 1]
++
++
++def test_R4_input_order_is_kept_in_both_lists() -> None:
++    items = [
++        _usd(NOV3, "1", memo="a"),
++        ForeignExpense(
++            day=NOV20, currency="EUR", amount=Decimal(1), category="x", memo="b"
++        ),
++        _usd(NOV3, "2", memo="c"),
++        ForeignExpense(
++            day=NOV3, currency="JPY", amount=Decimal(5), category="y", memo="d"
++        ),
++    ]
++    result = convert_to_yen(items, {"USD": {NOV3: Decimal(150)}})
++    assert [c.expense.memo for c in result.converted] == ["a", "c", "d"]
++    assert [m.memo for m in result.missing] == ["b"]
++
++
++def test_R4_empty_input_gives_empty_result() -> None:
++    assert convert_to_yen([], {}) == ConvertResult(converted=[], missing=[])
++
++
++def test_R5_float_amount_is_type_error() -> None:
++    item = ForeignExpense(day=NOV3, currency="USD", amount=1.5, category="x")  # type: ignore[arg-type]
++    with pytest.raises(TypeError):
++        convert_to_yen([item], {"USD": {NOV3: Decimal(150)}})
++
++
++def test_R5_bool_amount_is_type_error() -> None:
++    item = ForeignExpense(day=NOV3, currency="USD", amount=True, category="x")  # type: ignore[arg-type]
++    with pytest.raises(TypeError):
++        convert_to_yen([item], {"USD": {NOV3: Decimal(150)}})
++
++
++@pytest.mark.parametrize("rate", [Decimal(0), Decimal(-1)])
++def test_R5_non_positive_rate_is_value_error(rate: Decimal) -> None:
++    with pytest.raises(ValueError):
++        convert_to_yen([_usd(NOV3, "1")], {"USD": {NOV3: rate}})
++
++
++def test_R5_negative_max_gap_is_value_error() -> None:
++    with pytest.raises(ValueError):
++        convert_to_yen([], {}, max_gap_days=-1)
++
++
++@pytest.mark.parametrize("code", ["US", "US1", "", "USDX", "日本円", "usd$"])
++def test_R5_invalid_currency_code_is_value_error(code: str) -> None:
++    item = ForeignExpense(day=NOV3, currency=code, amount=Decimal(1), category="x")
++    with pytest.raises(ValueError):
++        convert_to_yen([item], {})
+diff --git a/tests/test_receipt_ocr.py b/tests/test_receipt_ocr.py
+new file mode 100644
+index 0000000..3bc226d
+--- /dev/null
++++ b/tests/test_receipt_ocr.py
+@@ -0,0 +1,291 @@
++from __future__ import annotations
++
++import dataclasses
++from datetime import date
++
++import pytest
++
++from kakeibo.receipt_ocr import ReceiptInfo, parse_receipt
++
++
++# 仕様の例の表(E3-1 〜 E3-3)をそのまま写す
++@pytest.mark.parametrize(
++    ("text", "day", "total", "store", "n_warnings"),
++    [
++        pytest.param(
++            "ファミリーマート\n2O26/11/l9 12:30\n小計 ¥980\n合計 ¥1.O78\nお預り ¥2,000",
++            date(2026, 11, 19),
++            1078,
++            "ファミリーマート",
++            0,
++            id="E3-1",
++        ),
++        pytest.param(
++            "R8.11.19\n合計\n¥3,300\n(内消費税 300)",
++            date(2026, 11, 19),
++            3300,
++            None,  # 店名は仕様で指定なし(「合計」行が店名候補になる)
++            None,  # 警告数も仕様で指定なし
++            id="E3-2",
++        ),
++        pytest.param(
++            "2026/02/30\n小計 500",
++            None,
++            500,
++            "小計 500",  # 店名は「小計 500」行が候補になるため警告 0 件
++            2,
++            id="E3-3",
++        ),
++    ],
++)
++def test_spec_examples(
++    text: str,
++    day: date | None,
++    total: int | None,
++    store: str | None,
++    n_warnings: int | None,
++) -> None:
++    info = parse_receipt(text)
++    assert info.day == day
++    assert info.total == total
++    if store is not None:
++        assert info.store == store
++    if n_warnings is not None:
++        assert len(info.warnings) == n_warnings
++
++
++def test_e3_1_has_no_warnings() -> None:
++    assert (
++        parse_receipt(
++            "ファミリーマート\n2O26/11/l9 12:30\n小計 ¥980\n合計 ¥1.O78\nお預り ¥2,000"
++        ).warnings
++        == ()
++    )
++
++
++def test_e3_3_warns_about_date_and_subtotal() -> None:
++    info = parse_receipt("2026/02/30\n小計 500")
++    assert any("小計から推定" in w for w in info.warnings)
++    assert any("日付" in w for w in info.warnings)
++
++
++def test_receipt_info_is_frozen() -> None:
++    info = ReceiptInfo(day=None, total=None, store=None, warnings=())
++    with pytest.raises(dataclasses.FrozenInstanceError):
++        info.total = 1  # type: ignore[misc]
++
++
++# R2: date formats
++@pytest.mark.parametrize(
++    ("line", "expected"),
++    [
++        ("2026/11/19", date(2026, 11, 19)),
++        ("2026-11-19", date(2026, 11, 19)),
++        ("2026.11.19", date(2026, 11, 19)),
++        ("2026年11月19日", date(2026, 11, 19)),
++        ("2026年 11月 19日", date(2026, 11, 19)),
++        ("26/11/19", date(2026, 11, 19)),
++        ("令和8年11月19日", date(2026, 11, 19)),
++        ("R8.11.19", date(2026, 11, 19)),
++        ("R8/11/19", date(2026, 11, 19)),
++        ("2026/11/19 12:34", date(2026, 11, 19)),
++        ("２０２６／１１／１９", date(2026, 11, 19)),
++        ("2O26年1l月l9日", date(2026, 11, 19)),
++    ],
++    ids=[
++        "slash",
++        "hyphen",
++        "dot",
++        "kanji",
++        "kanji-spaces",
++        "2digit-year",
++        "reiwa-kanji",
++        "reiwa-dot",
++        "reiwa-slash",
++        "time-suffix",
++        "fullwidth",
++        "ocr-letters",
++    ],
++)
++def test_date_formats(line: str, expected: date) -> None:
++    assert parse_receipt(f"店\n{line}\n合計 100").day == expected
++
++
++def test_invalid_date_is_skipped_for_next_candidate() -> None:
++    info = parse_receipt("2026/02/30\n2026/11/19\n合計 100")
++    assert info.day == date(2026, 11, 19)
++    assert not any("日付" in w for w in info.warnings)
++
++
++def test_no_date_warns() -> None:
++    info = parse_receipt("店\n合計 100")
++    assert info.day is None
++    assert any("日付" in w for w in info.warnings)
++
++
++def test_ocr_letters_outside_date_are_not_fixed() -> None:
++    # 日付の数字の並びの外の O は直さない(店名の O はそのまま)
++    assert parse_receipt("CoffeeO\n2026/11/19\n合計 100").store == "CoffeeO"
++
++
++# R3: total lines and priority
++@pytest.mark.parametrize(
++    ("text", "expected"),
++    [
++        pytest.param("小計 1000\n合計 1200", 1200, id="goukei-beats-subtotal"),
++        pytest.param("お買上 500\nお支払 600", 600, id="same-priority-last-wins"),
++        pytest.param("お買上 500\n合計 700", 700, id="goukei-beats-payment"),
++        pytest.param("合計 100\n総合計 200", 200, id="sougoukei-last-wins"),
++        pytest.param("お会計 ¥300", 300, id="okaikei"),
++        pytest.param("total ¥500", 500, id="total-case-insensitive"),
++        pytest.param("TOTAL ¥500", 500, id="total-upper"),
++        pytest.param("税込合計 ¥1,080\n内消費税 80", 1080, id="zeikomi-goukei-kept"),
++        pytest.param(
++            "合計 ¥980\nお預り ¥2,000\nお釣り ¥1,020", 980, id="change-lines-excluded"
++        ),
++        pytest.param("合計 ¥500\nポイント 10", 500, id="point-line-excluded"),
++        pytest.param("合計 ¥500\n割引 -50", 500, id="discount-line-excluded"),
++        pytest.param(
++            "小計 ¥980\n内消費税 80", 980, id="subtotal-with-tax-note-excluded-tax"
++        ),
++    ],
++)
++def test_total_selection(text: str, expected: int) -> None:
++    assert parse_receipt(text).total == expected
++
++
++def test_subtotal_used_only_when_nothing_else() -> None:
++    info = parse_receipt("小計 980")
++    assert info.total == 980
++    assert "小計から推定" in info.warnings
++
++
++def test_subtotal_warning_absent_when_total_keyword_present() -> None:
++    assert "小計から推定" not in parse_receipt("小計 980\n合計 1000").warnings
++
++
++def test_subtotal_word_not_taken_as_total_keyword() -> None:
++    info = parse_receipt("SUBTOTAL 300\nTOTAL 330")
++    assert info.total == 330
++
++
++def test_no_total_keyword_warns() -> None:
++    info = parse_receipt("店\n2026/11/19\nありがとう")
++    assert info.total is None
++    assert info.warnings != ()
++
++
++def test_total_with_no_amount_warns() -> None:
++    info = parse_receipt("合計\n次の行もなし")
++    assert info.total is None
++    assert info.warnings != ()
++
++
++def test_total_zero_becomes_none_with_warning() -> None:
++    info = parse_receipt("合計 ¥0")
++    assert info.total is None
++    assert any("0 以下" in w for w in info.warnings)
++
++
++def test_total_negative_becomes_none_with_warning() -> None:
++    info = parse_receipt("合計 -500")
++    assert info.total is None
++    assert any("0 以下" in w for w in info.warnings)
++
++
++def test_total_amount_on_next_line() -> None:
++    assert parse_receipt("合計\n¥3,300").total == 3300
++
++
++# R4: amount formats
++@pytest.mark.parametrize(
++    ("amount_text", "expected"),
++    [
++        pytest.param("¥1,234", 1234, id="yen-sign-comma"),
++        pytest.param("￥1234", 1234, id="fullwidth-yen-sign"),
++        pytest.param("1,234円", 1234, id="comma-yen-suffix"),
++        pytest.param("1234円", 1234, id="plain-yen-suffix"),
++        pytest.param(r"\1,234", 1234, id="backslash"),
++        pytest.param("1,234-", 1234, id="trailing-hyphen"),
++        pytest.param("1.234", 1234, id="dot-thousands-ocr"),
++        pytest.param("¥1.O78", 1078, id="dot-thousands-with-ocr-o"),
++        pytest.param("1 234", 1234, id="space-thousands"),
++        pytest.param("1 234円", 1234, id="space-thousands-yen"),
++        pytest.param("1,234,567", 1234567, id="multi-comma"),
++    ],
++)
++def test_amount_formats(amount_text: str, expected: int) -> None:
++    assert parse_receipt(f"店\n合計 {amount_text}").total == expected
++
++
++def test_amount_uses_last_on_keyword_line() -> None:
++    assert parse_receipt("店\n合計 ¥100 (税込 ¥110)").total == 110
++
++
++def test_ocr_o_in_amount_is_fixed() -> None:
++    assert parse_receipt("店\n合計 ¥1,O23").total == 1023
++
++
++def test_unreadable_amount_is_not_read_from_fraction() -> None:
++    # 「1.23」は桁区切りとして読めないので 23 にはしない
++    assert parse_receipt("店\n合計 1.23").total is None
++
++
++# R5: store name
++def test_store_skips_header_lines_and_takes_first_name_like_line() -> None:
++    text = "TEL 03-1234-5678\n〒100-0001\n東京都千代田区1-1\nレシート\n*** ベーカリー   本店 ***\n合計 100"
++    assert parse_receipt(text).store == "ベーカリー 本店"
++
++
++def test_store_ignores_lines_after_sixth() -> None:
++    text = "1\n2\n3\n4\n5\n6\n店\n合計 100"
++    info = parse_receipt(text)
++    assert info.store is None
++    assert "店名が見つかりません" in info.warnings
++
++
++def test_store_ignores_digit_and_symbol_only_lines() -> None:
++    assert parse_receipt("1234\n--==--\nパン屋\n合計 100").store == "パン屋"
++
++
++def test_store_skips_receipt_title_words() -> None:
++    assert parse_receipt("領収書\nパン屋\n合計 100").store == "パン屋"
++
++
++def test_store_skips_no_marker() -> None:
++    assert parse_receipt("No.12\nカフェ\n合計 100").store == "カフェ"
++
++
++# R1: newlines and blank lines
++def test_crlf_cr_lf_are_equivalent_and_blank_lines_ignored() -> None:
++    base = "ファミリーマート\n\n2026/11/19\n合計 500"
++    for text in (
++        base,
++        base.replace("\n", "\r\n"),
++        base.replace("\n", "\r"),
++        "\n\n" + base + "\n\n",
++    ):
++        info = parse_receipt(text)
++        assert info.store == "ファミリーマート"
++        assert info.day == date(2026, 11, 19)
++        assert info.total == 500
++
++
++# R6: empty input and types
++@pytest.mark.parametrize(
++    "text", ["", "   ", " \n\t\n "], ids=["empty", "spaces", "blank-lines"]
++)
++def test_empty_text_returns_all_none_with_warnings(text: str) -> None:
++    info = parse_receipt(text)
++    assert info.day is None
++    assert info.total is None
++    assert info.store is None
++    assert len(info.warnings) >= 3
++
++
++@pytest.mark.parametrize(
++    "value", [None, 123, ["合計 100"]], ids=["none", "int", "list"]
++)
++def test_non_str_raises_type_error(value: object) -> None:
++    with pytest.raises(TypeError):
++        parse_receipt(value)  # type: ignore[arg-type]
+diff --git a/tests/test_year_summary.py b/tests/test_year_summary.py
+new file mode 100644
+index 0000000..3ec7dda
+--- /dev/null
++++ b/tests/test_year_summary.py
+@@ -0,0 +1,116 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.year_summary import YearSummary, summarize_year
++
++MONTHS_2026 = [f"2026-{m:02d}" for m in range(1, 13)]
++
++
++def _e(day: str, category: str, amount: int) -> Expense:
++    return Expense(day=date.fromisoformat(day), category=category, amount=amount)
++
++
++def test_e4_1_top_month_and_shares_full_year() -> None:
++    """E4-1: R1, R2, R3."""
++    rows = [
++        _e("2026-01-03", "食費", 3000),
++        _e("2026-03-02", "食費", 2000),
++        _e("2026-03-09", "交通", 5000),
++    ]
++    s = summarize_year(rows, 2026)
++    assert list(s.monthly) == MONTHS_2026  # R1: 12 か月すべて、昇順
++    assert s.monthly["2026-01"] == 3000
++    assert s.monthly["2026-02"] == 0
++    assert s.monthly["2026-03"] == 7000
++    assert s.total == 10000
++    assert s.top_month == "2026-03"  # R2
++    assert s.top_month_total == 7000
++    assert s.shares == {"食費": 50.0, "交通": 50.0}  # R3
++
++
++def test_e4_2_largest_remainder_rounding_sums_to_100() -> None:
++    """E4-2: R3 (33.4 / 33.3 / 33.3, 合計 100.0)."""
++    rows = [
++        _e("2026-01-01", "食費", 1000),
++        _e("2026-01-02", "交通", 1000),
++        _e("2026-01-03", "娯楽", 1000),
++    ]
++    s = summarize_year(rows, 2026)
++    # 同点は名前順(交通 < 娯楽 < 食費)で先頭に 0.1 を配る
++    assert s.shares == {"交通": 33.4, "娯楽": 33.3, "食費": 33.3}
++    assert list(s.shares) == ["交通", "娯楽", "食費"]
++    assert round(sum(s.shares.values()), 1) == 100.0
++
++
++def test_e4_3_refund_category_excluded_from_shares() -> None:
++    """E4-3: D5, R3 (返金で純額 0 以下のカテゴリは割合から外す)."""
++    rows = [
++        _e("2026-01-01", "食費", 3000),
++        _e("2026-01-02", "食費", -3000),
++        _e("2026-01-03", "交通", 1000),
++    ]
++    s = summarize_year(rows, 2026)
++    assert s.shares == {"交通": 100.0}  # D5, R3
++    assert s.total == 1000  # D6: 返金は月合計に含める
++
++
++def test_r1_other_years_ignored() -> None:
++    rows = [_e("2025-12-31", "食費", 999), _e("2027-01-01", "食費", 888)]
++    s = summarize_year(rows, 2026)
++    assert s.total == 0
++    assert all(v == 0 for v in s.monthly.values())
++
++
++def test_r2_tie_top_month_is_earliest() -> None:
++    rows = [_e("2026-07-01", "食費", 500), _e("2026-02-01", "食費", 500)]
++    s = summarize_year(rows, 2026)
++    assert s.top_month == "2026-02"
++    assert s.top_month_total == 500
++
++
++def test_r2_all_non_positive_months_gives_none() -> None:
++    rows = [_e("2026-05-01", "食費", 1000), _e("2026-05-02", "食費", -1000)]
++    s = summarize_year(rows, 2026)
++    assert s.top_month is None
++    assert s.top_month_total == 0
++
++
++def test_r3_no_positive_category_gives_empty_shares() -> None:
++    rows = [_e("2026-01-01", "食費", -100)]
++    assert summarize_year(rows, 2026).shares == {}
++
++
++def test_r4_category_names_normalized() -> None:
++    rows = [
++        _e("2026-01-01", " Food ", 100),
++        _e("2026-01-02", "food", 100),
++        _e("2026-01-03", "ＦＯＯＤ", 200),
++    ]
++    s = summarize_year(rows, 2026)
++    assert len(s.shares) == 1
++    assert list(s.shares.values()) == [100.0]
++
++
++def test_r5_empty_rows() -> None:
++    s = summarize_year([], 2026)
++    assert isinstance(s, YearSummary)
++    assert s.year == 2026
++    assert list(s.monthly) == MONTHS_2026
++    assert all(v == 0 for v in s.monthly.values())
++    assert s.total == 0
++    assert s.top_month is None
++    assert s.top_month_total == 0
++    assert s.shares == {}
++
++
++@pytest.mark.parametrize("year", [0, 10000, -1, True, False, 2026.0, "2026", None])
++def test_invalid_year_raises_value_error(year: object) -> None:
++    with pytest.raises(ValueError):
++        summarize_year([], year)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize("year", [1, 9999])
++def test_year_bounds_accepted(year: int) -> None:
++    assert summarize_year([], year).year == year

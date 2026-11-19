@@ -59,6 +59,17 @@ def clean(s: str) -> str:
             .replace("#", "#\u200b"))
 
 
+MORE_MARK, END_MARK = "<!-- more -->", "<!-- end -->"
+
+
+def complete_items(text: str) -> list[str]:
+    """--watch: the items that are finished — all once END_MARK is there, else those before the last MORE_MARK."""
+    if END_MARK in text:
+        return split_tasks(text.replace(END_MARK, ""))[1]
+    cut = text.rfind(MORE_MARK)
+    return split_tasks(text[:cut])[1] if cut >= 0 else []
+
+
 def split_tasks(text: str) -> tuple[str, list[str]]:
     starts = [m.start() for m in ITEM.finditer(text)]
     if not starts:
@@ -208,13 +219,16 @@ def main() -> int:
     ap.add_argument("--unit-timeout", type=int, default=900, help="seconds before a unit is stopped")
     ap.add_argument("--max-turns", type=int, default=40, help="turn limit per unit")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees and branches afterwards")
+    ap.add_argument("--watch", action="store_true",
+                    help="the file is still being written: start each item's unit as soon as it is complete (items "
+                         "before a `<!-- more -->` line, all items once `<!-- end -->` is there)")
     ap.add_argument("--dry-run", action="store_true", help="check everything and show the plan; run nothing")
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     if os.environ.get("CLAUDECODE"):  # started by the model, outside the sandbox: the guard's grammar, re-checked
         tf = Path(os.path.realpath(a.tasks))
-        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run") and v != ap.get_default(k)]
+        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run", "watch") and v != ap.get_default(k)]
         allowed = [d for d in (root / ".devaccel", root / "docs" / "design")  # real directories inside the repo:
                    if not any(p.is_symlink() for p in (d, d.parent))]  # a linked dir could point at ~/.ssh
         if (tf.parent not in [d.resolve() for d in allowed] or not tf.is_relative_to(root.resolve())
@@ -227,9 +241,12 @@ def main() -> int:
     cfg = load_config(root)
     base = cfg["scale"]["base_branch"]
     head, items = split_tasks(a.tasks.read_text(encoding="utf-8"))
+    watching = a.watch and not a.dry_run and END_MARK not in a.tasks.read_text(encoding="utf-8")
+    if watching:
+        items = complete_items(a.tasks.read_text(encoding="utf-8"))
     if a.tasks.name == "prompt.md" and not a.dry_run:  # written by the guard for this run only: never reused
         write_nofollow(root / ".devaccel" / "prompt.md", None)
-    if not items or (os.environ.get("CLAUDECODE") and len(items) < 2):
+    if not watching and (not items or (os.environ.get("CLAUDECODE") and len(items) < 2)):
         print(f"{len(items)} task(s) found: a fan-out needs items starting with '1. ', '2. ', ... (one per line "
               "start); for a single task just implement it", file=sys.stderr)
         return 2
@@ -263,7 +280,8 @@ def main() -> int:
     t0 = time.time()
     copies = max(1, a.hedge)
     strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong)])
-    for i, it in enumerate(items, 1):
+    def add_item(i: int, it: str) -> bool:
+        """Worktree(s) and command for item i; False if a worktree could not be made."""
         ctx = "" if a.no_context else context_files(root, head + "\n" + it)
         if example_ids(it):
             ctx += ("\n\n例の表の全行を、ID をテストの中に書いて(parametrize の ids など)テストに写してから実装する。"
@@ -288,11 +306,16 @@ def main() -> int:
                                capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
-                cleanup(root, units, a.keep)
-                return 1
+                return False
             if example_ids(it):  # the unit's own gate checks these at Stop (feedback); settle re-checks (authority)
                 write_nofollow(wt / ".devaccel" / "expected-ids", "\n".join(example_ids(it)) + "\n")
             units.append({"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd})
+        return True
+
+    for i, it in enumerate(items, 1):
+        if not add_item(i, it):
+            cleanup(root, units, a.keep)
+            return 1
 
     def settle(u: dict) -> str:
         """Commit the unit's tree (our own git dir; hooks/fsmonitor off; no secrets/state files), then check
@@ -362,11 +385,34 @@ def main() -> int:
 
     running, done, won, speculated = [], [], {}, set()
     pending = list(units)
-    limit, why = plan_jobs(len(units), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
+    watch_until = time.time() + 600
+
+    def poll_watch() -> bool:
+        """Start units for items finished since the last look; False once the file is complete (or timed out)."""
+        try:
+            fd = os.open(os.path.realpath(a.tasks), os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            return time.time() < watch_until
+        done_writing = END_MARK in text or time.time() >= watch_until
+        ready = complete_items(text) if not done_writing else split_tasks(text.replace(END_MARK, ""))[1]
+        for n in range(len(items), len(ready)):
+            items.append(ready[n])
+            before = len(units)
+            if add_item(n + 1, ready[n]):
+                pending.extend(units[before:])
+                print(f"unit {n + 1} started (the design doc is still being written)" if not done_writing
+                      else f"unit {n + 1} started", flush=True)
+        return not done_writing
+    limit, why = plan_jobs(len(units) if not watching else 64, a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
     print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
     # a fresh session per unit: drop the parent session's markers (the anchor comes from the worktree path)
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")}
+    think = os.environ.get("DEVACCEL_UNIT_THINK") or str(cfg["parallel"].get("unit_think_tokens") or "")
+    if think.isdigit():  # cap the units' thinking (the slowest unit spent 40-50 s thinking before its first write)
+        env["MAX_THINKING_TOKENS"] = think
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(max_workers=max(1, limit))  # settling (commit + own check) overlaps the units
     settling: dict = {}
@@ -378,7 +424,9 @@ def main() -> int:
         running.append(u)
 
     try:
-        while pending or running or settling:
+        while pending or running or settling or watching:
+            if watching:
+                watching = poll_watch()
             while pending and len(running) + len(settling) < limit:
                 u = pending.pop(0)
                 if u["i"] not in won:

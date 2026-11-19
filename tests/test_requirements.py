@@ -2124,3 +2124,42 @@ class R34IdSpellingTest(unittest.TestCase):
             self.assertTrue(id_present("E2-3", t), t)
         for t in ("E2-30", "E2-4", "XE2-3", "E12-3"):
             self.assertFalse(id_present("E2-3", t), t)
+
+
+class R35WatchTest(R18BatchEndToEndTest):
+    def test_units_start_while_the_design_doc_is_still_being_written(self):
+        import shutil
+        import time as _t
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        d = self.root / "docs/design"
+        d.mkdir(parents=True, exist_ok=True)
+        doc = d / "20261119-w.md"
+        doc.write_text("目的: x\n\n1. GOODTASK: `a_mod.py`。テストは不要。" + "x" * 80 + "\n<!-- more -->\n")
+        prs, log = self.tmp / "prs.json", self.tmp / "gh.log"
+        prs.write_text("[]")
+        log.write_text("")
+        p = subprocess.Popen(["python3", ".claude/hooks/devaccel_batch.py", "docs/design/20261119-w.md",
+                              "--branch", "batch/w", "--watch"], cwd=self.root, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_PRS": str(prs),
+                                  "FAKE_GH_LOG": str(log), "FAKE_GH_VIEW": ""})
+        _t.sleep(3)
+        doc.write_text(doc.read_text().replace("<!-- more -->", "2. SECRETTASK: `b_mod.py`。テストは不要。" + "x" * 80
+                                               + "\n<!-- end -->"))
+        out, err = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 0, out + err)
+        self.assertIn("unit 2 started", out)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/w").stdout.split()
+        self.assertIn("a_mod.py", files)
+        self.assertIn("b_mod.py", files)
+
+    def test_complete_items_rules(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        self.assertEqual(b.complete_items("h\n1. a\n2. b"), [])
+        self.assertEqual(len(b.complete_items("h\n1. a\n<!-- more -->\n2. b")), 1)
+        self.assertEqual(len(b.complete_items("h\n1. a\n2. b\n<!-- end -->")), 2)

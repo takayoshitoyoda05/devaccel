@@ -1,0 +1,850 @@
+diff --git a/src/kakeibo/budget_alert.py b/src/kakeibo/budget_alert.py
+new file mode 100644
+index 0000000..3b7ee6d
+--- /dev/null
++++ b/src/kakeibo/budget_alert.py
+@@ -0,0 +1,66 @@
++"""Per-category monthly budget alerts (pure functions, no I/O)."""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++from kakeibo.core import Expense
++
++_MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
++_LEVEL_ORDER = {"over": 0, "warn": 1}
++
++
++@dataclass(frozen=True)
++class Alert:
++    category: str
++    month: str
++    spent: int
++    limit: int
++    level: str  # "over" = 超過 / "warn" = もうすぐ超えそう
++
++
++def check_budgets(
++    rows: list[Expense],
++    limits: dict[str, int],
++    month: str,
++    warn_ratio: float = 0.8,
++) -> list[Alert]:
++    """Return alerts for categories in ``limits`` whose spending in ``month`` is near or over the limit.
++
++    - spent > limit            -> "over"
++    - spent >= limit*warn_ratio and spent <= limit -> "warn" (exactly the limit is "warn")
++    - categories not in ``limits`` are ignored.
++    Order: "over" before "warn"; within a level, larger overage first, then category name ascending.
++    """
++    if not _MONTH_RE.fullmatch(month):
++        raise ValueError(f"month は YYYY-MM 形式である必要があります: {month!r}")
++    if not 0.0 <= warn_ratio <= 1.0:
++        raise ValueError(
++            f"warn_ratio は 0 以上 1 以下である必要があります: {warn_ratio!r}"
++        )
++    for cat, limit in limits.items():
++        if limit <= 0:
++            raise ValueError(f"limit は正の整数である必要があります: {cat}={limit!r}")
++
++    spent_by_cat: dict[str, int] = {}
++    for e in rows:
++        if f"{e.day.year:04d}-{e.day.month:02d}" != month:
++            continue
++        spent_by_cat[e.category] = spent_by_cat.get(e.category, 0) + e.amount
++
++    alerts: list[Alert] = []
++    for cat, limit in limits.items():
++        spent = spent_by_cat.get(cat, 0)
++        if spent > limit:
++            level = "over"
++        elif spent / limit >= warn_ratio:
++            level = "warn"
++        else:
++            continue
++        alerts.append(
++            Alert(category=cat, month=month, spent=spent, limit=limit, level=level)
++        )
++
++    alerts.sort(key=lambda a: (_LEVEL_ORDER[a.level], -(a.spent - a.limit), a.category))
++    return alerts
+diff --git a/src/kakeibo/fx.py b/src/kakeibo/fx.py
+new file mode 100644
+index 0000000..a279544
+--- /dev/null
++++ b/src/kakeibo/fx.py
+@@ -0,0 +1,50 @@
++"""外貨の金額を、日ごとのレートで円に換算する(純粋関数・I/O なし)。"""
++
++from datetime import date, timedelta
++from decimal import ROUND_HALF_UP, Decimal
++
++MAX_RATE_AGE = timedelta(days=7)
++_YEN = Decimal(1)
++
++
++class RateNotFound(ValueError):
++    """換算に使えるレートが無い(未知の通貨、または 7 日より古い/それ以前が無い)。"""
++
++
++def to_yen(
++    amount: Decimal | str | int,
++    currency: str,
++    day: date,
++    rates: dict[str, dict[date, Decimal]],
++) -> int:
++    """外貨建ての amount を、day 時点のレートで円(整数)に換算する。
++
++    rates[通貨][日付] = 1 単位あたりの円。通貨コードは大文字小文字を区別しない。
++    その日のレートが無ければ、その日より前で最も近い日のレートを使う(7 日まで)。
++    円への丸めは四捨五入(ROUND_HALF_UP)。
++    """
++    if isinstance(amount, float):
++        raise TypeError(
++            "amount に float は使えません。Decimal・str・int を渡してください"
++        )
++    value = Decimal(amount)
++    code = currency.upper()
++
++    if code == "JPY":
++        return int(value.quantize(_YEN, rounding=ROUND_HALF_UP))
++
++    table = next((t for k, t in rates.items() if k.upper() == code), None)
++    if table is None:
++        raise RateNotFound(f"未知の通貨です: {currency}")
++
++    earlier = [d for d in table if d <= day]
++    if not earlier:
++        raise RateNotFound(f"{currency} の {day} 以前のレートがありません")
++    nearest = max(earlier)
++    if day - nearest > MAX_RATE_AGE:
++        raise RateNotFound(
++            f"{currency} のレートが {day} から {MAX_RATE_AGE.days} 日より古いです"
++        )
++
++    rate = table[nearest]
++    return int((value * rate).quantize(_YEN, rounding=ROUND_HALF_UP))
+diff --git a/src/kakeibo/receipt.py b/src/kakeibo/receipt.py
+new file mode 100644
+index 0000000..8d2d3f2
+--- /dev/null
++++ b/src/kakeibo/receipt.py
+@@ -0,0 +1,86 @@
++"""Extract date, total and store name from OCR text of a receipt (pure functions)."""
++
++from __future__ import annotations
++
++import re
++import unicodedata
++from dataclasses import dataclass
++from datetime import date
++
++
++@dataclass(frozen=True)
++class Receipt:
++    day: date | None
++    total: int | None
++    store: str | None
++
++
++# 2026/11/19, 2026-11-19, 2026.11.19, 2026年11月19日 (after NFKC: full-width digits are half-width)
++_DATE_RE = re.compile(
++    r"(?<!\d)(\d{4})(?:[/\-.]|年)(\d{1,2})(?:[/\-.]|月)(\d{1,2})(?!\d)"
++)
++_TOTAL_KEYWORD_RE = re.compile(r"合計|お会計|総計|total", re.IGNORECASE)
++_SUBTOTAL = "小計"
++_PHONE_RE = re.compile(
++    r"(?:TEL|電話)?[:：]?\s*0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{3,4}", re.IGNORECASE
++)
++# ¥1,234 / \1,234 / 1,234円 / 1234 / 1.234 / 1 234 (3-digit groups separated by , . or space)
++_AMOUNT_RE = re.compile(
++    r"(?P<cur>[¥\\])?\s*(?P<num>\d{1,3}(?:[,.\s]\d{3})+|\d+)\s*(?P<yen>円)?"
++)
++_NOISE_RE = re.compile(r"領収書|レシート")
++
++
++def parse_receipt(text: str) -> Receipt:
++    """Parse OCR text. Never raises; unreadable items are None."""
++    lines = text.splitlines()
++    normalized = [unicodedata.normalize("NFKC", line) for line in lines]
++    return Receipt(
++        day=_find_date(normalized),
++        total=_find_total(normalized),
++        store=_find_store(lines, normalized),
++    )
++
++
++def _find_date(lines: list[str]) -> date | None:
++    for line in lines:
++        for m in _DATE_RE.finditer(line):
++            try:
++                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
++            except ValueError:
++                continue
++    return None
++
++
++def _find_total(lines: list[str]) -> int | None:
++    result: int | None = None
++    for line in lines:
++        if _SUBTOTAL in line or not _TOTAL_KEYWORD_RE.search(line):
++            continue
++        value = _amount_in_line(line)
++        if value is not None:
++            result = value  # later lines win
++    return result
++
++
++def _amount_in_line(line: str) -> int | None:
++    cleaned = _PHONE_RE.sub(" ", _DATE_RE.sub(" ", line))
++    candidates = list(_AMOUNT_RE.finditer(cleaned))
++    marked = [m for m in candidates if m.group("cur") or m.group("yen")]
++    picks = marked or candidates
++    if not picks:
++        return None
++    return int(re.sub(r"\D", "", picks[-1].group("num")))
++
++
++def _find_store(raw_lines: list[str], lines: list[str]) -> str | None:
++    for raw, line in zip(raw_lines, lines):
++        if not raw.strip():
++            continue
++        residue = line
++        for pattern in (_DATE_RE, _PHONE_RE, _AMOUNT_RE, _NOISE_RE):
++            residue = pattern.sub(" ", residue)
++        residue = re.sub(r"[¥\\円]", " ", residue)
++        if re.search(r"[^\W_]", residue):
++            return raw.strip()
++    return None
+diff --git a/src/kakeibo/yearly.py b/src/kakeibo/yearly.py
+new file mode 100644
+index 0000000..eefa23f
+--- /dev/null
++++ b/src/kakeibo/yearly.py
+@@ -0,0 +1,47 @@
++"""Yearly summary of expenses (pure functions, no I/O)."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from kakeibo.core import Expense
++
++
++@dataclass(frozen=True)
++class YearlySummary:
++    year: int
++    monthly: dict[str, int]  # "YYYY-01".."YYYY-12", all 12 keys
++    top_month: str | None
++    shares: dict[str, float]  # category -> share of year total (0..1)
++    total: int
++
++
++def summarize_year(rows: list[Expense], year: int) -> YearlySummary:
++    monthly = {f"{year:04d}-{m:02d}": 0 for m in range(1, 13)}
++    by_category: dict[str, int] = {}
++    total = 0
++    for e in rows:
++        if e.day.year != year:
++            continue
++        key = e.day.strftime("%Y-%m")
++        monthly[key] += e.amount
++        by_category[e.category] = by_category.get(e.category, 0) + e.amount
++        total += e.amount
++
++    top_month: str | None = None
++    if any(v != 0 for v in monthly.values()):
++        # max() returns the first maximal key, so ties go to the earlier month.
++        top_month = max(monthly, key=lambda k: monthly[k])
++
++    shares: dict[str, float] = {}
++    if total != 0:
++        ratios = {cat: amt / total for cat, amt in by_category.items()}
++        shares = dict(sorted(ratios.items(), key=lambda kv: (-kv[1], kv[0])))
++
++    return YearlySummary(
++        year=year,
++        monthly=monthly,
++        top_month=top_month,
++        shares=shares,
++        total=total,
++    )
+diff --git a/tests/test_budget_alert.py b/tests/test_budget_alert.py
+new file mode 100644
+index 0000000..48f605a
+--- /dev/null
++++ b/tests/test_budget_alert.py
+@@ -0,0 +1,163 @@
++"""Tests for kakeibo.budget_alert (pure function, no I/O)."""
++
++from __future__ import annotations
++
++from datetime import date
++
++import pytest
++
++from kakeibo.budget_alert import Alert, check_budgets
++from kakeibo.core import Expense
++
++
++def _e(day: str, category: str, amount: int, memo: str = "") -> Expense:
++    return Expense(
++        day=date.fromisoformat(day), category=category, amount=amount, memo=memo
++    )
++
++
++LIMITS = {"食費": 30000}
++
++
++def test_warn_when_spent_at_80_percent() -> None:
++    rows = [_e("2026-03-01", "食費", 24000)]
++    assert check_budgets(rows, LIMITS, "2026-03") == [
++        Alert(category="食費", month="2026-03", spent=24000, limit=30000, level="warn")
++    ]
++
++
++def test_over_when_spent_exceeds_limit() -> None:
++    rows = [_e("2026-03-01", "食費", 30001)]
++    assert check_budgets(rows, LIMITS, "2026-03") == [
++        Alert(category="食費", month="2026-03", spent=30001, limit=30000, level="over")
++    ]
++
++
++def test_no_alert_just_below_warn_threshold() -> None:
++    rows = [_e("2026-03-01", "食費", 23999)]
++    assert check_budgets(rows, LIMITS, "2026-03") == []
++
++
++def test_exactly_limit_is_warn_not_over() -> None:
++    rows = [_e("2026-03-01", "食費", 30000)]
++    assert check_budgets(rows, LIMITS, "2026-03") == [
++        Alert(category="食費", month="2026-03", spent=30000, limit=30000, level="warn")
++    ]
++
++
++def test_only_rows_of_given_month_are_summed() -> None:
++    rows = [
++        _e("2026-02-28", "食費", 20000),
++        _e("2026-03-01", "食費", 10000),
++        _e("2026-04-01", "食費", 20000),
++    ]
++    assert check_budgets(rows, LIMITS, "2026-03") == []
++    assert check_budgets(rows, LIMITS, "2026-02") == []
++
++
++def test_rows_of_same_category_in_month_are_summed() -> None:
++    rows = [_e("2026-03-01", "食費", 12000), _e("2026-03-31", "食費", 12000)]
++    assert check_budgets(rows, LIMITS, "2026-03") == [
++        Alert(category="食費", month="2026-03", spent=24000, limit=30000, level="warn")
++    ]
++
++
++def test_categories_not_in_limits_are_ignored() -> None:
++    rows = [_e("2026-03-01", "娯楽", 999999)]
++    assert check_budgets(rows, LIMITS, "2026-03") == []
++
++
++def test_empty_rows_gives_no_alerts() -> None:
++    assert check_budgets([], LIMITS, "2026-03") == []
++
++
++def test_no_rows_in_month_gives_no_alerts() -> None:
++    rows = [_e("2026-02-01", "食費", 99999)]
++    assert check_budgets(rows, LIMITS, "2026-03") == []
++
++
++def test_custom_warn_ratio() -> None:
++    rows = [_e("2026-03-01", "食費", 15000)]
++    assert check_budgets(rows, LIMITS, "2026-03", warn_ratio=0.5) == [
++        Alert(category="食費", month="2026-03", spent=15000, limit=30000, level="warn")
++    ]
++
++
++def test_warn_ratio_one_warns_only_at_limit() -> None:
++    rows = [_e("2026-03-01", "食費", 29999)]
++    assert check_budgets(rows, LIMITS, "2026-03", warn_ratio=1.0) == []
++
++
++def test_warn_ratio_zero_is_allowed() -> None:
++    rows = [_e("2026-03-01", "食費", 1000)]
++    assert check_budgets(rows, LIMITS, "2026-03", warn_ratio=0.0) == [
++        Alert(category="食費", month="2026-03", spent=1000, limit=30000, level="warn")
++    ]
++
++
++@pytest.mark.parametrize("bad_limit", [0, -1])
++def test_limit_zero_or_negative_raises(bad_limit: int) -> None:
++    with pytest.raises(ValueError):
++        check_budgets([], {"食費": bad_limit}, "2026-03")
++
++
++@pytest.mark.parametrize("bad_ratio", [-0.1, 1.1, 2.0])
++def test_warn_ratio_outside_0_1_raises(bad_ratio: float) -> None:
++    with pytest.raises(ValueError):
++        check_budgets([], LIMITS, "2026-03", warn_ratio=bad_ratio)
++
++
++@pytest.mark.parametrize(
++    "bad_month", ["2026-3", "2026/03", "202603", "2026-13", "2026-00", "", "2026-03-01"]
++)
++def test_invalid_month_format_raises(bad_month: str) -> None:
++    with pytest.raises(ValueError):
++        check_budgets([], LIMITS, bad_month)
++
++
++def test_sort_over_first_then_warn() -> None:
++    limits = {"食費": 10000, "娯楽": 10000}
++    rows = [
++        _e("2026-03-01", "食費", 8000),  # warn
++        _e("2026-03-01", "娯楽", 10001),  # over
++    ]
++    result = check_budgets(rows, limits, "2026-03")
++    assert [a.level for a in result] == ["over", "warn"]
++    assert [a.category for a in result] == ["娯楽", "食費"]
++
++
++def test_same_level_sorted_by_overage_desc() -> None:
++    limits = {"A": 1000, "B": 1000}
++    rows = [
++        _e("2026-03-01", "A", 1100),  # over by 100
++        _e("2026-03-01", "B", 1500),  # over by 500
++    ]
++    result = check_budgets(rows, limits, "2026-03")
++    assert [a.category for a in result] == ["B", "A"]
++
++
++def test_same_overage_tie_broken_by_category_name_asc() -> None:
++    limits = {"B": 1000, "A": 1000}
++    rows = [
++        _e("2026-03-01", "B", 1100),
++        _e("2026-03-01", "A", 1100),
++    ]
++    result = check_budgets(rows, limits, "2026-03")
++    assert [a.category for a in result] == ["A", "B"]
++
++
++def test_warn_ties_sorted_by_category_name_asc() -> None:
++    limits = {"B": 1000, "A": 1000}
++    rows = [
++        _e("2026-03-01", "B", 800),
++        _e("2026-03-01", "A", 800),
++    ]
++    result = check_budgets(rows, limits, "2026-03")
++    assert [a.category for a in result] == ["A", "B"]
++    assert all(a.level == "warn" for a in result)
++
++
++def test_alert_is_frozen_dataclass() -> None:
++    alert = Alert(category="食費", month="2026-03", spent=1, limit=2, level="warn")
++    with pytest.raises(AttributeError):
++        alert.spent = 5  # type: ignore[misc]
+diff --git a/tests/test_fx.py b/tests/test_fx.py
+new file mode 100644
+index 0000000..2f0e442
+--- /dev/null
++++ b/tests/test_fx.py
+@@ -0,0 +1,116 @@
++from datetime import date
++from decimal import Decimal
++
++import pytest
++
++from kakeibo.fx import RateNotFound, to_yen
++
++D = date(2026, 3, 10)
++RATES: dict[str, dict[date, Decimal]] = {
++    "USD": {D: Decimal("150.25")},
++}
++
++
++def test_exact_day_rate_usd_decimal_amount() -> None:
++    assert to_yen(Decimal("10.00"), "USD", D, RATES) == 1503
++
++
++def test_half_yen_rounds_half_up() -> None:
++    # 10 * 150.25 = 1502.5 -> 1503
++    assert to_yen(10, "USD", D, RATES) == 1503
++
++
++def test_rounds_down_below_half() -> None:
++    rates = {"USD": {D: Decimal("150.24")}}
++    assert to_yen(Decimal(10), "USD", D, rates) == 1502
++
++
++def test_str_amount() -> None:
++    assert to_yen("10.00", "USD", D, RATES) == 1503
++
++
++def test_int_amount() -> None:
++    rates = {"USD": {D: Decimal(100)}}
++    assert to_yen(3, "USD", D, rates) == 300
++
++
++def test_currency_is_case_insensitive() -> None:
++    assert to_yen(10, "usd", D, RATES) == 1503
++
++
++def test_rates_key_case_is_ignored() -> None:
++    rates = {"usd": {D: Decimal("150.25")}}
++    assert to_yen(10, "USD", D, rates) == 1503
++
++
++def test_jpy_returns_int_without_rates() -> None:
++    assert to_yen(1200, "JPY", D, {}) == 1200
++    assert isinstance(to_yen(1200, "jpy", D, {}), int)
++
++
++def test_jpy_str_amount_is_int() -> None:
++    assert to_yen("1200", "JPY", D, {}) == 1200
++
++
++def test_negative_amount_refund() -> None:
++    # -10 * 150.25 = -1502.5 -> ROUND_HALF_UP は 0 から遠ざかる方向 -> -1503
++    assert to_yen(-10, "USD", D, RATES) == -1503
++
++
++def test_falls_back_to_earlier_rate_three_days_before() -> None:
++    rates = {"USD": {date(2026, 3, 7): Decimal(150)}}
++    assert to_yen(Decimal(1), "USD", D, rates) == 150
++
++
++def test_uses_nearest_earlier_rate_not_older_one() -> None:
++    rates = {
++        "USD": {
++            date(2026, 3, 5): Decimal(100),
++            date(2026, 3, 8): Decimal(150),
++        }
++    }
++    assert to_yen(1, "USD", D, rates) == 150
++
++
++def test_ignores_rates_after_the_day() -> None:
++    rates = {
++        "USD": {date(2026, 3, 11): Decimal(999)},
++    }
++    with pytest.raises(RateNotFound):
++        to_yen(1, "USD", D, rates)
++
++
++def test_exactly_seven_days_old_is_allowed() -> None:
++    rates = {"USD": {date(2026, 3, 3): Decimal(150)}}
++    assert to_yen(1, "USD", D, rates) == 150
++
++
++def test_eight_days_old_only_raises_rate_not_found() -> None:
++    rates = {"USD": {date(2026, 3, 2): Decimal(150)}}
++    with pytest.raises(RateNotFound):
++        to_yen(1, "USD", D, rates)
++
++
++def test_no_rate_on_or_before_day_raises() -> None:
++    rates = {"USD": {date(2026, 3, 11): Decimal(150)}}
++    with pytest.raises(RateNotFound):
++        to_yen(1, "USD", D, rates)
++
++
++def test_unknown_currency_raises_rate_not_found() -> None:
++    with pytest.raises(RateNotFound):
++        to_yen(1, "XYZ", D, RATES)
++
++
++def test_rate_not_found_is_value_error() -> None:
++    assert issubclass(RateNotFound, ValueError)
++
++
++def test_float_amount_raises_type_error() -> None:
++    with pytest.raises(TypeError):
++        to_yen(10.0, "USD", D, RATES)  # type: ignore[arg-type]
++
++
++def test_float_amount_raises_type_error_for_jpy() -> None:
++    with pytest.raises(TypeError):
++        to_yen(1200.0, "JPY", D, {})  # type: ignore[arg-type]
+diff --git a/tests/test_receipt.py b/tests/test_receipt.py
+new file mode 100644
+index 0000000..c9eb2a7
+--- /dev/null
++++ b/tests/test_receipt.py
+@@ -0,0 +1,172 @@
++"""Tests for kakeibo.receipt.parse_receipt (OCR text -> date / total / store)."""
++
++from __future__ import annotations
++
++from dataclasses import FrozenInstanceError
++from datetime import date
++
++import pytest
++
++from kakeibo.receipt import Receipt, parse_receipt
++
++EMPTY = Receipt(None, None, None)
++
++
++# --- date -------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "text, expected",
++    [
++        ("2026/11/19", date(2026, 11, 19)),
++        ("2026-11-19", date(2026, 11, 19)),
++        ("2026.11.19", date(2026, 11, 19)),
++        ("2026年11月19日", date(2026, 11, 19)),
++        ("２０２６／１１／１９", date(2026, 11, 19)),  # full-width digits and slash
++        ("2026/1/9", date(2026, 1, 9)),  # single-digit month and day
++    ],
++)
++def test_date_formats(text: str, expected: date) -> None:
++    assert parse_receipt(text).day == expected
++
++
++def test_date_invalid_day_is_none() -> None:
++    assert parse_receipt("2026/02/30").day is None
++
++
++def test_date_first_valid_is_used_when_earlier_one_is_invalid() -> None:
++    assert parse_receipt("2026/02/30\n2026/11/19").day == date(2026, 11, 19)
++
++
++def test_date_first_of_several_valid_is_used() -> None:
++    assert parse_receipt("2026/11/19\n2026/11/20").day == date(2026, 11, 19)
++
++
++def test_date_requires_four_digit_year() -> None:
++    assert parse_receipt("12026/11/19").day is None
++
++
++def test_no_date_is_none() -> None:
++    assert parse_receipt("合計 ¥100").day is None
++
++
++# --- total ------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "line, expected",
++    [
++        ("合計 ¥1,234", 1234),
++        ("合計 1,234円", 1234),
++        ("合計 1234", 1234),
++        ("合計 \\1,234", 1234),
++        ("合計 ￥１，２３４円", 1234),  # full-width yen, digits and comma
++        ("合計 1.234", 1234),  # OCR turned the comma into a dot
++        ("合計 1 234", 1234),  # OCR turned the comma into a space
++        ("お会計 ¥980", 980),
++        ("総計 ¥500", 500),
++        ("TOTAL ¥1,234", 1234),
++        ("total 1,234", 1234),
++        ("Total: 1,234", 1234),
++    ],
++)
++def test_total_formats(line: str, expected: int) -> None:
++    assert parse_receipt(line).total == expected
++
++
++def test_subtotal_line_is_not_total() -> None:
++    assert parse_receipt("小計 ¥1,000").total is None
++
++
++def test_subtotal_ignored_when_total_exists() -> None:
++    assert parse_receipt("小計 ¥1,000\n合計 ¥1,100").total == 1100
++
++
++def test_subtotal_after_total_does_not_override() -> None:
++    assert parse_receipt("合計 1,234\n小計 1,000").total == 1234
++
++
++def test_last_total_line_wins() -> None:
++    assert parse_receipt("合計 ¥100\n合計 ¥200").total == 200
++
++
++def test_keyword_line_without_amount_is_none() -> None:
++    assert parse_receipt("合計").total is None
++
++
++def test_no_keyword_is_none() -> None:
++    assert parse_receipt("牛乳 ¥198\n1,234").total is None
++
++
++def test_total_line_with_phone_number_ignores_phone() -> None:
++    assert parse_receipt("合計 ¥1,234 TEL 03-1234-5678").total == 1234
++
++
++def test_total_line_with_date_ignores_date() -> None:
++    assert parse_receipt("2026/11/19 合計 ¥1,234").total == 1234
++
++
++def test_total_prefers_marked_amount_over_trailing_count() -> None:
++    assert parse_receipt("合計 ¥1,234 (2点)").total == 1234
++
++
++# --- store ------------------------------------------------------------------
++
++
++def test_store_is_first_non_empty_line_stripped() -> None:
++    assert parse_receipt("\n\n  ローソン  \n合計 ¥100").store == "ローソン"
++
++
++def test_store_skips_date_only_line() -> None:
++    assert parse_receipt("2026/11/19\nダイエー").store == "ダイエー"
++
++
++def test_store_skips_amount_only_line() -> None:
++    assert parse_receipt("¥1,200\nセブン").store == "セブン"
++
++
++def test_store_skips_phone_only_line() -> None:
++    assert parse_receipt("03-1234-5678\nABC店").store == "ABC店"
++
++
++def test_store_skips_receipt_title_lines() -> None:
++    assert parse_receipt("領収書\nレシート\nスーパーX").store == "スーパーX"
++
++
++def test_store_none_when_only_non_store_lines() -> None:
++    assert parse_receipt("2026/11/19\n¥100").store is None
++
++
++def test_store_skips_meaningless_symbols() -> None:
++    assert parse_receipt("***\n---\nカフェ").store == "カフェ"
++
++
++# --- whole receipt / degenerate input ----------------------------------------
++
++
++def test_full_receipt() -> None:
++    text = (
++        "スーパーマルエー\n"
++        "東京都千代田区1-2-3\n"
++        "TEL 03-1234-5678\n"
++        "2026/11/19 14:32\n"
++        "牛乳 ¥198\n"
++        "小計 ¥1,000\n"
++        "合計 ¥1,080\n"
++    )
++    assert parse_receipt(text) == Receipt(date(2026, 11, 19), 1080, "スーパーマルエー")
++
++
++@pytest.mark.parametrize("text", ["", "   \n \n\t"])
++def test_empty_text(text: str) -> None:
++    assert parse_receipt(text) == EMPTY
++
++
++def test_meaningless_text() -> None:
++    assert parse_receipt("???") == EMPTY
++
++
++def test_receipt_is_frozen() -> None:
++    receipt = parse_receipt("")
++    with pytest.raises(FrozenInstanceError):
++        receipt.total = 1  # type: ignore[misc]
+diff --git a/tests/test_yearly.py b/tests/test_yearly.py
+new file mode 100644
+index 0000000..a9384f3
+--- /dev/null
++++ b/tests/test_yearly.py
+@@ -0,0 +1,102 @@
++from __future__ import annotations
++
++from datetime import date
++
++from kakeibo.core import Expense
++from kakeibo.yearly import YearlySummary, summarize_year
++
++
++def _e(day: str, category: str, amount: int, memo: str = "") -> Expense:
++    return Expense(
++        day=date.fromisoformat(day), category=category, amount=amount, memo=memo
++    )
++
++
++def test_empty_rows_gives_twelve_zero_months_and_no_top() -> None:
++    s = summarize_year([], 2026)
++    assert isinstance(s, YearlySummary)
++    assert s.year == 2026
++    assert s.monthly == {f"2026-{m:02d}": 0 for m in range(1, 13)}
++    assert s.top_month is None
++    assert s.shares == {}
++    assert s.total == 0
++
++
++def test_monthly_has_all_twelve_keys_in_order() -> None:
++    s = summarize_year([_e("2026-03-01", "food", 100)], 2026)
++    assert list(s.monthly) == [f"2026-{m:02d}" for m in range(1, 13)]
++    assert s.monthly["2026-03"] == 100
++    assert s.monthly["2026-01"] == 0
++
++
++def test_rows_from_other_years_are_ignored() -> None:
++    rows = [
++        _e("2025-12-31", "food", 999),
++        _e("2026-05-10", "food", 300),
++        _e("2027-01-01", "food", 888),
++    ]
++    s = summarize_year(rows, 2026)
++    assert s.total == 300
++    assert s.monthly["2026-05"] == 300
++    assert sum(s.monthly.values()) == 300
++    assert s.shares == {"food": 1.0}
++
++
++def test_same_month_amounts_are_summed() -> None:
++    rows = [_e("2026-02-01", "food", 100), _e("2026-02-28", "rent", 50)]
++    s = summarize_year(rows, 2026)
++    assert s.monthly["2026-02"] == 150
++
++
++def test_top_month_is_max_total() -> None:
++    rows = [
++        _e("2026-01-05", "food", 100),
++        _e("2026-07-05", "food", 500),
++        _e("2026-09-05", "food", 200),
++    ]
++    assert summarize_year(rows, 2026).top_month == "2026-07"
++
++
++def test_top_month_tie_goes_to_earlier_month() -> None:
++    rows = [
++        _e("2026-10-05", "food", 300),
++        _e("2026-04-05", "food", 300),
++        _e("2026-06-05", "food", 100),
++    ]
++    assert summarize_year(rows, 2026).top_month == "2026-04"
++
++
++def test_top_month_none_when_all_amounts_zero() -> None:
++    rows = [_e("2026-03-01", "food", 0)]
++    s = summarize_year(rows, 2026)
++    assert s.top_month is None
++    assert s.total == 0
++
++
++def test_shares_sorted_by_share_desc_then_name_asc() -> None:
++    rows = [
++        _e("2026-01-01", "rent", 100),
++        _e("2026-01-02", "food", 100),
++        _e("2026-01-03", "book", 200),
++    ]
++    s = summarize_year(rows, 2026)
++    assert list(s.shares) == ["book", "food", "rent"]
++    assert s.shares["book"] == 0.5
++    assert s.shares["food"] == 0.25
++    assert s.shares["rent"] == 0.25
++
++
++def test_shares_are_fractions_of_year_total_not_month() -> None:
++    rows = [
++        _e("2026-01-01", "food", 300),
++        _e("2026-02-01", "rent", 100),
++        _e("2025-06-01", "food", 9999),
++    ]
++    s = summarize_year(rows, 2026)
++    assert s.total == 400
++    assert s.shares == {"food": 0.75, "rent": 0.25}
++
++
++def test_total_is_sum_of_all_rows_in_year() -> None:
++    rows = [_e("2026-01-01", "food", 120), _e("2026-12-31", "rent", 80)]
++    assert summarize_year(rows, 2026).total == 200
