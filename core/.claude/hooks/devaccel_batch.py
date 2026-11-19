@@ -389,10 +389,20 @@ def main() -> int:
 
     def poll_watch() -> bool:
         """Start units for items finished since the last look; False once the file is complete (or timed out)."""
+        # re-validated on every read (the file is rewritten while we watch; an editor may replace it): the path
+        # itself, no link on the way (O_NOFOLLOW + link checks), and what was opened is a regular file that
+        # really sits in the allowed directory inside the repo
+        import stat
+        allowed = {(root / ".devaccel").resolve(), (root / "docs" / "design").resolve()}
         try:
-            fd = os.open(os.path.realpath(a.tasks), os.O_RDONLY | os.O_NOFOLLOW)
+            if any(p.is_symlink() for p in (a.tasks.parent, a.tasks.parent.parent)):
+                return False
+            fd = os.open(a.tasks, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(fd, encoding="utf-8") as fh:
-                text = fh.read()
+                real = Path(os.readlink(f"/proc/self/fd/{fh.fileno()}"))
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode) or real.parent not in allowed:
+                    return False
+                text = fh.read(1_000_000)
         except OSError:
             return time.time() < watch_until
         done_writing = END_MARK in text or time.time() >= watch_until
