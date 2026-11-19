@@ -151,6 +151,9 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
         prompt = "/devaccel-batch " + tasks + force + "\n" + TAIL
     elif arm_base == "auto":  # no routing hint: the session decides (fan-out for >=4 independent tasks) and ships
         prompt = tasks + "\n" + TAIL
+    elif arm_base == "auto_design":  # the proposal under test: a design doc with acceptance criteria first
+        prompt = (tasks + "\nまず設計書を書いてから進めて: 各件のファイル・関数とクラスの名前と型・入力と出力の具体例(端の"
+                  "ケースと出す例外)・結果の並び順・受け入れ条件を、件ごとに番号付きで書く。それを実装の指示にする。\n" + TAIL)
     else:
         sh(["git", "checkout", "-q", "-B", f"bench/{arm}", "main"], trial)
         how = OLD_PR if arm_base == "seq_old" else "最後に devaccel-pr スキルで PR を 1 本作って。"

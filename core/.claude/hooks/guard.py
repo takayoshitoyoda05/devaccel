@@ -82,7 +82,8 @@ PR_SCRIPT = re.compile(r"devaccel_(?:pr|land|ship|batch)\b")
 PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s[^`$<>]*)?\s*$")
 SHIP_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_ship\.py(?:\s[^`$<>]*)?\s*$")  # pushes: lock-checked
 # batch runs outside the sandbox (settings: sandbox.excludedCommands): exact form, plain arguments only
-BATCH_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_batch\.py \.devaccel/[\w-]+\.md --branch batch/[\w-]+"
+BATCH_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_batch\.py (?:\.devaccel|docs/design)/[\w-]+\.md "
+                       r"--branch batch/[\w-]+"
                        r"(?: --dry-run)?\s*$")
 LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-run)?\s*$")
 # reads that cannot execute anything (no sed/less/rg: they have exec escapes)
@@ -199,7 +200,7 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
                             "--merge(マージ)は人が端末で実行します。")
         if "devaccel_batch" in s and not BATCH_RUN.search(s):
             return "deny", ("devaccel_batch.py は `python3 .claude/hooks/devaccel_batch.py .devaccel/<名前>.md --branch "
-                            "batch/<名前> [--dry-run]` の形だけ(他のオプションは人が端末で)。")
+                            "batch/<名前> [--dry-run]`(依頼ファイルは docs/design/<名前>.md も可)の形だけ(他のオプションは人が端末で)。")
         if "devaccel_ship" in s and not SHIP_RUN.search(s):
             return "deny", "devaccel_ship.py は `python3 .claude/hooks/devaccel_ship.py ...` の形で直接実行してください。"
         if "devaccel_pr" in s and not PR_RUN.search(s):  # its arguments are harmless; the path is not

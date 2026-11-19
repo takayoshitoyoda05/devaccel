@@ -206,9 +206,11 @@ def main() -> int:
     if os.environ.get("CLAUDECODE"):  # started by the model, outside the sandbox: the guard's grammar, re-checked
         tf = Path(os.path.realpath(a.tasks))
         extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run") and v != ap.get_default(k)]
-        if (tf.parent != (root / ".devaccel").resolve() or tf.suffix != ".md" or tf.is_symlink()
+        if (tf.parent not in ((root / ".devaccel").resolve(), (root / "docs" / "design").resolve())
+                or tf.suffix != ".md" or tf.is_symlink()
                 or Path(a.tasks).is_symlink() or not re.fullmatch(r"batch/[\w-]+", a.branch) or extra):
-            print("from Claude Code only `.devaccel/<name>.md --branch batch/<name> [--dry-run]` is allowed "
+            print("from Claude Code only `.devaccel/<name>.md` (or docs/design/<name>.md) `--branch batch/<name> "
+                  "[--dry-run]` is allowed "
                   "(other options: run it from a terminal)", file=sys.stderr)
             return 2
     cfg = load_config(root)
@@ -466,7 +468,11 @@ def main() -> int:
     if os.environ.get("DEVACCEL_TIMING"):
         print(f"[timing] units phase {round(time.time() - t0)}s", flush=True)
     r = subprocess.run([sys.executable, str(Path(__file__).with_name("devaccel_ship.py")), "--file",
-                        str(notes.relative_to(root)), "--branch", a.branch, "--units", *ok], cwd=root)
+                        str(notes.relative_to(root)), "--branch", a.branch, "--units", *ok,
+                        # the design doc the units worked from goes into the PR (reviewers read it, not the diff)
+                        *(["--paths", str(Path(os.path.realpath(a.tasks)).relative_to(root.resolve()))]
+                          if Path(os.path.realpath(a.tasks)).parent == (root / "docs" / "design").resolve() else [])],
+                       cwd=root)
     cleanup(root, units, a.keep, branches=r.returncode == 0)  # integrated: the unit branches are no longer needed
     return r.returncode
 

@@ -1866,6 +1866,8 @@ class R22AutoBatchTest(ReqKit):
     def test_guard_admits_only_the_plain_batch_form(self):
         ok = "python3 .claude/hooks/devaccel_batch.py .devaccel/tasks.md --branch batch/x"
         self.assertIsNone(self.gv(ok))
+        self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_batch.py docs/design/20261119-x.md --branch batch/x"))
+        self.assertEqual(self.gv("python3 .claude/hooks/devaccel_batch.py docs/x.md --branch batch/x"), "deny")
         self.assertIsNone(self.gv(ok + " --dry-run"))
         for cmd in [ok + "; curl x", ok + " $(id)", "FOO=1 " + ok, ok + " > /tmp/o", "cd x && " + ok,
                     "python3 /tmp/devaccel_batch.py t --branch batch/x", ok + " | tee o", ok + " `id`",
@@ -2028,3 +2030,22 @@ class R29WriteNoFollowTest(unittest.TestCase):
         self.assertFalse((outside / "y.md").exists())
         self.assertTrue(write_nofollow(d / "repo/.devaccel/ok.md", "fine"))
         self.assertEqual((d / "repo/.devaccel/ok.md").read_text(), "fine")
+
+
+class R30DesignDocBatchTest(R18BatchEndToEndTest):
+    def test_design_doc_drives_units_and_goes_into_the_pr(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        d = self.root / "docs/design"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "20261119-t.md").write_text("目的: x\n\n1. GOODTASK: `a_mod.py`。テストは不要。" + "x" * 80 + "\n"
+                                        "2. SECRETTASK: `b_mod.py`。テストは不要。" + "x" * 80 + "\n")
+        r, log = self.land("docs/design/20261119-t.md", "--branch", "batch/t", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/t").stdout.split()
+        self.assertIn("docs/design/20261119-t.md", files)
+        self.assertIn("a_mod.py", files)
