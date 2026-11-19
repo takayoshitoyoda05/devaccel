@@ -1736,6 +1736,8 @@ class R18BatchEndToEndTest(R6ShipTest):
         '  *GOODTASK*) echo "A = 1" > a_mod.py;;\n'
         '  *BADTASK*) echo "BROKEN = 1" >> app.py; echo "C = 1" > c_mod.py;;\n'
         '  *SECRETTASK*) echo "TOKEN=x" > .env; echo "B = 1" > b_mod.py; echo " " >> .claude/project.json;;\n'
+        '  *EXHALF*) echo "H = 1" > h_mod.py; mkdir -p tests; printf "IDS = [%s]\\n" "\\"E1-1\\"" > tests/test_h.py;;\n'
+        '  *EXFULL*) echo "F = 1" > f_mod.py; mkdir -p tests; printf "IDS = [%s]\\n" "\\"E2-1\\", \\"E2-2\\"" > tests/test_f.py;;\n'
         '  *SELFCOMMIT*) echo "S = 1" > s_mod.py; echo "K" > id_rsa; git add -A; git -c user.name=u '
         '-c user.email=u@x commit -qm self;;\n'
         'esac\n'
@@ -1866,6 +1868,8 @@ class R22AutoBatchTest(ReqKit):
     def test_guard_admits_only_the_plain_batch_form(self):
         ok = "python3 .claude/hooks/devaccel_batch.py .devaccel/tasks.md --branch batch/x"
         self.assertIsNone(self.gv(ok))
+        self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_batch.py docs/design/20261119-x.md --branch batch/x"))
+        self.assertEqual(self.gv("python3 .claude/hooks/devaccel_batch.py docs/x.md --branch batch/x"), "deny")
         self.assertIsNone(self.gv(ok + " --dry-run"))
         for cmd in [ok + "; curl x", ok + " $(id)", "FOO=1 " + ok, ok + " > /tmp/o", "cd x && " + ok,
                     "python3 /tmp/devaccel_batch.py t --branch batch/x", ok + " | tee o", ok + " `id`",
@@ -1911,9 +1915,18 @@ class R24BatchFromClaudeTest(R6ShipTest):
         (self.root / ".devaccel").mkdir(exist_ok=True)
         (self.root / ".devaccel/link.md").symlink_to(secret)
         (self.root / ".devaccel/t.md").write_text("1. x\n")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "s.md").write_text("1. a\n2. b\n")
+        (self.root / "docs").mkdir(exist_ok=True)
+        if (self.root / "docs/design").exists():
+            import shutil as _sh
+            _sh.rmtree(self.root / "docs/design")
+        (self.root / "docs/design").symlink_to(outside)
         env_cc = {"CLAUDECODE": "1"}
         for args in ([str(secret), "--branch", "batch/x"], [".devaccel/link.md", "--branch", "batch/x"],
-                     [".devaccel/t.md", "--branch", "feat/x"], [".devaccel/t.md", "--branch", "batch/x", "--jobs", "9"]):
+                     [".devaccel/t.md", "--branch", "feat/x"], [".devaccel/t.md", "--branch", "batch/x", "--jobs", "9"],
+                     ["docs/design/s.md", "--branch", "batch/x"]):
             r = sh(self.root, "python3", ".claude/hooks/devaccel_batch.py", *args, env=env_cc)
             self.assertEqual(r.returncode, 2, args)
             self.assertIn("only `.devaccel/", r.stderr, args)
@@ -2028,3 +2041,171 @@ class R29WriteNoFollowTest(unittest.TestCase):
         self.assertFalse((outside / "y.md").exists())
         self.assertTrue(write_nofollow(d / "repo/.devaccel/ok.md", "fine"))
         self.assertEqual((d / "repo/.devaccel/ok.md").read_text(), "fine")
+
+
+class R30DesignDocBatchTest(R18BatchEndToEndTest):
+    def test_design_doc_drives_units_and_goes_into_the_pr(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        d = self.root / "docs/design"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "20261119-t.md").write_text("目的: x\n\n1. GOODTASK: `a_mod.py`。テストは不要。" + "x" * 80 + "\n"
+                                        "2. SECRETTASK: `b_mod.py`。テストは不要。" + "x" * 80 + "\n")
+        r, log = self.land("docs/design/20261119-t.md", "--branch", "batch/t", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/t").stdout.split()
+        self.assertIn("docs/design/20261119-t.md", files)
+        self.assertIn("a_mod.py", files)
+
+
+class R31ExampleCoverageTest(R18BatchEndToEndTest):
+    def test_every_example_id_must_be_in_the_units_tests(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "tasks.md"
+        tasks.write_text("1. EXHALF `h_mod.py` テスト `tests/test_h.py`\n| ID | 入力 | 出力 | 規則 |\n"
+                         "| E1-1 | a | b | R1 |\n| E1-2 | c | d | R1 |\n"
+                         "2. EXFULL `f_mod.py` テスト `tests/test_f.py`\n| E2-1 | a | b | R1 |\n| E2-2 | c | d | R1 |\n")
+        r, _ = self.land(str(tasks), "--branch", "batch/t", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("examples not in tests: E1-2", r.stdout)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/t").stdout.split()
+        self.assertIn("f_mod.py", files)
+        self.assertNotIn("h_mod.py", files)
+
+    def test_example_ids_parse(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        self.assertEqual(b.example_ids("x\n| ID | a |\n| E1-1 | x |\n|E1-2| y |\n| E1-1 | z |\nE9-9 in text"),
+                         ["E1-1", "E1-2"])
+
+
+class R32GateExampleFeedbackTest(ReqKit):
+    def test_unit_gate_bounces_missing_example_ids_until_tests_carry_them(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        wt = self.root / ".claude" / "worktrees" / "u7"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "u7", str(wt))
+        (wt / ".devaccel").mkdir()
+        (wt / ".devaccel/expected-ids").write_text("E1-1\nE1-2\n")
+        (wt / "tests").mkdir(exist_ok=True)
+        (wt / "tests/test_x.py").write_text('IDS = ["E1-1"]\n')
+        os.mkfifo(wt / "tests/test_fifo.py")  # an agent-planted FIFO or link must not hang or steer the hook
+        (wt / "tests/test_link.py").symlink_to(self.tmp / "outside.py")
+        (self.tmp / "outside.py").write_text('IDS = ["E1-2"]\n')
+
+        def stop() -> dict:
+            r = run(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"),
+                    env={"CLAUDE_PROJECT_DIR": str(self.root)},
+                    stdin=json.dumps({"session_id": "s", "agent_id": "u7", "cwd": str(wt)}))
+            return json.loads(r.stdout) if r.stdout.strip() else {}
+        out = stop()
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("E1-2", out["reason"])
+        self.assertNotIn("E1-1,", out["reason"])
+        (wt / "tests/test_x.py").write_text('IDS = ["E1-1", "E1-2"]\n')
+        self.assertNotIn("decision", stop())
+
+
+class R34IdSpellingTest(unittest.TestCase):
+    def test_id_spellings_count_but_other_numbers_do_not(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        from devaccel_common import id_present
+        for t in ('ids=["E2-3"]', "test_E2_3_neg", "e2-3", "E2-3a", "id=E2-3_neg"):
+            self.assertTrue(id_present("E2-3", t), t)
+        for t in ("E2-30", "E2-4", "XE2-3", "E12-3"):
+            self.assertFalse(id_present("E2-3", t), t)
+
+
+class R35WatchTest(R18BatchEndToEndTest):
+    def test_units_start_while_the_design_doc_is_still_being_written(self):
+        import shutil
+        import time as _t
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        d = self.root / "docs/design"
+        d.mkdir(parents=True, exist_ok=True)
+        doc = d / "20261119-w.md"
+        doc.write_text("目的: x\n\n1. GOODTASK: `a_mod.py`。テストは不要。" + "x" * 80 + "\n<!-- more -->\n")
+        prs, log = self.tmp / "prs.json", self.tmp / "gh.log"
+        prs.write_text("[]")
+        log.write_text("")
+        p = subprocess.Popen(["python3", ".claude/hooks/devaccel_batch.py", "docs/design/20261119-w.md",
+                              "--branch", "batch/w", "--watch"], cwd=self.root, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_PRS": str(prs),
+                                  "FAKE_GH_LOG": str(log), "FAKE_GH_VIEW": ""})
+        _t.sleep(3)
+        doc.write_text(doc.read_text().replace("<!-- more -->", "2. SECRETTASK: `b_mod.py`。テストは不要。" + "x" * 80
+                                               + "\n<!-- end -->"))
+        out, err = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 0, out + err)
+        self.assertIn("unit 2 started", out)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/w").stdout.split()
+        self.assertIn("a_mod.py", files)
+        self.assertIn("b_mod.py", files)
+
+    def test_complete_items_rules(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        self.assertEqual(b.complete_items("h\n1. a\n2. b"), [])
+        self.assertEqual(len(b.complete_items("h\n1. a\n<!-- more -->\n2. b")), 1)
+        self.assertEqual(len(b.complete_items("h\n1. a\n2. b\n<!-- end -->")), 2)
+
+
+class R36DualTrackTest(R18BatchEndToEndTest):
+    """Dual track: a tester writes the spec tests while the implementer writes the code, in one worktree; the
+    implementer may not change the tester's tests."""
+    DUAL = (
+        '#!/usr/bin/env bash\n'
+        'while [ "$1" != "-p" ]; do shift; done; p="$2"\n'
+        'case "$p" in\n'
+        '  *あなたはテスト係*) mkdir -p tests; case "$p" in *CHEAT*) n=c;; *) n=a;; esac;'
+        ' printf "from %s_mod import X\\nIDS = [\\"E1-1\\"]\\ndef test_x():\\n    assert X == 1\\n" $n'
+        ' > tests/test_$n.py; sleep 1;;\n'
+        '  *CHEAT*) sleep 3; echo "X = 2" > c_mod.py; echo "def test_x(): pass" > tests/test_c.py;;\n'
+        '  *) sleep 3; echo "X = 1" > a_mod.py;;\n'
+        'esac\n'
+        'printf \'{"result": "done", "total_cost_usd": 0.001}\'\n')
+
+    def test_tester_and_implementer_share_a_worktree_and_tests_are_protected(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.DUAL)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "tasks.md"
+        tasks.write_text("1. GOOD `a_mod.py` + `tests/test_a.py`\n| ID | in | out | R |\n| E1-1 | a | b | R1 |\n"
+                         "2. CHEAT `c_mod.py` + `tests/test_c.py`\n| ID | in | out | R |\n| E2-1 | a | b | R1 |\n")
+        self.set_cfg({"parallel": {"dual_track": True}})
+        sh(self.root, "git", "push", "-q", "origin", "main")
+        r, _ = self.land(str(tasks), "--branch", "batch/d", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/d").stdout.split()
+        self.assertIn("a_mod.py", files)
+        self.assertIn("tests/test_a.py", files)  # the tester's spec tests ship with the implementation
+        self.assertNotIn("c_mod.py", files)
+        self.assertIn("spec tests changed by the implementer", r.stdout)
+
+
+class R37FingerprintTest(unittest.TestCase):
+    def test_layout_changes_do_not_count_but_content_changes_do(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        a = b._fingerprint(b"def test_x():\n    assert f(1)==2\n", "t.py")
+        self.assertEqual(a, b._fingerprint(b"def test_x():\n    assert f(1) == 2  # c\n\n", "t.py"))
+        self.assertNotEqual(a, b._fingerprint(b"def test_x():\n    assert f(1) == 3\n", "t.py"))
+        self.assertNotEqual(a, b._fingerprint(b"def test_x():\n    pass\n", "t.py"))

@@ -1,0 +1,284 @@
+diff --git a/docs/design/20261119-kakeibo-analysis.md b/docs/design/20261119-kakeibo-analysis.md
+new file mode 100644
+index 0000000..5902222
+--- /dev/null
++++ b/docs/design/20261119-kakeibo-analysis.md
+@@ -0,0 +1,52 @@
++# kakeibo-analysis
++目的: 家計簿に、定期支出の検出・銀行CSV取込・条件検索・前月比レポートを純粋関数のモジュールとして足す。 / やらないこと: 既存ファイル・CLI の変更、ファイル書き込み、外部依存。
++共通前提: 標準ライブラリのみ・既存ファイル不変・`from kakeibo.core import Expense`(day: date, category: str, amount: int 円, memo: str)を使う。金額は支出が正。
++判断一覧:
++- D1 取込の金額は支出を正で返す。`-300` `−300` `△500` `▲500` `(500)` `500-` は負(返金)として受ける。取込は返金も Expense に入れる(amount 負)。
++- D2 定期支出の同一視はカテゴリ+正規化メモ(NFKC・小文字・空白除去・末尾の数字と `#` 除去)。金額が系列の中央値の ±10% 以内なら同じ系列。負の金額は系列から除く。
++- D3 定期とみなすのは異なる 3 か月以上に連続して現れ、同月 2 回は 1 回に数える(最初の日)。欠けた月がある系列は定期としない。
++- D4 次回予定日は最後の月の翌月、日は系列の日の中央値を、その月の末日で上限して決める(31 日系列の 2 月は 28/29 日)。
++- D5 検索の範囲・期間は端を含む(以上・以下)。メモは NFKC・小文字化した部分一致。空の AND は真、空の OR は偽。
++- D6 前月比の増減率は前月 0 のとき None。片方にだけあるカテゴリも出す。
++
++<!-- more -->
++
++1. `src/kakeibo/bank_import.py` + `tests/test_bank_import.py` — `def import_bank_csv(text: str) -> tuple[list[Expense], list[RowIssue]]` と `@dataclass(frozen=True) class RowIssue: line: int; column: str; value: str; reason: str`
++規則: R1 区切りは `,` とタブを先頭行で自動判定、BOM と改行コードは無視、引用内の区切りと改行は 1 レコード(line は開始行、ヘッダーが 1 行目)。R2 列名は前後空白・大文字小文字を無視し別名を受ける: 日付=`日付` `利用日` `取引日` `ご利用日` `date`、金額=`金額` `利用金額` `ご利用金額` `amount`、出金=`出金額` `支払` `お支払金額`、入金=`入金額` `預入` `お預り金額`、メモ=`摘要` `メモ` `利用店名` `ご利用店名` `description` `memo`、カテゴリ=`カテゴリ` `category`(無ければ `未分類`)。R3 金額は NFKC 後に `¥` `￥` `円` `JPY` 空白 `,` を除去して D1 の符号を解釈、小数・空・非数は RowIssue。出金/入金の 2 列形式は出金を正、入金だけの行は支出ではないのでスキップ(issue にしない)。R4 日付は `2026-01-05` `2026/1/5` `2026.1.5` `20260105` と時刻付き(日付部分のみ使う)、存在しない日付は RowIssue。R5 1 行の誤りは全列分を RowIssue に積み(行番号・列名・元の値・理由)、その行は結果に入れない。空行は無視、列数が合わない行は column=`(行)` で RowIssue。R6 日付列か金額列(出金/入金のどちらもない)が無い、または空入力はヘッダー行 line=1 の RowIssue 1 件を返し例外にしない。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E1-1 | `利用日,利用店名,利用金額\n2026/1/5,ＮＥＴＦＬＩＸ,"1,490円"` | Expense(2026-01-05,未分類,1490,NETFLIX) | R2 R3 |
++| E1-2 | `date,amount\n2026-01-05,△500` | amount=-500 | R3 |
++| E1-3 | `date,amount\n2026-02-30,abc` | RowIssue 2 件(date と amount, line=2) | R4 R5 |
++
++<!-- more -->
++
++2. `src/kakeibo/recurring.py` + `tests/test_recurring.py` — `def find_recurring(expenses: list[Expense]) -> list[Recurring]` と `@dataclass(frozen=True) class Recurring: category: str; memo: str; amount: int; months: int; last_day: date; next_day: date`
++規則: R1 D2〜D4 のとおり。amount は系列の中央値(整数、偶数個なら切り捨て)、memo は系列で最後のメモ。R2 並びは next_day 昇順、同点は category、memo の順。R3 同じカテゴリ・金額でもメモの正規化が違えば別系列(5 日と 20 日の 2 つのサブスクは別メモなら別)。R4 空入力は空リスト、入力は変更しない。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E2-1 | 娯楽/Netflix/1490 が 10/31・11/30・12/31 | months=3, next_day=2027-01-31 | D4 |
++| E2-2 | 住居/家賃 が 1/1・2/1・4/1 | 空(3 月が欠け連続しない) | D3 |
++| E2-3 | 娯楽/Netflix 1490 と 1500 が 3 か月 | 1 系列(±10%) | D2 |
++
++<!-- more -->
++
++3. `src/kakeibo/search.py` + `tests/test_search.py` — `def search(expenses: list[Expense], cond: Cond) -> list[Expense]` と `Cond = dict`。
++規則: R1 条件は dict。葉のキーは `category`(完全一致、前後空白除去)・`min_amount` `max_amount`(円の整数、以上・以下)・`memo`(D5 の部分一致、空文字は常に真)・`since` `until`(date、D5)。1 つの dict に複数の葉を書くと AND。R2 結合は `{"and": [cond,...]}` `{"or": [...]}` `{"not": cond}` で入れ子可、D5 の空の扱い。R3 結果は入力順を保つ。R4 未知のキー・型違い(金額が int でない、date が date でない)・`min_amount > max_amount`・`since > until` は ValueError(どのキーかをメッセージに含める)。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E3-1 | `{"or": [{"category": "食費"}, {"min_amount": 10000}]}` | どちらかを満たす明細、入力順 | R2 R3 |
++| E3-2 | `{"and": []}` | 全件 | D5 |
++| E3-3 | `{"cat": "x"}` | ValueError(未知のキー cat) | R4 |
++
++<!-- more -->
++
++4. `src/kakeibo/monthly_diff.py` + `tests/test_monthly_diff.py` — `def compare_months(expenses: list[Expense], month: str) -> list[CategoryDiff]` と `@dataclass(frozen=True) class CategoryDiff: category: str; previous: int; current: int; delta: int; rate: float | None; trend: str`
++規則: R1 month は `YYYY-MM`(不正は ValueError)、前月は 1 月なら前年 12 月。各月はカテゴリ別の合計(負の返金も合算)。R2 delta = current - previous、rate = delta / previous(D6)、trend は delta>0 で `増` / <0 で `減` / 0 で `変わらず`。R3 並びは delta の絶対値の降順、同点は category 昇順。R4 両月とも明細が無ければ空リスト。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E4-1 | 食費 前月 0・今月 3000 | delta=3000, rate=None, trend=増 | D6 |
++| E4-2 | month=`2026-01`、前年 12 月に交通 1000・今月なし | previous=1000, current=0, trend=減 | R1 |
++| E4-3 | month=`2026/01` | ValueError | R1 |
++
++<!-- end -->
+diff --git a/src/kakeibo/monthly_diff.py b/src/kakeibo/monthly_diff.py
+new file mode 100644
+index 0000000..30dd788
+--- /dev/null
++++ b/src/kakeibo/monthly_diff.py
+@@ -0,0 +1,70 @@
++"""Month-over-month category comparison (pure functions)."""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++from kakeibo.core import Expense
++
++_MONTH_RE = re.compile(r"([0-9]{4})-(0[1-9]|1[0-2])")
++
++
++@dataclass(frozen=True)
++class CategoryDiff:
++    category: str
++    previous: int
++    current: int
++    delta: int
++    rate: float | None
++    trend: str
++
++
++def _previous_month(month: str) -> str:
++    year, mon = int(month[:4]), int(month[5:7])
++    if mon == 1:
++        return f"{year - 1:04d}-12"
++    return f"{year:04d}-{mon - 1:02d}"
++
++
++def _totals_for(expenses: list[Expense], month: str) -> dict[str, int]:
++    out: dict[str, int] = {}
++    for e in expenses:
++        if e.day.strftime("%Y-%m") == month:
++            out[e.category] = out.get(e.category, 0) + e.amount
++    return out
++
++
++def _trend(delta: int) -> str:
++    if delta > 0:
++        return "増"
++    if delta < 0:
++        return "減"
++    return "変わらず"
++
++
++def compare_months(expenses: list[Expense], month: str) -> list[CategoryDiff]:
++    if not isinstance(month, str) or not _MONTH_RE.fullmatch(month):
++        raise ValueError(f"month は YYYY-MM 形式である必要があります: {month!r}")
++    prev_month = _previous_month(month)
++    prev = _totals_for(expenses, prev_month)
++    curr = _totals_for(expenses, month)
++
++    diffs: list[CategoryDiff] = []
++    for cat in set(prev) | set(curr):
++        previous = prev.get(cat, 0)
++        current = curr.get(cat, 0)
++        delta = current - previous
++        rate = None if previous == 0 else delta / previous
++        diffs.append(
++            CategoryDiff(
++                category=cat,
++                previous=previous,
++                current=current,
++                delta=delta,
++                rate=rate,
++                trend=_trend(delta),
++            )
++        )
++    diffs.sort(key=lambda d: (-abs(d.delta), d.category))
++    return diffs
+diff --git a/tests/test_monthly_diff.py b/tests/test_monthly_diff.py
+new file mode 100644
+index 0000000..23bf495
+--- /dev/null
++++ b/tests/test_monthly_diff.py
+@@ -0,0 +1,144 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.monthly_diff import CategoryDiff, compare_months
++
++
++def exp(day: date, category: str, amount: int, memo: str = "") -> Expense:
++    return Expense(day, category, amount, memo)
++
++
++# 例の表 E4-1 / E4-2 / E4-3 (ID をそのまま pytest の id に使う)
++
++
++@pytest.mark.parametrize(
++    ("expenses", "month", "expected"),
++    [
++        pytest.param(
++            [exp(date(2026, 2, 3), "食費", 3000)],
++            "2026-02",
++            [CategoryDiff("食費", 0, 3000, 3000, None, "増")],
++            id="E4-1",
++        ),
++        pytest.param(
++            [exp(date(2025, 12, 20), "交通", 1000)],
++            "2026-01",
++            [CategoryDiff("交通", 1000, 0, -1000, -1.0, "減")],
++            id="E4-2",
++        ),
++    ],
++)
++def test_example_rows(expenses, month, expected):
++    assert compare_months(expenses, month) == expected
++
++
++@pytest.mark.parametrize(
++    "month",
++    [
++        pytest.param("2026/01", id="E4-3"),
++    ],
++)
++def test_invalid_month_raises(month):
++    with pytest.raises(ValueError):
++        compare_months([], month)
++
++
++# R1: month は YYYY-MM。不正は ValueError。
++
++
++@pytest.mark.parametrize(
++    "month",
++    ["2026-1", "26-01", "2026-13", "202601", "2026-01-01", ""],
++    ids=["short-month", "short-year", "month-13", "no-hyphen", "with-day", "empty"],
++)
++def test_r1_malformed_month_raises(month):
++    with pytest.raises(ValueError):
++        compare_months([], month)
++
++
++def test_r1_previous_month_of_february_is_january():
++    expenses = [
++        exp(date(2026, 1, 10), "食費", 2000),
++        exp(date(2026, 2, 10), "食費", 2500),
++    ]
++    result = compare_months(expenses, "2026-02")
++    assert result == [CategoryDiff("食費", 2000, 2500, 500, 0.25, "増")]
++
++
++# R1: 各月はカテゴリ別の合計。負の返金も合算する。
++
++
++def test_r1_refunds_are_summed_into_month_total():
++    expenses = [
++        exp(date(2026, 1, 5), "食費", 4000),
++        exp(date(2026, 1, 9), "食費", -500),
++        exp(date(2026, 2, 5), "食費", 3000),
++    ]
++    result = compare_months(expenses, "2026-02")
++    # 前月 4000 - 500 = 3500、今月 3000
++    assert result == [CategoryDiff("食費", 3500, 3000, -500, -500 / 3500, "減")]
++
++
++# R2: delta = current - previous, rate = delta / previous (D6), trend.
++
++
++def test_r2_trend_unchanged_when_delta_is_zero():
++    expenses = [
++        exp(date(2026, 1, 5), "食費", 1200),
++        exp(date(2026, 2, 5), "食費", 1200),
++    ]
++    result = compare_months(expenses, "2026-02")
++    assert result == [CategoryDiff("食費", 1200, 1200, 0, 0.0, "変わらず")]
++
++
++def test_r2_rate_is_delta_over_previous():
++    expenses = [
++        exp(date(2026, 1, 5), "娯楽", 4000),
++        exp(date(2026, 2, 5), "娯楽", 5000),
++    ]
++    result = compare_months(expenses, "2026-02")
++    assert result == [CategoryDiff("娯楽", 4000, 5000, 1000, 0.25, "増")]
++
++
++# R3: 並びは delta の絶対値の降順、同点は category 昇順。
++
++
++def test_r3_sorted_by_absolute_delta_descending():
++    expenses = [
++        exp(date(2026, 1, 1), "A", 100),
++        exp(date(2026, 2, 1), "A", 150),  # delta +50
++        exp(date(2026, 1, 1), "B", 1000),
++        exp(date(2026, 2, 1), "B", 700),  # delta -300
++        exp(date(2026, 1, 1), "C", 500),
++        exp(date(2026, 2, 1), "C", 500),  # delta 0
++    ]
++    result = compare_months(expenses, "2026-02")
++    assert [r.category for r in result] == ["B", "A", "C"]
++
++
++def test_r3_ties_on_abs_delta_are_ordered_by_category():
++    expenses = [
++        exp(date(2026, 1, 1), "Z", 1000),
++        exp(date(2026, 2, 1), "Z", 1200),  # delta +200
++        exp(date(2026, 1, 1), "M", 1000),
++        exp(date(2026, 2, 1), "M", 800),  # delta -200 (同じ絶対値)
++    ]
++    result = compare_months(expenses, "2026-02")
++    assert [r.category for r in result] == ["M", "Z"]
++
++
++# R4: 両月とも明細が無ければ空リスト。
++
++
++def test_r4_no_expenses_in_either_month_returns_empty_list():
++    expenses = [
++        exp(date(2025, 6, 1), "食費", 1000),
++        exp(date(2026, 4, 1), "食費", 1000),
++    ]
++    assert compare_months(expenses, "2026-02") == []
++
++
++def test_r4_empty_input_returns_empty_list():
++    assert compare_months([], "2026-02") == []

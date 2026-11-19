@@ -24,11 +24,12 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))
-from devaccel_common import git, load_config, write_nofollow  # noqa: E402
+from devaccel_common import git, id_present, load_config, write_nofollow  # noqa: E402
 from stop_gate import run_check  # noqa: E402
 
 # "1. ", also as a markdown heading or bold ("## 1. ", "**1.** ") — how a session tends to rewrite a list
@@ -42,12 +43,32 @@ SKIP_NEW = re.compile(r"(^|/)(\.?env|[^/]*\.env|\.env\.[^/]*|[^/]*\.(pem|key|p12
 CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 
 
+EXAMPLE_ID = re.compile(r"^\|\s*(E\d+-\d+)\s*\|", re.M)
+TEST_FILE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests?/")
+
+
+def example_ids(item: str) -> list[str]:
+    """IDs of the example table rows in a design-doc item (`| E1-2 | input | output | rule |`)."""
+    return list(dict.fromkeys(EXAMPLE_ID.findall(item)))
+
+
 def clean(s: str) -> str:
     """A unit's free text, made safe for the terminal and a PR body: no control/escape or bidi characters,
     and no @mentions, issue links/closing keywords or HTML comments that would act on GitHub."""
     s = CTRL.sub("", s)
     return (s.replace("<", "&lt;").replace(">", "&gt;").replace("@", "@\u200b")
             .replace("#", "#\u200b"))
+
+
+MORE_MARK, END_MARK = "<!-- more -->", "<!-- end -->"
+
+
+def complete_items(text: str) -> list[str]:
+    """--watch: the items that are finished — all once END_MARK is there, else those before the last MORE_MARK."""
+    if END_MARK in text:
+        return split_tasks(text.replace(END_MARK, ""))[1]
+    cut = text.rfind(MORE_MARK)
+    return split_tasks(text[:cut])[1] if cut >= 0 else []
 
 
 def split_tasks(text: str) -> tuple[str, list[str]]:
@@ -156,11 +177,83 @@ def preflight(root: Path, base: str, branch: str) -> list[str]:
     return errs
 
 
+def _read_nofollow(p: Path) -> bytes | None:
+    """Contents of a regular file without following a link at the file (and not through linked dirs)."""
+    import stat
+    try:
+        if any(x.is_symlink() for x in p.parents):
+            return None
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:  # no hardlinked files from an agent's tree
+                return None
+            return fh.read(5_000_000)
+    except OSError:
+        return None
+
+
+def write_nofollow_deep(base: Path, rel: str, data: bytes) -> bool:
+    """Write base/rel, walking every directory relative to its parent's fd with O_NOFOLLOW (no window in which a
+    concurrently planted link could redirect the write)."""
+    parts = Path(rel).parts
+    try:
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        # a fresh file renamed over the destination: never writes through an existing entry (a planted
+        # hardlink to a file elsewhere would otherwise be overwritten in place)
+        tmp = f".{parts[-1]}.{os.getpid()}.devaccel-tmp"
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        with os.fdopen(out, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, parts[-1], src_dir_fd=fd, dst_dir_fd=fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _fingerprint(data: bytes, name: str) -> str:
+    """What the tests say, not how they are laid out: for Python, the AST (the gate's auto-format rewrites the
+    layout and must not count as a change; any change to an assertion or a value still does)."""
+    import ast
+    import hashlib
+    if name.endswith(".py"):
+        try:
+            return "ast:" + hashlib.sha256(ast.dump(ast.parse(data)).encode()).hexdigest()
+        except (SyntaxError, ValueError):
+            pass
+    return hashlib.sha256(data).hexdigest()
+
+
+def _digest(p: Path) -> str:
+    """Fingerprint of a regular file (no link followed), '' if absent."""
+    data = _read_nofollow(p)
+    return "" if data is None else _fingerprint(data, p.name)
+
+
 def cleanup(root: Path, units: list[dict], keep: bool, branches: bool = False) -> None:
     """Stop what still runs; remove unit worktrees (even broken ones) and, after shipping, unit branches."""
     import shutil
     for u in units:
-        p = u.get("p")
+        for p in (u.get("p"), (u.get("tester") or {}).get("p")):
+            if p is not None and p.poll() is None:
+                try:
+                    os.killpg(p.pid, 9)
+                except OSError:
+                    pass
+        p = None
         if p is not None and p.poll() is None:
             try:
                 os.killpg(p.pid, 9)
@@ -169,14 +262,17 @@ def cleanup(root: Path, units: list[dict], keep: bool, branches: bool = False) -
     if keep:
         return
     for u in units:
-        r = subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(u["wt"])],
-                           capture_output=True)
-        if r.returncode != 0 and u["wt"].exists():
-            shutil.rmtree(u["wt"], ignore_errors=True)
+        for wt in (u["wt"], (u.get("tester") or {}).get("wt")):
+            if wt is None:
+                continue
+            r = subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(wt)],
+                               capture_output=True)
+            if r.returncode != 0 and wt.exists():
+                shutil.rmtree(wt, ignore_errors=True)
     subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True)
     if branches:
-        subprocess.run(["git", "-C", str(root), "branch", "-q", "-D", *[u["branch"] for u in units]],
-                       capture_output=True)
+        subprocess.run(["git", "-C", str(root), "branch", "-q", "-D", *[u["branch"] for u in units],
+                        *[u["tester"]["branch"] for u in units if u.get("tester")]], capture_output=True)
 
 
 def main() -> int:
@@ -199,24 +295,34 @@ def main() -> int:
     ap.add_argument("--unit-timeout", type=int, default=900, help="seconds before a unit is stopped")
     ap.add_argument("--max-turns", type=int, default=40, help="turn limit per unit")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees and branches afterwards")
+    ap.add_argument("--watch", action="store_true",
+                    help="the file is still being written: start each item's unit as soon as it is complete (items "
+                         "before a `<!-- more -->` line, all items once `<!-- end -->` is there)")
     ap.add_argument("--dry-run", action="store_true", help="check everything and show the plan; run nothing")
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     if os.environ.get("CLAUDECODE"):  # started by the model, outside the sandbox: the guard's grammar, re-checked
         tf = Path(os.path.realpath(a.tasks))
-        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run") and v != ap.get_default(k)]
-        if (tf.parent != (root / ".devaccel").resolve() or tf.suffix != ".md" or tf.is_symlink()
+        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run", "watch") and v != ap.get_default(k)]
+        allowed = [d for d in (root / ".devaccel", root / "docs" / "design")  # real directories inside the repo:
+                   if not any(p.is_symlink() for p in (d, d.parent))]  # a linked dir could point at ~/.ssh
+        if (tf.parent not in [d.resolve() for d in allowed] or not tf.is_relative_to(root.resolve())
+                or tf.suffix != ".md" or tf.is_symlink()
                 or Path(a.tasks).is_symlink() or not re.fullmatch(r"batch/[\w-]+", a.branch) or extra):
-            print("from Claude Code only `.devaccel/<name>.md --branch batch/<name> [--dry-run]` is allowed "
+            print("from Claude Code only `.devaccel/<name>.md` (or docs/design/<name>.md) `--branch batch/<name> "
+                  "[--dry-run]` is allowed "
                   "(other options: run it from a terminal)", file=sys.stderr)
             return 2
     cfg = load_config(root)
     base = cfg["scale"]["base_branch"]
     head, items = split_tasks(a.tasks.read_text(encoding="utf-8"))
+    watching = a.watch and not a.dry_run and END_MARK not in a.tasks.read_text(encoding="utf-8")
+    if watching:
+        items = complete_items(a.tasks.read_text(encoding="utf-8"))
     if a.tasks.name == "prompt.md" and not a.dry_run:  # written by the guard for this run only: never reused
         write_nofollow(root / ".devaccel" / "prompt.md", None)
-    if not items or (os.environ.get("CLAUDECODE") and len(items) < 2):
+    if not watching and (not items or (os.environ.get("CLAUDECODE") and len(items) < 2)):
         print(f"{len(items)} task(s) found: a fan-out needs items starting with '1. ', '2. ', ... (one per line "
               "start); for a single task just implement it", file=sys.stderr)
         return 2
@@ -249,11 +355,38 @@ def main() -> int:
     units = []
     t0 = time.time()
     copies = max(1, a.hedge)
+    # dual track (tester || implementer per item) is experimental and off: measured slower, costlier and with
+    # many refused items (implementers rewrote the spec tests). Kept behind parallel.dual_track for research only
+    dual = bool(cfg["parallel"].get("dual_track"))
     strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong)])
-    for i, it in enumerate(items, 1):
+    def add_item(i: int, it: str) -> bool:
+        """Worktree(s) and command for item i; False if a worktree could not be made."""
         ctx = "" if a.no_context else context_files(root, head + "\n" + it)
+        if example_ids(it):
+            ctx += ("\n\n例の表の全行を、ID をテストの中に書いて(parametrize の ids など)テストに写してから実装する。"
+                    "端のケースは表に列挙済みなので考え直さない。ID が 1 つでもテストに無ければ統合されない。")
+        tester = None
+        if dual:  # dual track: a tester writes the spec tests while this unit implements, in the same worktree
+            tfiles = sorted(set(re.findall(r"`((?:[\w./-]*/)?tests?/[\w./-]+\.py|(?:[\w./-]*/)?test_[\w.-]+\.py)`", it)))
+            tester = {"sid": str(uuid.uuid4()), "files": tfiles}
+            tprompt = ((head + "\n\n" if head else "") + it + ctx + "\n\nあなたはテスト係。この件の仕様(規則・例・判断)から、"
+                       f"テストファイル {' '.join('`' + f + '`' for f in tfiles) or '(仕様が名指しするテストファイル)'} "
+                       "だけを書く。実装(src)は書かない・読まない(別の単位が同時に書いている)。関数・クラスは仕様の名前と型の"
+                       "とおりに import する。例の表の全行を ID 付きで、加えて各規則(R#)の端を 1 つ以上テストにする。期待値は"
+                       "仕様から決め、仕様に無い振る舞いはテストしない。テストは実行しない(実装がまだ無い)。最後に "
+                       "`uv run ruff check --fix <テストファイル>` を 1 回だけ回して終える。")
+            tester["cmd"] = ["claude", "-p", tprompt, "--model", model, "--effort", effort, "--session-id", tester["sid"],
+                             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                             "--tools", "Read", "Edit", "Write", "Bash", "Grep", "Glob", "--disable-slash-commands",
+                             "--max-turns", "20", "--output-format", "json", "--permission-mode", "acceptEdits"]
+            ctx += ("\n\nテストは別の単位(テスト係)がこの作業ツリーで同時に "
+                    f"{' '.join('`' + f + '`' for f in tester['files']) or '仕様のテストファイル'} に書いている。そのファイルは"
+                    "作らない・変えない(変えるとこの件は統合されない)。実装だけを書き、簡単に動かして確かめたら終える。終了時に"
+                    "ゲートがテスト係のテストを走らせ、落ちていれば差し戻す。落ちたテストが仕様と矛盾すると思うときは、テストは"
+                    "変えずに、どの規則(R#)と矛盾するかを最後の報告に書く。")
         prompt = (head + "\n\n" if head else "") + it + ctx + (
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
+            if not dual else "\n\nこの 1 件だけを実装する。"
             + ("テストが通ったら `uv run ruff check --fix <作った・変えたファイル>` を 1 回回し、残った指摘を直してから終える"
                "(lint の差し戻しは 1 往復 10 秒以上かかる)。" if "python" in cfg.get("presets", []) else "")
             + "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
@@ -272,9 +405,29 @@ def main() -> int:
                                capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
-                cleanup(root, units, a.keep)
-                return 1
-            units.append({"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd})
+                return False
+            if example_ids(it):  # the unit's own gate checks these at Stop (feedback); settle re-checks (authority)
+                write_nofollow(wt / ".devaccel" / "expected-ids", "\n".join(example_ids(it)) + "\n")
+            u = {"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd}
+            if tester:
+                # the tester works in its OWN worktree (the implementer can't touch its files); its tests are copied
+                # into the implementer's tree when it exits, and fingerprinted at that moment
+                twt = root / ".claude" / "worktrees" / (tag + "t")
+                r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", f"unit/{tag}t", str(twt),
+                                    start], capture_output=True, text=True)
+                if r.returncode != 0:
+                    print(f"tester worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+                    return False
+                write_nofollow(twt / ".devaccel" / "tester-session", tester["sid"] + "\n")  # its gate lets it stop
+                write_nofollow(wt / ".devaccel" / "tester-pending", "1\n")  # the implementer's gate waits for this
+                u["tester"] = {**tester, "wt": twt, "branch": f"unit/{tag}t"}
+            units.append(u)
+        return True
+
+    for i, it in enumerate(items, 1):
+        if not add_item(i, it):
+            cleanup(root, units, a.keep)
+            return 1
 
     def settle(u: dict) -> str:
         """Commit the unit's tree (our own git dir; hooks/fsmonitor off; no secrets/state files), then check
@@ -288,6 +441,13 @@ def main() -> int:
             os.killpg(u["p"].pid, 9)  # leftovers of the unit's session must not touch the tree being checked
         except OSError:
             pass
+        t = u.get("tester")
+        if t and t.get("failed"):
+            return "the tester failed (no spec tests)"
+        if t and any(not h or _digest(wt / f) != h for f, h in t.get("hash", {}).items()):
+            return "spec tests changed by the implementer"
+        if t and not any(t.get("hash", {}).values()):
+            return "the tester wrote no spec tests"
         subprocess.run([*safe, "add", "-u"], capture_output=True)
         staged = subprocess.run([*safe, "diff", "--cached", "--name-only", "-z"], capture_output=True,
                                 text=True).stdout.split("\0")
@@ -305,6 +465,13 @@ def main() -> int:
         commits = git(root, "rev-list", "--count", f"{start}..{u['branch']}").strip()
         if commits in ("", "0"):
             return "no commit"
+        ids = example_ids(items[u["i"] - 1])
+        if ids:  # the spec's example table is the acceptance test: every ID must be in the unit's tests
+            tests = "".join(git(root, "show", f"{u['branch']}:{f}") for f in git(
+                root, "diff", "--name-only", start, u["branch"]).splitlines() if TEST_FILE.search(f))
+            missing = [x for x in ids if not id_present(x, tests)]
+            if missing:
+                return "examples not in tests: " + ", ".join(missing[:5])
         changed = git(root, "diff", "--name-only", "-z", start, u["branch"]).split("\0")
         touched = [f for f in changed if f and SKIP_NEW.search(f)]
         if touched:  # e.g. the unit committed by itself: secrets or devaccel/Claude config are never integrated
@@ -337,11 +504,46 @@ def main() -> int:
 
     running, done, won, speculated = [], [], {}, set()
     pending = list(units)
-    limit, why = plan_jobs(len(units), a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
+    watch_until = time.time() + 600
+
+    def poll_watch() -> bool:
+        """Start units for items finished since the last look; False once the file is complete (or timed out)."""
+        # re-validated on every read (the file is rewritten while we watch; an editor may replace it): the path
+        # itself, no link on the way (O_NOFOLLOW + link checks), and what was opened is a regular file that
+        # really sits in the allowed directory inside the repo
+        import stat
+        allowed = {(root / ".devaccel").resolve(), (root / "docs" / "design").resolve()}
+        try:
+            if any(p.is_symlink() for p in (a.tasks.parent, a.tasks.parent.parent)):
+                return False
+            fd = os.open(a.tasks, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                real = Path(os.readlink(f"/proc/self/fd/{fh.fileno()}"))
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode) or real.parent not in allowed:
+                    return False
+                text = fh.read(1_000_000)
+        except OSError:
+            return time.time() < watch_until
+        done_writing = END_MARK in text or time.time() >= watch_until
+        ready = complete_items(text) if not done_writing else split_tasks(text.replace(END_MARK, ""))[1]
+        for n in range(len(items), len(ready)):
+            items.append(ready[n])
+            before = len(units)
+            if add_item(n + 1, ready[n]):
+                pending.extend(units[before:])
+                print(f"unit {n + 1} started (the design doc is still being written)" if not done_writing
+                      else f"unit {n + 1} started", flush=True)
+        return not done_writing
+    limit, why = plan_jobs(len(units) if not watching else 64, a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
+    if dual:  # every item runs two sessions
+        limit, why = max(1, limit // 2), why + " / 2 (tester + implementer per item)"
     print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
     # a fresh session per unit: drop the parent session's markers (the anchor comes from the worktree path)
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")}
+    think = os.environ.get("DEVACCEL_UNIT_THINK") or str(cfg["parallel"].get("unit_think_tokens") or "")
+    if think.isdigit():  # cap the units' thinking (the slowest unit spent 40-50 s thinking before its first write)
+        env["MAX_THINKING_TOKENS"] = think
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(max_workers=max(1, limit))  # settling (commit + own check) overlaps the units
     settling: dict = {}
@@ -350,10 +552,51 @@ def main() -> int:
         u["t"] = time.time()
         u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
+        if u.get("tester"):
+            u["tester"]["p"] = subprocess.Popen(u["tester"]["cmd"], cwd=u["tester"]["wt"], stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, env=env,
+                                                start_new_session=True)
         running.append(u)
 
+    def tester_done(u: dict, wait: float = 0) -> None:
+        """Once the tester has exited: release the implementer's gate and fingerprint the spec tests (the
+        implementer must not change them). An implementer that finishes first waits up to `wait` seconds."""
+        t = u.get("tester")
+        if not t or t.get("finished"):
+            return
+        end = time.time() + wait
+        while t["p"].poll() is None and time.time() < end:
+            time.sleep(0.5)
+        if t["p"].poll() is None:
+            if wait == 0:
+                return
+            try:
+                os.killpg(t["p"].pid, 9)
+            except OSError:
+                pass
+        out, _ = t["p"].communicate()
+        try:
+            t["cost"] = float((json.loads(out) or {}).get("total_cost_usd") or 0)
+        except (ValueError, AttributeError):
+            t["cost"] = 0.0
+        t["finished"] = True
+        t["failed"] = t["p"].returncode != 0  # killed or crashed: no trustworthy spec tests
+        t["hash"] = {}
+        for f in t["files"]:  # copy the tester's tests over whatever is at that path in the implementer's tree
+            src = _read_nofollow(t["wt"] / f)
+            ok = (src is not None and bool(Path(f).parts) and ".." not in Path(f).parts and not Path(f).is_absolute()
+                  and write_nofollow_deep(u["wt"], f, src))
+            if not ok:  # fail closed: a spec test that could not be copied is a failed tester
+                t["failed"] = True
+                t["hash"][f] = ""
+                continue
+            t["hash"][f] = _fingerprint(src, f)  # what was copied, not a re-read of the tree
+        write_nofollow(u["wt"] / ".devaccel" / "tester-pending", None)
+
     try:
-        while pending or running or settling:
+        while pending or running or settling or watching:
+            if watching:
+                watching = poll_watch()
             while pending and len(running) + len(settling) < limit:
                 u = pending.pop(0)
                 if u["i"] not in won:
@@ -372,6 +615,7 @@ def main() -> int:
                             print(f"unit {u['i']} is straggling ({round(time.time() - u['t'])}s vs median "
                                   f"{med}s): started a backup copy", flush=True)
             for u in list(running):
+                tester_done(u)
                 if u["p"].poll() is None:
                     if time.time() - u["t"] > a.unit_timeout:
                         try:
@@ -380,6 +624,7 @@ def main() -> int:
                             pass
                         u["timed_out"] = True
                     continue
+                tester_done(u, wait=180)  # the spec tests must exist before the unit is settled
                 out, err = u["p"].communicate()
                 u["secs"] = round(time.time() - u["t"])
                 try:
@@ -427,7 +672,7 @@ def main() -> int:
     full = []
     for u in sorted(done, key=lambda x: (x["i"], x["k"])):
         j = u["json"]
-        cost += float(j.get("total_cost_usd") or 0)  # (stopped copies report no cost: an underestimate)
+        cost += float(j.get("total_cost_usd") or 0) + float((u.get("tester") or {}).get("cost") or 0)
         full.append(f"=== unit {u['i']}/{u['k']} ({u['branch']}, {u['secs']}s, {u['status']})\n"
                     f"{clean(str(j.get('result', '')))}\n" + (f"--- check\n{clean(u['check_tail'])}\n"
                                                              if u.get("check_tail") and u["status"] != "ok" else ""))
@@ -466,7 +711,11 @@ def main() -> int:
     if os.environ.get("DEVACCEL_TIMING"):
         print(f"[timing] units phase {round(time.time() - t0)}s", flush=True)
     r = subprocess.run([sys.executable, str(Path(__file__).with_name("devaccel_ship.py")), "--file",
-                        str(notes.relative_to(root)), "--branch", a.branch, "--units", *ok], cwd=root)
+                        str(notes.relative_to(root)), "--branch", a.branch, "--units", *ok,
+                        # the design doc the units worked from goes into the PR (reviewers read it, not the diff)
+                        *(["--paths", str(Path(os.path.realpath(a.tasks)).relative_to(root.resolve()))]
+                          if Path(os.path.realpath(a.tasks)).parent == (root / "docs" / "design").resolve() else [])],
+                       cwd=root)
     cleanup(root, units, a.keep, branches=r.returncode == 0)  # integrated: the unit branches are no longer needed
     return r.returncode
 

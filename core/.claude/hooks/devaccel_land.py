@@ -131,7 +131,8 @@ def main() -> int:
                 run(["git", "merge", "--abort"], wt)
                 downgrade(p, "base(と先行 PR)と衝突: " + (", ".join(bad[:5]) or m.stderr.strip()[:200]))
                 continue
-            ok, stages, tail, secs = run_base_check(root, cfg, base_sha, wt, sandbox=bool(cfg["gate"].get("sandbox", True)))
+            ok, stages, tail, secs = run_base_check(root, cfg, base_sha, wt, sandbox=bool(cfg["gate"].get("sandbox", True)),
+                                              export_from=wt)
             if not ok:
                 run(["git", "reset", "-q", "--hard", "HEAD~1"], wt)
                 downgrade(p, "統合後に `check.sh full` が失敗(単独では緑): "

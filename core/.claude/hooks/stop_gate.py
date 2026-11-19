@@ -22,6 +22,7 @@ sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is alre
 from devaccel_common import (  # noqa: E402
     emit as _emit_raw,
     worktree_link_ok,
+    id_present,
     check_script_for,
     confined,
     git,
@@ -230,6 +231,48 @@ def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[
     return relevant
 
 
+def _dual_role(root: Path, data: dict) -> str:
+    """'tester' when this session is the dual-track tester recorded by devaccel_batch (feedback routing only:
+    devaccel_batch checks every commit itself, so a unit that claims the role gains nothing)."""
+    try:
+        sid = (root / ".devaccel" / "tester-session").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return "tester" if sid and sid == str(data.get("session_id") or "") else ""
+
+
+def missing_examples(root: Path) -> list[str]:
+    """IDs from <worktree>/.devaccel/expected-ids (written by devaccel_batch) not found in the tree's test files.
+    Feedback only: devaccel_batch re-checks the committed tests against the spec itself."""
+    try:
+        ids = [x.strip() for x in (root / ".devaccel" / "expected-ids").read_text(encoding="utf-8").splitlines()
+               if re.fullmatch(r"E\d+-\d+", x.strip())]
+    except OSError:
+        return []
+    import stat
+    text, total = "", 0
+    test_name = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests?/[^/]*\.py$")
+    for d, dirs, files in os.walk(root, followlinks=False):  # the tree is agent-written: no links, no FIFOs
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x != "node_modules"]
+        for f in files:
+            full = os.path.join(d, f)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            if not f.endswith(".py") or not test_name.search(rel):
+                continue
+            try:
+                st = os.lstat(full)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > 1_000_000 or total > 8_000_000:
+                    continue
+                fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as fh:
+                    data = fh.read(1_000_000)
+            except OSError:
+                continue
+            total += len(data)
+            text += data.decode("utf-8", errors="replace")
+    return [x for x in ids if not id_present(x, text)]
+
+
 def pr_nudge(root: Path, cfg: dict, sess: dict) -> dict | None:
     """Sessions only: uncommitted code changes at the end of a turn -> ask once to open the evidence PR.
     Once per state: stopping again without changes (the user said no PR, or it was only a question) passes."""
@@ -311,6 +354,14 @@ def main() -> int:
         # a linked worktree elsewhere (git-dir != common-dir) is a unit too; robust to symlinks and path case
         unit = (git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()
                 != git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    if unit and _dual_role(root, data) == "tester":
+        return 0  # dual track: the tester writes tests before the code exists; its tree is checked via the implementer
+    if unit and (root / ".devaccel" / "tester-pending").exists():
+        # the implementer stops first: wait for the spec tests (devaccel_batch removes the marker when the tester
+        # exits), then they run in the check below
+        end = time.time() + 90
+        while (root / ".devaccel" / "tester-pending").exists() and time.time() < end:
+            time.sleep(1)
     mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
     CTX.update({"scope": "unit" if unit else "session", "mode": mode})
     if not is_git_repo(root):
@@ -383,6 +434,17 @@ def main() -> int:
         log_event(anchor, event)
         if mode == "enforce":  # never pass silently when the check could not run
             reply["systemMessage"] = f"[devaccel] check.sh を実行できず未検査です: {output[:200] or 'scripts/check.sh がありません'}"
+    elif result == "pass" and unit and (missing := missing_examples(root)):
+        # the spec's example table is the acceptance test: bounce it back now instead of losing the unit later
+        sess["streak"] += 1
+        tail = ("設計書の例のうち、テストの中に ID が見つからないもの: " + ", ".join(missing[:10])
+                + "。例の表の各行を、ID をテストの中に書いて(parametrize の ids など)テストにしてください。")
+        sess["fail"], sess["reason"], sess["stage"] = sig, tail, "examples"
+        event.update({"result": "fail", "stage": "examples", "streak": sess["streak"]})
+        reply = _block_or_escalate(sess, sig, "examples", tail, max_rounds)
+        if "systemMessage" in reply:
+            event["result"] = "escalate"
+        log_event(anchor, event)
     elif result == "pass":
         sess["ok"], sess["streak"], sess["fail"] = sig, 0, ""
         log_event(anchor, event)
