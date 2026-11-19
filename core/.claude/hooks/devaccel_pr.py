@@ -75,8 +75,8 @@ def need_confinement(cfg: dict) -> bool:
     return True
 
 
-def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
-                   sandbox: bool = False) -> tuple[bool, list[str], str, float]:
+def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path, sandbox: bool = False,
+                   export_from: Path | None = None) -> tuple[bool, list[str], str, float]:
     """Run the *base branch's* check.sh full in workdir: a branch cannot weaken the check that judges it."""
     t0 = time.time()
     base_check = git(root, "show", f"{base_ref}:scripts/check.sh") if base_ref else ""
@@ -102,9 +102,9 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
         if "pytest" in base_check:
             def collect_own_copy() -> int | None:
                 with tempfile.TemporaryDirectory(prefix="devaccel-collect-") as cdir:
-                    # the same commit the check judges: a land worktree's own HEAD, else the branch HEAD
-                    src = workdir if (workdir / ".git").exists() else root
-                    if not export_head(src, Path(cdir)):
+                    # the same commit the check judges, from a checkout the caller names (never inferred from
+                    # files inside the tree being judged): the branch HEAD for PRs, land's merge worktree for land
+                    if not export_head(export_from or root, Path(cdir)):
                         return None
                     return _pytest_collected(base_check, Path(cdir), sandbox, int(cfg["gate"]["timeout_sec"]))
             pending = pool.submit(collect_own_copy)
@@ -149,6 +149,8 @@ def export_head(root: Path, dest: Path) -> bool:
         if blob.returncode != 0:
             return False
         rel = os.fsdecode(path)
+        if any(part.lower() == ".git" for part in Path(rel).parts):  # never write git metadata into a snapshot
+            return False
         target = (dest / rel).resolve()
         if dest.resolve() not in target.parents:
             return False
