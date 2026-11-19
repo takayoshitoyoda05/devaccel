@@ -1913,9 +1913,18 @@ class R24BatchFromClaudeTest(R6ShipTest):
         (self.root / ".devaccel").mkdir(exist_ok=True)
         (self.root / ".devaccel/link.md").symlink_to(secret)
         (self.root / ".devaccel/t.md").write_text("1. x\n")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "s.md").write_text("1. a\n2. b\n")
+        (self.root / "docs").mkdir(exist_ok=True)
+        if (self.root / "docs/design").exists():
+            import shutil as _sh
+            _sh.rmtree(self.root / "docs/design")
+        (self.root / "docs/design").symlink_to(outside)
         env_cc = {"CLAUDECODE": "1"}
         for args in ([str(secret), "--branch", "batch/x"], [".devaccel/link.md", "--branch", "batch/x"],
-                     [".devaccel/t.md", "--branch", "feat/x"], [".devaccel/t.md", "--branch", "batch/x", "--jobs", "9"]):
+                     [".devaccel/t.md", "--branch", "feat/x"], [".devaccel/t.md", "--branch", "batch/x", "--jobs", "9"],
+                     ["docs/design/s.md", "--branch", "batch/x"]):
             r = sh(self.root, "python3", ".claude/hooks/devaccel_batch.py", *args, env=env_cc)
             self.assertEqual(r.returncode, 2, args)
             self.assertIn("only `.devaccel/", r.stderr, args)

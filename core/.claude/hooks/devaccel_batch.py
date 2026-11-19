@@ -206,7 +206,9 @@ def main() -> int:
     if os.environ.get("CLAUDECODE"):  # started by the model, outside the sandbox: the guard's grammar, re-checked
         tf = Path(os.path.realpath(a.tasks))
         extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run") and v != ap.get_default(k)]
-        if (tf.parent not in ((root / ".devaccel").resolve(), (root / "docs" / "design").resolve())
+        allowed = [d for d in (root / ".devaccel", root / "docs" / "design")  # real directories inside the repo:
+                   if not any(p.is_symlink() for p in (d, d.parent))]  # a linked dir could point at ~/.ssh
+        if (tf.parent not in [d.resolve() for d in allowed] or not tf.is_relative_to(root.resolve())
                 or tf.suffix != ".md" or tf.is_symlink()
                 or Path(a.tasks).is_symlink() or not re.fullmatch(r"batch/[\w-]+", a.branch) or extra):
             print("from Claude Code only `.devaccel/<name>.md` (or docs/design/<name>.md) `--branch batch/<name> "
