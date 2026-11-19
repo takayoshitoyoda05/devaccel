@@ -83,8 +83,7 @@ PR_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_pr\.py(?:\s[^`$<>]*)?\
 SHIP_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_ship\.py(?:\s[^`$<>]*)?\s*$")  # pushes: lock-checked
 # batch runs outside the sandbox (settings: sandbox.excludedCommands): exact form, plain arguments only
 BATCH_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_batch\.py (?:\.devaccel|docs/design)/[\w-]+\.md "
-                       r"--branch batch/[\w-]+"
-                       r"(?: --dry-run)?\s*$")
+                       r"--branch batch/[\w-]+(?: --design)?(?: --dry-run)?\s*$")
 LAND_RUN = re.compile(r"^\s*python3 \.claude/hooks/devaccel_land\.py(?: --dry-run)?\s*$")
 # reads that cannot execute anything (no sed/less/rg: they have exec escapes)
 READERS = re.compile(r"^\s*(?:cat|head|tail|wc|ls|grep|git (?:diff|log|show|status))\s[^`$<>]*$")

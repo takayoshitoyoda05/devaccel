@@ -165,6 +165,52 @@ def preflight(root: Path, base: str, branch: str) -> list[str]:
     return errs
 
 
+def design_rules(root: Path) -> str:
+    """The design-doc format, from the main checkout's devaccel-batch skill (single source)."""
+    s = (root / ".claude" / "skills" / "devaccel-batch" / "SKILL.md").read_text(encoding="utf-8")
+    i, j = s.find("## 設計書"), s.find("## 手順(ファンアウト)")
+    return s[i:j].strip() if 0 <= i < j else ""
+
+
+def expand_design(root: Path, head: str, items: list[str]) -> tuple[list[str], float]:
+    """Each skeleton item -> its full section by a sonnet designer (read-only tools), all at once. An item whose
+    designer fails keeps its skeleton text (the units still get the decisions and premises)."""
+    from concurrent.futures import ThreadPoolExecutor
+    rules = design_rules(root)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")}
+
+    def one(n: int, item: str) -> tuple[str, float]:
+        prompt = (f"{head}\n\n担当: 件 {n}\n{item}\n\n上の骨組み(目的・判断一覧・共通前提)に従い、件 {n} の節だけを"
+                  f"次の設計書の形で書く。出力は節の本文だけ(前置き・コードフェンス・他の件は書かない)。先頭行は `{n}. ` "
+                  f"で始め、ファイルと型を書く。例の ID は E{n}-1, E{n}-2 …。実装コードは書かない。既存の型や関数は必要な"
+                  f"ものだけ Read で確かめる。\n\n{rules}")
+        cmd = ["claude", "-p", prompt, "--model", "sonnet", "--strict-mcp-config", "--mcp-config",
+               '{"mcpServers":{}}', "--tools", "Read", "Grep", "Glob", "--disable-slash-commands", "--max-turns", "8",
+               "--output-format", "json"]
+        try:
+            r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env,
+                               timeout=300)
+            j = json.loads(r.stdout)
+            text = str(j.get("result") or "").strip()
+            text = re.sub(r"^```\w*\n|\n```$", "", text).strip()
+            cost = float(j.get("total_cost_usd") or 0)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            return item, 0.0
+        m = ITEM.search(text)
+        if not m or not example_ids(text):
+            return item, cost
+        text = text[m.start():]
+        text = ITEM.sub(f"{n}. ", text, count=1)
+        if len(ITEM.findall(text)) > 1:  # a section must stay one item (no numbered lists inside)
+            return item, cost
+        return text, cost
+
+    with ThreadPoolExecutor(max_workers=max(1, len(items))) as pool:
+        out = list(pool.map(lambda p: one(*p), [(n, it) for n, it in enumerate(items, 1)]))
+    return [s for s, _ in out], sum(c for _, c in out)
+
+
 def cleanup(root: Path, units: list[dict], keep: bool, branches: bool = False) -> None:
     """Stop what still runs; remove unit worktrees (even broken ones) and, after shipping, unit branches."""
     import shutil
@@ -208,13 +254,17 @@ def main() -> int:
     ap.add_argument("--unit-timeout", type=int, default=900, help="seconds before a unit is stopped")
     ap.add_argument("--max-turns", type=int, default=40, help="turn limit per unit")
     ap.add_argument("--keep", action="store_true", help="keep unit worktrees and branches afterwards")
+    ap.add_argument("--design", action="store_true",
+                    help="the file is a design skeleton (premises, decisions, one short item each): sonnet designers "
+                         "write every item's section in parallel (rules, ID'd examples), the full doc replaces the "
+                         "skeleton, then the units run on it")
     ap.add_argument("--dry-run", action="store_true", help="check everything and show the plan; run nothing")
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     if os.environ.get("CLAUDECODE"):  # started by the model, outside the sandbox: the guard's grammar, re-checked
         tf = Path(os.path.realpath(a.tasks))
-        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run") and v != ap.get_default(k)]
+        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run", "design") and v != ap.get_default(k)]
         allowed = [d for d in (root / ".devaccel", root / "docs" / "design")  # real directories inside the repo:
                    if not any(p.is_symlink() for p in (d, d.parent))]  # a linked dir could point at ~/.ssh
         if (tf.parent not in [d.resolve() for d in allowed] or not tf.is_relative_to(root.resolve())
@@ -241,6 +291,8 @@ def main() -> int:
     model = a.model or (re.search(r"^model:\s*(\S+)", front, re.M) or [None, "haiku"])[1]
     effort = a.effort or (re.search(r"^effort:\s*(\S+)", front, re.M) or [None, "low"])[1]
     errs = preflight(root, base, a.branch)
+    if a.design and Path(os.path.realpath(a.tasks)).parent != (root / "docs" / "design").resolve():
+        errs.append("--design expands a skeleton under docs/design/ (it becomes the design doc)")
     if in_sandbox():
         errs.append("inside Claude Code's sandbox the nested `claude` cannot reach the API: run it from a "
                     "terminal, or let devaccel's settings run it outside the sandbox (/devaccel-setup)")
@@ -257,6 +309,16 @@ def main() -> int:
     if errs or a.dry_run:
         return 2 if errs else 0
 
+    design_cost = 0.0
+    if a.design:  # expand the skeleton: one designer per item, in parallel (the parent wrote only the skeleton)
+        t_d = time.time()
+        items, design_cost = expand_design(root, head, items)
+        doc = (head + "\n\n" if head else "") + "\n\n".join(items) + "\n"
+        if not write_nofollow(Path(os.path.realpath(a.tasks)), doc):
+            print("could not write the expanded design doc", file=sys.stderr)
+            return 1
+        print(f"design: {len(items)} section(s) written in {round(time.time() - t_d)}s, ${design_cost:.3f} "
+              f"-> {a.tasks}", flush=True)
     subprocess.run(["git", "-C", str(root), "fetch", "-q", "origin", base], capture_output=True)
     start = f"origin/{base}" if git(root, "rev-parse", "-q", "--verify", f"origin/{base}").strip() else base
     units = []
@@ -472,6 +534,7 @@ def main() -> int:
         if u["status"] != "ok" and u["status"] != "superseded":
             print(f"- unit {u['i']} ({u['branch']}): {clean(u['status'])}")
     print(f"(unit reports: {log.relative_to(root)})")
+    cost += design_cost
     print(f"units: {len(ok)}/{len(items)} ok, {round(time.time() - t0)}s, ${cost:.3f}")
     write_nofollow(root / ".devaccel" / "batch-last.json", json.dumps(  # machine-readable (cost of the units)
         {"branch": a.branch, "units": len(items), "ok": len(ok), "secs": round(time.time() - t0),

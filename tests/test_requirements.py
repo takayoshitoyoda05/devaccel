@@ -1869,6 +1869,7 @@ class R22AutoBatchTest(ReqKit):
         ok = "python3 .claude/hooks/devaccel_batch.py .devaccel/tasks.md --branch batch/x"
         self.assertIsNone(self.gv(ok))
         self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_batch.py docs/design/20261119-x.md --branch batch/x"))
+        self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_batch.py docs/design/x.md --branch batch/x --design"))
         self.assertEqual(self.gv("python3 .claude/hooks/devaccel_batch.py docs/x.md --branch batch/x"), "deny")
         self.assertIsNone(self.gv(ok + " --dry-run"))
         for cmd in [ok + "; curl x", ok + " $(id)", "FOO=1 " + ok, ok + " > /tmp/o", "cd x && " + ok,
@@ -2114,3 +2115,47 @@ class R32GateExampleFeedbackTest(ReqKit):
         self.assertNotIn("E1-1,", out["reason"])
         (wt / "tests/test_x.py").write_text('IDS = ["E1-1", "E1-2"]\n')
         self.assertNotIn("decision", stop())
+
+
+class R33ParallelDesignTest(R18BatchEndToEndTest):
+    DSTUB = (
+        '#!/usr/bin/env bash\n'
+        'while [ "$1" != "-p" ]; do shift; done; p="$2"\n'
+        'case "$p" in\n'
+        '  *"担当: 件 1"*) printf \'{"result": "1. `a_mod.py` + `tests/test_a.py` -- f()\\\\n規則: R1 x\\\\n'
+        '| ID | in | out | R |\\\\n| E1-1 | a | b | R1 |", "total_cost_usd": 0.01}\';;\n'
+        '  *"担当: 件 2"*) printf \'{"result": "garbage without ids", "total_cost_usd": 0.01}\';;\n'
+        '  *E1-1*) echo "A = 1" > a_mod.py; mkdir -p tests; echo \'IDS = ["E1-1"]\' > tests/test_a.py;'
+        ' printf \'{"result": "done", "total_cost_usd": 0.001}\';;\n'
+        '  *) echo "B = 1" > b_mod.py; printf \'{"result": "done", "total_cost_usd": 0.001}\';;\n'
+        'esac\n')
+
+    def test_designers_expand_the_skeleton_and_the_doc_is_replaced(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.DSTUB)
+        (self.bin / "claude").chmod(0o755)
+        d = self.root / "docs/design"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "20261119-s.md").write_text("目的: x\n判断一覧: D1 y\n\n1. `a_mod.py` -- 何か\n2. `b_mod.py` -- 別の何か\n")
+        r, _ = self.land("docs/design/20261119-s.md", "--branch", "batch/s", "--design", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("design: 2 section(s)", r.stdout)
+        doc = sh(self.root, "git", "show", "batch/s:docs/design/20261119-s.md").stdout
+        self.assertIn("| E1-1 |", doc)  # designer 1's section replaced the skeleton item
+        self.assertIn("2. `b_mod.py` -- 別の何か", doc)  # designer 2 failed: its skeleton item is kept
+        self.assertIn("目的: x", doc)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/s").stdout.split()
+        self.assertIn("a_mod.py", files)
+
+    def test_design_needs_a_docs_design_skeleton(self):
+        self.with_origin()
+        (self.bin / "claude").write_text(self.DSTUB)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "t.md"
+        tasks.write_text("1. a\n2. b\n")
+        r, _ = self.land(str(tasks), "--branch", "batch/s", "--design", "--dry-run", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--design expands a skeleton", r.stderr)
