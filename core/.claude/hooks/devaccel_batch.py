@@ -42,6 +42,8 @@ SKIP_NEW = re.compile(r"(^|/)(\.?env|[^/]*\.env|\.env\.[^/]*|[^/]*\.(pem|key|p12
 CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 
 
+SECRET_TEXT = re.compile(r"gh[opsu]_[A-Za-z0-9]{36}|github_pat_\w+|-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}"
+                         r"|sk-[A-Za-z0-9_-]{20,}|xox[abp]-[A-Za-z0-9-]{10,}")
 EXAMPLE_ID = re.compile(r"^\|\s*(E\d+-\d+)\s*\|", re.M)
 TEST_FILE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests?/")
 
@@ -185,9 +187,16 @@ def expand_design(root: Path, head: str, items: list[str]) -> tuple[list[str], f
                   f"次の設計書の形で書く。出力は節の本文だけ(前置き・コードフェンス・他の件は書かない)。先頭行は `{n}. ` "
                   f"で始め、ファイルと型を書く。例の ID は E{n}-1, E{n}-2 …。実装コードは書かない。既存の型や関数は必要な"
                   f"ものだけ Read で確かめる。\n\n{rules}")
+        # read-only tools. Outside the working directory reads need a permission that `-p` never grants; the
+        # project's Read denies (.env) apply as for the parent; this adds explicit denies for home secrets and
+        # secret-looking names (deny rules win over allows, so no broad "deny all but the repo" is possible)
+        deny = {"permissions": {"deny": [
+            "Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.gnupg/**)", "Read(~/.config/**)", "Read(~/.claude/**)",
+            "Read(~/.netrc)", "Read(~/.docker/**)", "Read(~/.kube/**)", "Read(**/.env)", "Read(**/.env.*)",
+            "Read(**/*.pem)", "Read(**/*.key)", "Read(**/id_rsa*)", "Read(**/id_ed25519*)", "Read(**/credentials*)"]}}
         cmd = ["claude", "-p", prompt, "--model", "sonnet", "--strict-mcp-config", "--mcp-config",
                '{"mcpServers":{}}', "--tools", "Read", "Grep", "Glob", "--disable-slash-commands", "--max-turns", "8",
-               "--output-format", "json"]
+               "--settings", json.dumps(deny), "--output-format", "json"]
         try:
             r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env,
                                timeout=300)
@@ -198,7 +207,7 @@ def expand_design(root: Path, head: str, items: list[str]) -> tuple[list[str], f
         except (subprocess.TimeoutExpired, ValueError, OSError):
             return item, 0.0
         m = ITEM.search(text)
-        if not m or not example_ids(text):
+        if not m or not example_ids(text) or SECRET_TEXT.search(text):  # never a credential into the doc / PR
             return item, cost
         text = text[m.start():]
         text = ITEM.sub(f"{n}. ", text, count=1)
