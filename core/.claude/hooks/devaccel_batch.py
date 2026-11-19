@@ -387,8 +387,9 @@ def main() -> int:
         prompt = (head + "\n\n" if head else "") + it + ctx + (
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
             if not dual else "\n\nこの 1 件だけを実装する。"
-            + ("テストが通ったら `uv run ruff check --fix <作った・変えたファイル>` を 1 回回し、残った指摘を直してから終える"
-               "(lint の差し戻しは 1 往復 10 秒以上かかる)。" if "python" in cfg.get("presets", []) else "")
+            + ("テストが通ったら `uv run ruff check --fix <作った・変えたファイル>` と `uv run pyright <作った・変えたファイル>` を"
+               "1 回ずつ回し、残った指摘を直してから終える(終了時の検査で落ちると 1 往復 10 秒以上かかり、直せないまま"
+               "終わると件ごと外れる)。" if "python" in cfg.get("presets", []) else "")
             + "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
             "コミットはしない(ゲートを通った作業ツリーを devaccel_batch がコミットする)。")
         # lean session: no MCP servers, only the tools a unit uses, no skill/command listing. That context is
