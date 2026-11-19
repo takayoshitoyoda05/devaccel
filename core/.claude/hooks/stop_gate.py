@@ -230,6 +230,27 @@ def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[
     return relevant
 
 
+def missing_examples(root: Path) -> list[str]:
+    """IDs from <worktree>/.devaccel/expected-ids (written by devaccel_batch) not found in the tree's test files.
+    Feedback only: devaccel_batch re-checks the committed tests against the spec itself."""
+    try:
+        ids = [x.strip() for x in (root / ".devaccel" / "expected-ids").read_text(encoding="utf-8").splitlines()
+               if re.fullmatch(r"E\d+-\d+", x.strip())]
+    except OSError:
+        return []
+    text = ""
+    for p in root.rglob("*.py"):
+        rel = p.relative_to(root).as_posix()
+        if rel.startswith((".", "node_modules/")) or "/." in rel:
+            continue
+        if re.search(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests?/", rel):
+            try:
+                text += p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+    return [x for x in ids if not re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", text)]
+
+
 def pr_nudge(root: Path, cfg: dict, sess: dict) -> dict | None:
     """Sessions only: uncommitted code changes at the end of a turn -> ask once to open the evidence PR.
     Once per state: stopping again without changes (the user said no PR, or it was only a question) passes."""
@@ -383,6 +404,17 @@ def main() -> int:
         log_event(anchor, event)
         if mode == "enforce":  # never pass silently when the check could not run
             reply["systemMessage"] = f"[devaccel] check.sh を実行できず未検査です: {output[:200] or 'scripts/check.sh がありません'}"
+    elif result == "pass" and unit and (missing := missing_examples(root)):
+        # the spec's example table is the acceptance test: bounce it back now instead of losing the unit later
+        sess["streak"] += 1
+        tail = ("設計書の例のうち、テストの中に ID が見つからないもの: " + ", ".join(missing[:10])
+                + "。例の表の各行を、ID をテストの中に書いて(parametrize の ids など)テストにしてください。")
+        sess["fail"], sess["reason"], sess["stage"] = sig, tail, "examples"
+        event.update({"result": "fail", "stage": "examples", "streak": sess["streak"]})
+        reply = _block_or_escalate(sess, sig, "examples", tail, max_rounds)
+        if "systemMessage" in reply:
+            event["result"] = "escalate"
+        log_event(anchor, event)
     elif result == "pass":
         sess["ok"], sess["streak"], sess["fail"] = sig, 0, ""
         log_event(anchor, event)

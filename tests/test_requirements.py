@@ -2086,3 +2086,28 @@ class R31ExampleCoverageTest(R18BatchEndToEndTest):
         import devaccel_batch as b
         self.assertEqual(b.example_ids("x\n| ID | a |\n| E1-1 | x |\n|E1-2| y |\n| E1-1 | z |\nE9-9 in text"),
                          ["E1-1", "E1-2"])
+
+
+class R32GateExampleFeedbackTest(ReqKit):
+    def test_unit_gate_bounces_missing_example_ids_until_tests_carry_them(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        wt = self.root / ".claude" / "worktrees" / "u7"
+        sh(self.root, "git", "worktree", "add", "-q", "-b", "u7", str(wt))
+        (wt / ".devaccel").mkdir()
+        (wt / ".devaccel/expected-ids").write_text("E1-1\nE1-2\n")
+        (wt / "tests").mkdir(exist_ok=True)
+        (wt / "tests/test_x.py").write_text('IDS = ["E1-1"]\n')
+
+        def stop() -> dict:
+            r = run(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"),
+                    env={"CLAUDE_PROJECT_DIR": str(self.root)},
+                    stdin=json.dumps({"session_id": "s", "agent_id": "u7", "cwd": str(wt)}))
+            return json.loads(r.stdout) if r.stdout.strip() else {}
+        out = stop()
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("E1-2", out["reason"])
+        self.assertNotIn("E1-1,", out["reason"])
+        (wt / "tests/test_x.py").write_text('IDS = ["E1-1", "E1-2"]\n')
+        self.assertNotIn("decision", stop())

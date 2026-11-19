@@ -290,6 +290,8 @@ def main() -> int:
                 print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
                 cleanup(root, units, a.keep)
                 return 1
+            if example_ids(it):  # the unit's own gate checks these at Stop (feedback); settle re-checks (authority)
+                write_nofollow(wt / ".devaccel" / "expected-ids", "\n".join(example_ids(it)) + "\n")
             units.append({"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd})
 
     def settle(u: dict) -> str:
