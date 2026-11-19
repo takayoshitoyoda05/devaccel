@@ -502,6 +502,8 @@ def main() -> int:
         units.append(v)
         return v
 
+    # a backup copy for a straggler once half the items passed (the slowest unit's time varies 52-185 s run to run)
+    speculate = a.speculate or bool(cfg["parallel"].get("speculate")) or os.environ.get("DEVACCEL_SPECULATE") == "1"
     running, done, won, speculated = [], [], {}, set()
     pending = list(units)
     watch_until = time.time() + 600
@@ -603,7 +605,7 @@ def main() -> int:
                     launch(u)
             time.sleep(0.5)
             passed = sorted(x["secs"] for x in done if x.get("status") == "ok")
-            if a.speculate and len(passed) * 2 >= len(items) and len(running) < limit:
+            if speculate and len(passed) * 2 >= len(items) and len(running) < limit:
                 med = passed[len(passed) // 2]
                 for u in list(running):  # a straggler gets one backup copy; the first copy to pass wins
                     late = time.time() - u["t"] > max(1.4 * med, med + 15)
