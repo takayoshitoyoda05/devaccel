@@ -185,7 +185,8 @@ def _read_nofollow(p: Path) -> bytes | None:
             return None
         fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as fh:
-            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:  # no hardlinked files from an agent's tree
                 return None
             return fh.read(5_000_000)
     except OSError:
@@ -209,9 +210,13 @@ def write_nofollow_deep(base: Path, rel: str, data: bytes) -> bool:
             nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = nxt
-        out = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        # a fresh file renamed over the destination: never writes through an existing entry (a planted
+        # hardlink to a file elsewhere would otherwise be overwritten in place)
+        tmp = f".{parts[-1]}.{os.getpid()}.devaccel-tmp"
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
         with os.fdopen(out, "wb") as fh:
             fh.write(data)
+        os.replace(tmp, parts[-1], src_dir_fd=fd, dst_dir_fd=fd)
         return True
     except OSError:
         return False
