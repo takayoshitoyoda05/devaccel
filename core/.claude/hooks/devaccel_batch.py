@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))
-from devaccel_common import git, load_config, write_nofollow  # noqa: E402
+from devaccel_common import git, id_present, load_config, write_nofollow  # noqa: E402
 from stop_gate import run_check  # noqa: E402
 
 # "1. ", also as a markdown heading or bold ("## 1. ", "**1.** ") — how a session tends to rewrite a list
@@ -327,7 +327,7 @@ def main() -> int:
         if ids:  # the spec's example table is the acceptance test: every ID must be in the unit's tests
             tests = "".join(git(root, "show", f"{u['branch']}:{f}") for f in git(
                 root, "diff", "--name-only", start, u["branch"]).splitlines() if TEST_FILE.search(f))
-            missing = [x for x in ids if not re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", tests)]
+            missing = [x for x in ids if not id_present(x, tests)]
             if missing:
                 return "examples not in tests: " + ", ".join(missing[:5])
         changed = git(root, "diff", "--name-only", "-z", start, u["branch"]).split("\0")

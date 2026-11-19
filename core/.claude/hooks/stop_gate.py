@@ -22,6 +22,7 @@ sys.path.append(str(Path(__file__).resolve().parent))  # (the script dir is alre
 from devaccel_common import (  # noqa: E402
     emit as _emit_raw,
     worktree_link_ok,
+    id_present,
     check_script_for,
     confined,
     git,
@@ -259,7 +260,7 @@ def missing_examples(root: Path) -> list[str]:
                 continue
             total += len(data)
             text += data.decode("utf-8", errors="replace")
-    return [x for x in ids if not re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", text)]
+    return [x for x in ids if not id_present(x, text)]
 
 
 def pr_nudge(root: Path, cfg: dict, sess: dict) -> dict | None:

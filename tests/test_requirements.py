@@ -2114,3 +2114,13 @@ class R32GateExampleFeedbackTest(ReqKit):
         self.assertNotIn("E1-1,", out["reason"])
         (wt / "tests/test_x.py").write_text('IDS = ["E1-1", "E1-2"]\n')
         self.assertNotIn("decision", stop())
+
+
+class R34IdSpellingTest(unittest.TestCase):
+    def test_id_spellings_count_but_other_numbers_do_not(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        from devaccel_common import id_present
+        for t in ('ids=["E2-3"]', "test_E2_3_neg", "e2-3", "E2-3a", "id=E2-3_neg"):
+            self.assertTrue(id_present("E2-3", t), t)
+        for t in ("E2-30", "E2-4", "XE2-3", "E12-3"):
+            self.assertFalse(id_present("E2-3", t), t)

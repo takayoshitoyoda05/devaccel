@@ -206,6 +206,15 @@ def write_nofollow(path: Path, text: str | None) -> bool:
         os.close(dfd)
 
 
+def id_present(example_id: str, text: str) -> bool:
+    """`E2-3` counts as present as E2-3, E2_3, e2-3 or a variant like E2-3a / E2-3_neg (all 9 example bounces in
+    the measurements were such spellings, never missing tests); E2-30 is a different example."""
+    m = re.fullmatch(r"E(\d+)-(\d+)", example_id)
+    if not m:
+        return example_id in text
+    return re.search(rf"(?<![A-Za-z0-9])[Ee]{m[1]}[-_]{m[2]}(?![0-9])", text) is not None
+
+
 def git(root: Path, *args: str, check: bool = False) -> str:
     try:
         r = subprocess.run(

@@ -93,12 +93,8 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
                 return False, ["== failed: check.sh full (bwrap がないので隔離できない)"], "", 0.0
             cmd, env = wrapped
         env["DEVACCEL_ROOT"] = str(workdir)
-        # the collection cross-check runs alongside the check (full mode writes no sources; ~1 s saved)
-        from concurrent.futures import ThreadPoolExecutor
-        pool = ThreadPoolExecutor(max_workers=1)
-        pending = (pool.submit(_pytest_collected, base_check, workdir, sandbox, int(cfg["gate"]["timeout_sec"]))
-                   if "pytest" in base_check else None)
-        pool.shutdown(wait=False)
+        # (the collection cross-check runs after the check, not alongside: in a fresh snapshot both would create
+        # the environment (.venv) at once, and the loser made "collected: None" = a false failure, 5 of 12 PRs)
         r = run(cmd, workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10, env=env)
     except subprocess.TimeoutExpired:
         return False, ["== failed: check.sh full (timeout)"], "timeout", round(time.time() - t0, 1)
@@ -111,7 +107,7 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
         # cross-check with a separate collection: a test that prints a fake summary and os._exit(0)s,
         # or one that stops pytest early, leaves "ran" != "collected"
         ran = _pytest_ran("\n".join(out))
-        collected = pending.result() if pending is not None else None
+        collected = _pytest_collected(base_check, workdir, sandbox, int(cfg["gate"]["timeout_sec"]))
         if collected is None or (collected > 0 and ran != collected):
             ok = False
             stages.append(f"== failed: tests (ran {ran} of {collected} collected)")
