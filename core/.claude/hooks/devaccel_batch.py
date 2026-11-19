@@ -42,6 +42,15 @@ SKIP_NEW = re.compile(r"(^|/)(\.?env|[^/]*\.env|\.env\.[^/]*|[^/]*\.(pem|key|p12
 CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 
 
+EXAMPLE_ID = re.compile(r"^\|\s*(E\d+-\d+)\s*\|", re.M)
+TEST_FILE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests?/")
+
+
+def example_ids(item: str) -> list[str]:
+    """IDs of the example table rows in a design-doc item (`| E1-2 | input | output | rule |`)."""
+    return list(dict.fromkeys(EXAMPLE_ID.findall(item)))
+
+
 def clean(s: str) -> str:
     """A unit's free text, made safe for the terminal and a PR body: no control/escape or bidi characters,
     and no @mentions, issue links/closing keywords or HTML comments that would act on GitHub."""
@@ -256,6 +265,9 @@ def main() -> int:
     strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong)])
     for i, it in enumerate(items, 1):
         ctx = "" if a.no_context else context_files(root, head + "\n" + it)
+        if example_ids(it):
+            ctx += ("\n\n例の表の全行を、ID をテストの中に書いて(parametrize の ids など)テストに写してから実装する。"
+                    "端のケースは表に列挙済みなので考え直さない。ID が 1 つでもテストに無ければ統合されない。")
         prompt = (head + "\n\n" if head else "") + it + ctx + (
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
             + ("テストが通ったら `uv run ruff check --fix <作った・変えたファイル>` を 1 回回し、残った指摘を直してから終える"
@@ -309,6 +321,13 @@ def main() -> int:
         commits = git(root, "rev-list", "--count", f"{start}..{u['branch']}").strip()
         if commits in ("", "0"):
             return "no commit"
+        ids = example_ids(items[u["i"] - 1])
+        if ids:  # the spec's example table is the acceptance test: every ID must be in the unit's tests
+            tests = "".join(git(root, "show", f"{u['branch']}:{f}") for f in git(
+                root, "diff", "--name-only", start, u["branch"]).splitlines() if TEST_FILE.search(f))
+            missing = [x for x in ids if not re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", tests)]
+            if missing:
+                return "examples not in tests: " + ", ".join(missing[:5])
         changed = git(root, "diff", "--name-only", "-z", start, u["branch"]).split("\0")
         touched = [f for f in changed if f and SKIP_NEW.search(f)]
         if touched:  # e.g. the unit committed by itself: secrets or devaccel/Claude config are never integrated

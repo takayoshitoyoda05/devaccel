@@ -1736,6 +1736,8 @@ class R18BatchEndToEndTest(R6ShipTest):
         '  *GOODTASK*) echo "A = 1" > a_mod.py;;\n'
         '  *BADTASK*) echo "BROKEN = 1" >> app.py; echo "C = 1" > c_mod.py;;\n'
         '  *SECRETTASK*) echo "TOKEN=x" > .env; echo "B = 1" > b_mod.py; echo " " >> .claude/project.json;;\n'
+        '  *EXHALF*) echo "H = 1" > h_mod.py; mkdir -p tests; printf "IDS = [%s]\\n" "\\"E1-1\\"" > tests/test_h.py;;\n'
+        '  *EXFULL*) echo "F = 1" > f_mod.py; mkdir -p tests; printf "IDS = [%s]\\n" "\\"E2-1\\", \\"E2-2\\"" > tests/test_f.py;;\n'
         '  *SELFCOMMIT*) echo "S = 1" > s_mod.py; echo "K" > id_rsa; git add -A; git -c user.name=u '
         '-c user.email=u@x commit -qm self;;\n'
         'esac\n'
@@ -2058,3 +2060,29 @@ class R30DesignDocBatchTest(R18BatchEndToEndTest):
         files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/t").stdout.split()
         self.assertIn("docs/design/20261119-t.md", files)
         self.assertIn("a_mod.py", files)
+
+
+class R31ExampleCoverageTest(R18BatchEndToEndTest):
+    def test_every_example_id_must_be_in_the_units_tests(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "tasks.md"
+        tasks.write_text("1. EXHALF `h_mod.py` テスト `tests/test_h.py`\n| ID | 入力 | 出力 | 規則 |\n"
+                         "| E1-1 | a | b | R1 |\n| E1-2 | c | d | R1 |\n"
+                         "2. EXFULL `f_mod.py` テスト `tests/test_f.py`\n| E2-1 | a | b | R1 |\n| E2-2 | c | d | R1 |\n")
+        r, _ = self.land(str(tasks), "--branch", "batch/t", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("examples not in tests: E1-2", r.stdout)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/t").stdout.split()
+        self.assertIn("f_mod.py", files)
+        self.assertNotIn("h_mod.py", files)
+
+    def test_example_ids_parse(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        self.assertEqual(b.example_ids("x\n| ID | a |\n| E1-1 | x |\n|E1-2| y |\n| E1-1 | z |\nE9-9 in text"),
+                         ["E1-1", "E1-2"])
