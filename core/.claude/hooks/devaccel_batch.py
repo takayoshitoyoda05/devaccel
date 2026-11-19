@@ -193,20 +193,23 @@ def _read_nofollow(p: Path) -> bytes | None:
 
 
 def write_nofollow_deep(base: Path, rel: str, data: bytes) -> bool:
-    """Write base/rel creating directories, refusing any symlinked component on the way."""
-    target = base
-    for part in Path(rel).parts[:-1]:
-        target = target / part
-        if target.is_symlink():
-            return False
-        target.mkdir(exist_ok=True)
-    p = base / rel
+    """Write base/rel, walking every directory relative to its parent's fd with O_NOFOLLOW (no window in which a
+    concurrently planted link could redirect the write)."""
+    parts = Path(rel).parts
     try:
-        fd = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return False
     try:
-        out = os.open(p.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        out = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=fd)
         with os.fdopen(out, "wb") as fh:
             fh.write(data)
         return True
@@ -427,7 +430,7 @@ def main() -> int:
         t = u.get("tester")
         if t and t.get("failed"):
             return "the tester failed (no spec tests)"
-        if t and any(_digest(wt / f) != h for f, h in t.get("hash", {}).items()):
+        if t and any(not h or _digest(wt / f) != h for f, h in t.get("hash", {}).items()):
             return "spec tests changed by the implementer"
         if t and not any(t.get("hash", {}).values()):
             return "the tester wrote no spec tests"
@@ -565,11 +568,16 @@ def main() -> int:
         t["finished"] = True
         t["failed"] = t["p"].returncode != 0  # killed or crashed: no trustworthy spec tests
         t["hash"] = {}
+        import hashlib
         for f in t["files"]:  # copy the tester's tests over whatever is at that path in the implementer's tree
             src = _read_nofollow(t["wt"] / f)
-            if src is not None and Path(f).parts and ".." not in Path(f).parts and not Path(f).is_absolute():
-                write_nofollow_deep(u["wt"], f, src)
-            t["hash"][f] = _digest(u["wt"] / f)
+            ok = (src is not None and bool(Path(f).parts) and ".." not in Path(f).parts and not Path(f).is_absolute()
+                  and write_nofollow_deep(u["wt"], f, src))
+            if not ok:  # fail closed: a spec test that could not be copied is a failed tester
+                t["failed"] = True
+                t["hash"][f] = ""
+                continue
+            t["hash"][f] = hashlib.sha256(src).hexdigest()  # what was copied, not a re-read of the tree
         write_nofollow(u["wt"] / ".devaccel" / "tester-pending", None)
 
     try:
