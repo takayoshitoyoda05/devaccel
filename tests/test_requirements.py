@@ -2190,7 +2190,8 @@ class R36DualTrackTest(R18BatchEndToEndTest):
         tasks = self.tmp / "tasks.md"
         tasks.write_text("1. GOOD `a_mod.py` + `tests/test_a.py`\n| ID | in | out | R |\n| E1-1 | a | b | R1 |\n"
                          "2. CHEAT `c_mod.py` + `tests/test_c.py`\n| ID | in | out | R |\n| E2-1 | a | b | R1 |\n")
-        os.environ["DEVACCEL_DUAL"] = "1"
+        self.set_cfg({"parallel": {"dual_track": True}})
+        sh(self.root, "git", "push", "-q", "origin", "main")
         r, _ = self.land(str(tasks), "--branch", "batch/d", script="devaccel_batch.py")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/d").stdout.split()

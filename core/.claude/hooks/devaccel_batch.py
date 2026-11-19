@@ -355,8 +355,9 @@ def main() -> int:
     units = []
     t0 = time.time()
     copies = max(1, a.hedge)
-    # dual track (tester || implementer per item): project setting parallel.dual_track or DEVACCEL_DUAL=1
-    dual = bool(cfg["parallel"].get("dual_track")) or os.environ.get("DEVACCEL_DUAL") == "1"
+    # dual track (tester || implementer per item) is experimental and off: measured slower, costlier and with
+    # many refused items (implementers rewrote the spec tests). Kept behind parallel.dual_track for research only
+    dual = bool(cfg["parallel"].get("dual_track"))
     strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong)])
     def add_item(i: int, it: str) -> bool:
         """Worktree(s) and command for item i; False if a worktree could not be made."""
