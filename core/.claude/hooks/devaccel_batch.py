@@ -177,6 +177,45 @@ def preflight(root: Path, base: str, branch: str) -> list[str]:
     return errs
 
 
+def _read_nofollow(p: Path) -> bytes | None:
+    """Contents of a regular file without following a link at the file (and not through linked dirs)."""
+    import stat
+    try:
+        if any(x.is_symlink() for x in p.parents):
+            return None
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+            return fh.read(5_000_000)
+    except OSError:
+        return None
+
+
+def write_nofollow_deep(base: Path, rel: str, data: bytes) -> bool:
+    """Write base/rel creating directories, refusing any symlinked component on the way."""
+    target = base
+    for part in Path(rel).parts[:-1]:
+        target = target / part
+        if target.is_symlink():
+            return False
+        target.mkdir(exist_ok=True)
+    p = base / rel
+    try:
+        fd = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        out = os.open(p.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        with os.fdopen(out, "wb") as fh:
+            fh.write(data)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def _digest(p: Path) -> str:
     """sha256 of a regular file (no link followed), '' if absent."""
     import hashlib
@@ -207,14 +246,17 @@ def cleanup(root: Path, units: list[dict], keep: bool, branches: bool = False) -
     if keep:
         return
     for u in units:
-        r = subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(u["wt"])],
-                           capture_output=True)
-        if r.returncode != 0 and u["wt"].exists():
-            shutil.rmtree(u["wt"], ignore_errors=True)
+        for wt in (u["wt"], (u.get("tester") or {}).get("wt")):
+            if wt is None:
+                continue
+            r = subprocess.run(["git", "-C", str(root), "worktree", "remove", "--force", str(wt)],
+                               capture_output=True)
+            if r.returncode != 0 and wt.exists():
+                shutil.rmtree(wt, ignore_errors=True)
     subprocess.run(["git", "-C", str(root), "worktree", "prune"], capture_output=True)
     if branches:
-        subprocess.run(["git", "-C", str(root), "branch", "-q", "-D", *[u["branch"] for u in units]],
-                       capture_output=True)
+        subprocess.run(["git", "-C", str(root), "branch", "-q", "-D", *[u["branch"] for u in units],
+                        *[u["tester"]["branch"] for u in units if u.get("tester")]], capture_output=True)
 
 
 def main() -> int:
@@ -350,10 +392,18 @@ def main() -> int:
             if example_ids(it):  # the unit's own gate checks these at Stop (feedback); settle re-checks (authority)
                 write_nofollow(wt / ".devaccel" / "expected-ids", "\n".join(example_ids(it)) + "\n")
             u = {"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd}
-            if tester:  # the gate lets the tester's session stop unchecked and makes the implementer wait for it
-                write_nofollow(wt / ".devaccel" / "tester-session", tester["sid"] + "\n")
-                write_nofollow(wt / ".devaccel" / "tester-pending", "1\n")
-                u["tester"] = dict(tester)
+            if tester:
+                # the tester works in its OWN worktree (the implementer can't touch its files); its tests are copied
+                # into the implementer's tree when it exits, and fingerprinted at that moment
+                twt = root / ".claude" / "worktrees" / (tag + "t")
+                r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", f"unit/{tag}t", str(twt),
+                                    start], capture_output=True, text=True)
+                if r.returncode != 0:
+                    print(f"tester worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+                    return False
+                write_nofollow(twt / ".devaccel" / "tester-session", tester["sid"] + "\n")  # its gate lets it stop
+                write_nofollow(wt / ".devaccel" / "tester-pending", "1\n")  # the implementer's gate waits for this
+                u["tester"] = {**tester, "wt": twt, "branch": f"unit/{tag}t"}
             units.append(u)
         return True
 
@@ -375,6 +425,8 @@ def main() -> int:
         except OSError:
             pass
         t = u.get("tester")
+        if t and t.get("failed"):
+            return "the tester failed (no spec tests)"
         if t and any(_digest(wt / f) != h for f, h in t.get("hash", {}).items()):
             return "spec tests changed by the implementer"
         if t and not any(t.get("hash", {}).values()):
@@ -484,7 +536,7 @@ def main() -> int:
         u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
         if u.get("tester"):
-            u["tester"]["p"] = subprocess.Popen(u["tester"]["cmd"], cwd=u["wt"], stdout=subprocess.PIPE,
+            u["tester"]["p"] = subprocess.Popen(u["tester"]["cmd"], cwd=u["tester"]["wt"], stdout=subprocess.PIPE,
                                                 stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, env=env,
                                                 start_new_session=True)
         running.append(u)
@@ -511,7 +563,13 @@ def main() -> int:
         except (ValueError, AttributeError):
             t["cost"] = 0.0
         t["finished"] = True
-        t["hash"] = {f: _digest(u["wt"] / f) for f in t["files"]}
+        t["failed"] = t["p"].returncode != 0  # killed or crashed: no trustworthy spec tests
+        t["hash"] = {}
+        for f in t["files"]:  # copy the tester's tests over whatever is at that path in the implementer's tree
+            src = _read_nofollow(t["wt"] / f)
+            if src is not None and Path(f).parts and ".." not in Path(f).parts and not Path(f).is_absolute():
+                write_nofollow_deep(u["wt"], f, src)
+            t["hash"][f] = _digest(u["wt"] / f)
         write_nofollow(u["wt"] / ".devaccel" / "tester-pending", None)
 
     try:
