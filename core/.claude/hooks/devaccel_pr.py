@@ -108,6 +108,8 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
                         return None
                     return _pytest_collected(base_check, Path(cdir), sandbox, int(cfg["gate"]["timeout_sec"]))
             pending = pool.submit(collect_own_copy)
+            if not sandbox:  # side by side only when both runs are confined: each then sees just its own tree
+                pending.result()  # (bwrap gives every run a private /tmp). Unconfined: finish collecting first
         pool.shutdown(wait=False)
         r = run(cmd, workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10, env=env)
     except subprocess.TimeoutExpired:
