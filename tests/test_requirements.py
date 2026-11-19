@@ -2163,3 +2163,38 @@ class R35WatchTest(R18BatchEndToEndTest):
         self.assertEqual(b.complete_items("h\n1. a\n2. b"), [])
         self.assertEqual(len(b.complete_items("h\n1. a\n<!-- more -->\n2. b")), 1)
         self.assertEqual(len(b.complete_items("h\n1. a\n2. b\n<!-- end -->")), 2)
+
+
+class R36DualTrackTest(R18BatchEndToEndTest):
+    """Dual track: a tester writes the spec tests while the implementer writes the code, in one worktree; the
+    implementer may not change the tester's tests."""
+    DUAL = (
+        '#!/usr/bin/env bash\n'
+        'while [ "$1" != "-p" ]; do shift; done; p="$2"\n'
+        'case "$p" in\n'
+        '  *あなたはテスト係*) mkdir -p tests; case "$p" in *CHEAT*) n=c;; *) n=a;; esac;'
+        ' printf "from %s_mod import X\\nIDS = [\\"E1-1\\"]\\ndef test_x():\\n    assert X == 1\\n" $n'
+        ' > tests/test_$n.py; sleep 1;;\n'
+        '  *CHEAT*) sleep 3; echo "X = 2" > c_mod.py; echo "def test_x(): pass" > tests/test_c.py;;\n'
+        '  *) sleep 3; echo "X = 1" > a_mod.py;;\n'
+        'esac\n'
+        'printf \'{"result": "done", "total_cost_usd": 0.001}\'\n')
+
+    def test_tester_and_implementer_share_a_worktree_and_tests_are_protected(self):
+        import shutil
+        if not shutil.which("bwrap"):
+            self.skipTest("bwrap not installed")
+        self.with_origin()
+        (self.bin / "claude").write_text(self.DUAL)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "tasks.md"
+        tasks.write_text("1. GOOD `a_mod.py` + `tests/test_a.py`\n| ID | in | out | R |\n| E1-1 | a | b | R1 |\n"
+                         "2. CHEAT `c_mod.py` + `tests/test_c.py`\n| ID | in | out | R |\n| E2-1 | a | b | R1 |\n")
+        os.environ["DEVACCEL_DUAL"] = "1"
+        r, _ = self.land(str(tasks), "--branch", "batch/d", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = sh(self.root, "git", "ls-tree", "-r", "--name-only", "batch/d").stdout.split()
+        self.assertIn("a_mod.py", files)
+        self.assertIn("tests/test_a.py", files)  # the tester's spec tests ship with the implementation
+        self.assertNotIn("c_mod.py", files)
+        self.assertIn("spec tests changed by the implementer", r.stdout)

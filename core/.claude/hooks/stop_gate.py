@@ -231,6 +231,16 @@ def relevant_paths(root: Path, gate: dict, cfg: dict, unit: bool) -> list[tuple[
     return relevant
 
 
+def _dual_role(root: Path, data: dict) -> str:
+    """'tester' when this session is the dual-track tester recorded by devaccel_batch (feedback routing only:
+    devaccel_batch checks every commit itself, so a unit that claims the role gains nothing)."""
+    try:
+        sid = (root / ".devaccel" / "tester-session").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return "tester" if sid and sid == str(data.get("session_id") or "") else ""
+
+
 def missing_examples(root: Path) -> list[str]:
     """IDs from <worktree>/.devaccel/expected-ids (written by devaccel_batch) not found in the tree's test files.
     Feedback only: devaccel_batch re-checks the committed tests against the spec itself."""
@@ -344,6 +354,14 @@ def main() -> int:
         # a linked worktree elsewhere (git-dir != common-dir) is a unit too; robust to symlinks and path case
         unit = (git(root, "rev-parse", "--path-format=absolute", "--git-dir").strip()
                 != git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    if unit and _dual_role(root, data) == "tester":
+        return 0  # dual track: the tester writes tests before the code exists; its tree is checked via the implementer
+    if unit and (root / ".devaccel" / "tester-pending").exists():
+        # the implementer stops first: wait for the spec tests (devaccel_batch removes the marker when the tester
+        # exits), then they run in the check below
+        end = time.time() + 90
+        while (root / ".devaccel" / "tester-pending").exists() and time.time() < end:
+            time.sleep(1)
     mode = gate.get("unit_mode", "enforce") if unit else gate["mode"]
     CTX.update({"scope": "unit" if unit else "session", "mode": mode})
     if not is_git_repo(root):

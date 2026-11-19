@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -176,11 +177,28 @@ def preflight(root: Path, base: str, branch: str) -> list[str]:
     return errs
 
 
+def _digest(p: Path) -> str:
+    """sha256 of a regular file (no link followed), '' if absent."""
+    import hashlib
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            return hashlib.sha256(fh.read(5_000_000)).hexdigest()
+    except OSError:
+        return ""
+
+
 def cleanup(root: Path, units: list[dict], keep: bool, branches: bool = False) -> None:
     """Stop what still runs; remove unit worktrees (even broken ones) and, after shipping, unit branches."""
     import shutil
     for u in units:
-        p = u.get("p")
+        for p in (u.get("p"), (u.get("tester") or {}).get("p")):
+            if p is not None and p.poll() is None:
+                try:
+                    os.killpg(p.pid, 9)
+                except OSError:
+                    pass
+        p = None
         if p is not None and p.poll() is None:
             try:
                 os.killpg(p.pid, 9)
@@ -279,6 +297,8 @@ def main() -> int:
     units = []
     t0 = time.time()
     copies = max(1, a.hedge)
+    # dual track (tester || implementer per item): project setting parallel.dual_track or DEVACCEL_DUAL=1
+    dual = bool(cfg["parallel"].get("dual_track")) or os.environ.get("DEVACCEL_DUAL") == "1"
     strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong)])
     def add_item(i: int, it: str) -> bool:
         """Worktree(s) and command for item i; False if a worktree could not be made."""
@@ -286,8 +306,28 @@ def main() -> int:
         if example_ids(it):
             ctx += ("\n\n例の表の全行を、ID をテストの中に書いて(parametrize の ids など)テストに写してから実装する。"
                     "端のケースは表に列挙済みなので考え直さない。ID が 1 つでもテストに無ければ統合されない。")
+        tester = None
+        if dual:  # dual track: a tester writes the spec tests while this unit implements, in the same worktree
+            tfiles = sorted(set(re.findall(r"`((?:[\w./-]*/)?tests?/[\w./-]+\.py|(?:[\w./-]*/)?test_[\w.-]+\.py)`", it)))
+            tester = {"sid": str(uuid.uuid4()), "files": tfiles}
+            tprompt = ((head + "\n\n" if head else "") + it + ctx + "\n\nあなたはテスト係。この件の仕様(規則・例・判断)から、"
+                       f"テストファイル {' '.join('`' + f + '`' for f in tfiles) or '(仕様が名指しするテストファイル)'} "
+                       "だけを書く。実装(src)は書かない・読まない(別の単位が同時に書いている)。関数・クラスは仕様の名前と型の"
+                       "とおりに import する。例の表の全行を ID 付きで、加えて各規則(R#)の端を 1 つ以上テストにする。期待値は"
+                       "仕様から決め、仕様に無い振る舞いはテストしない。テストは実行しない(実装がまだ無い)。最後に "
+                       "`uv run ruff check --fix <テストファイル>` を 1 回だけ回して終える。")
+            tester["cmd"] = ["claude", "-p", tprompt, "--model", model, "--effort", effort, "--session-id", tester["sid"],
+                             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                             "--tools", "Read", "Edit", "Write", "Bash", "Grep", "Glob", "--disable-slash-commands",
+                             "--max-turns", "20", "--output-format", "json", "--permission-mode", "acceptEdits"]
+            ctx += ("\n\nテストは別の単位(テスト係)がこの作業ツリーで同時に "
+                    f"{' '.join('`' + f + '`' for f in tester['files']) or '仕様のテストファイル'} に書いている。そのファイルは"
+                    "作らない・変えない(変えるとこの件は統合されない)。実装だけを書き、簡単に動かして確かめたら終える。終了時に"
+                    "ゲートがテスト係のテストを走らせ、落ちていれば差し戻す。落ちたテストが仕様と矛盾すると思うときは、テストは"
+                    "変えずに、どの規則(R#)と矛盾するかを最後の報告に書く。")
         prompt = (head + "\n\n" if head else "") + it + ctx + (
             "\n\nこの 1 件だけを実装し、追加したテストを `uv run pytest -q <テストファイル>` で確かめて終了する。"
+            if not dual else "\n\nこの 1 件だけを実装する。"
             + ("テストが通ったら `uv run ruff check --fix <作った・変えたファイル>` を 1 回回し、残った指摘を直してから終える"
                "(lint の差し戻しは 1 往復 10 秒以上かかる)。" if "python" in cfg.get("presets", []) else "")
             + "`scripts/check.sh` は自分で回さない(終了時にゲートが整形込みで必ず回し、落ちていれば差し戻す)。"
@@ -309,7 +349,12 @@ def main() -> int:
                 return False
             if example_ids(it):  # the unit's own gate checks these at Stop (feedback); settle re-checks (authority)
                 write_nofollow(wt / ".devaccel" / "expected-ids", "\n".join(example_ids(it)) + "\n")
-            units.append({"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd})
+            u = {"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd}
+            if tester:  # the gate lets the tester's session stop unchecked and makes the implementer wait for it
+                write_nofollow(wt / ".devaccel" / "tester-session", tester["sid"] + "\n")
+                write_nofollow(wt / ".devaccel" / "tester-pending", "1\n")
+                u["tester"] = dict(tester)
+            units.append(u)
         return True
 
     for i, it in enumerate(items, 1):
@@ -329,6 +374,11 @@ def main() -> int:
             os.killpg(u["p"].pid, 9)  # leftovers of the unit's session must not touch the tree being checked
         except OSError:
             pass
+        t = u.get("tester")
+        if t and any(_digest(wt / f) != h for f, h in t.get("hash", {}).items()):
+            return "spec tests changed by the implementer"
+        if t and not any(t.get("hash", {}).values()):
+            return "the tester wrote no spec tests"
         subprocess.run([*safe, "add", "-u"], capture_output=True)
         staged = subprocess.run([*safe, "diff", "--cached", "--name-only", "-z"], capture_output=True,
                                 text=True).stdout.split("\0")
@@ -416,6 +466,8 @@ def main() -> int:
                       else f"unit {n + 1} started", flush=True)
         return not done_writing
     limit, why = plan_jobs(len(units) if not watching else 64, a.jobs, cfg, mem_available_mb(), os.cpu_count() or 1)
+    if dual:  # every item runs two sessions
+        limit, why = max(1, limit // 2), why + " / 2 (tester + implementer per item)"
     print(f"running {len(units)} unit(s), {limit} at a time ({why})", flush=True)
     # a fresh session per unit: drop the parent session's markers (the anchor comes from the worktree path)
     env = {k: v for k, v in os.environ.items()
@@ -431,7 +483,36 @@ def main() -> int:
         u["t"] = time.time()
         u["p"] = subprocess.Popen(u["cmd"], cwd=u["wt"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   stdin=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
+        if u.get("tester"):
+            u["tester"]["p"] = subprocess.Popen(u["tester"]["cmd"], cwd=u["wt"], stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, env=env,
+                                                start_new_session=True)
         running.append(u)
+
+    def tester_done(u: dict, wait: float = 0) -> None:
+        """Once the tester has exited: release the implementer's gate and fingerprint the spec tests (the
+        implementer must not change them). An implementer that finishes first waits up to `wait` seconds."""
+        t = u.get("tester")
+        if not t or t.get("finished"):
+            return
+        end = time.time() + wait
+        while t["p"].poll() is None and time.time() < end:
+            time.sleep(0.5)
+        if t["p"].poll() is None:
+            if wait == 0:
+                return
+            try:
+                os.killpg(t["p"].pid, 9)
+            except OSError:
+                pass
+        out, _ = t["p"].communicate()
+        try:
+            t["cost"] = float((json.loads(out) or {}).get("total_cost_usd") or 0)
+        except (ValueError, AttributeError):
+            t["cost"] = 0.0
+        t["finished"] = True
+        t["hash"] = {f: _digest(u["wt"] / f) for f in t["files"]}
+        write_nofollow(u["wt"] / ".devaccel" / "tester-pending", None)
 
     try:
         while pending or running or settling or watching:
@@ -455,6 +536,7 @@ def main() -> int:
                             print(f"unit {u['i']} is straggling ({round(time.time() - u['t'])}s vs median "
                                   f"{med}s): started a backup copy", flush=True)
             for u in list(running):
+                tester_done(u)
                 if u["p"].poll() is None:
                     if time.time() - u["t"] > a.unit_timeout:
                         try:
@@ -463,6 +545,7 @@ def main() -> int:
                             pass
                         u["timed_out"] = True
                     continue
+                tester_done(u, wait=180)  # the spec tests must exist before the unit is settled
                 out, err = u["p"].communicate()
                 u["secs"] = round(time.time() - u["t"])
                 try:
@@ -510,7 +593,7 @@ def main() -> int:
     full = []
     for u in sorted(done, key=lambda x: (x["i"], x["k"])):
         j = u["json"]
-        cost += float(j.get("total_cost_usd") or 0)  # (stopped copies report no cost: an underestimate)
+        cost += float(j.get("total_cost_usd") or 0) + float((u.get("tester") or {}).get("cost") or 0)
         full.append(f"=== unit {u['i']}/{u['k']} ({u['branch']}, {u['secs']}s, {u['status']})\n"
                     f"{clean(str(j.get('result', '')))}\n" + (f"--- check\n{clean(u['check_tail'])}\n"
                                                              if u.get("check_tail") and u["status"] != "ok" else ""))
