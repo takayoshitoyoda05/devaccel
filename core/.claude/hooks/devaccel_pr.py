@@ -93,11 +93,22 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
                 return False, ["== failed: check.sh full (bwrap がないので隔離できない)"], "", 0.0
             cmd, env = wrapped
         env["DEVACCEL_ROOT"] = str(workdir)
-        # the collection cross-check runs BEFORE the check, on the pristine snapshot: after it, the tests that ran
-        # could have changed the tree to match a forged count. Not alongside: both would create the environment
-        # (.venv) at once, and the loser made "collected: None" = a false failure (5 of 12 PRs)
-        collected = (_pytest_collected(base_check, workdir, sandbox, int(cfg["gate"]["timeout_sec"]))
-                     if "pytest" in base_check else None)
+        # the collection cross-check gets its OWN pristine copy of HEAD, so neither run can reshape the tree the
+        # other judges (collecting runs branch code too); separate dirs also mean no clash creating .venv (a shared
+        # dir made "collected: None" = a false failure in 5 of 12 PRs), so the two run side by side again
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=1)
+        pending = None
+        if "pytest" in base_check:
+            def collect_own_copy() -> int | None:
+                with tempfile.TemporaryDirectory(prefix="devaccel-collect-") as cdir:
+                    # the same commit the check judges: a land worktree's own HEAD, else the branch HEAD
+                    src = workdir if (workdir / ".git").exists() else root
+                    if not export_head(src, Path(cdir)):
+                        return None
+                    return _pytest_collected(base_check, Path(cdir), sandbox, int(cfg["gate"]["timeout_sec"]))
+            pending = pool.submit(collect_own_copy)
+        pool.shutdown(wait=False)
         r = run(cmd, workdir, timeout=int(cfg["gate"]["timeout_sec"]) * 10, env=env)
     except subprocess.TimeoutExpired:
         return False, ["== failed: check.sh full (timeout)"], "timeout", round(time.time() - t0, 1)
@@ -110,6 +121,7 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path,
         # cross-check with a separate collection: a test that prints a fake summary and os._exit(0)s,
         # or one that stops pytest early, leaves "ran" != "collected"
         ran = _pytest_ran("\n".join(out))
+        collected = pending.result() if pending is not None else None
         if collected is None or (collected > 0 and ran != collected):
             ok = False
             stages.append(f"== failed: tests (ran {ran} of {collected} collected)")
