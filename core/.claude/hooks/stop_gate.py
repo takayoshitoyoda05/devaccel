@@ -238,16 +238,27 @@ def missing_examples(root: Path) -> list[str]:
                if re.fullmatch(r"E\d+-\d+", x.strip())]
     except OSError:
         return []
-    text = ""
-    for p in root.rglob("*.py"):
-        rel = p.relative_to(root).as_posix()
-        if rel.startswith((".", "node_modules/")) or "/." in rel:
-            continue
-        if re.search(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests?/", rel):
+    import stat
+    text, total = "", 0
+    test_name = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests?/[^/]*\.py$")
+    for d, dirs, files in os.walk(root, followlinks=False):  # the tree is agent-written: no links, no FIFOs
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x != "node_modules"]
+        for f in files:
+            full = os.path.join(d, f)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            if not f.endswith(".py") or not test_name.search(rel):
+                continue
             try:
-                text += p.read_text(encoding="utf-8", errors="replace")
+                st = os.lstat(full)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > 1_000_000 or total > 8_000_000:
+                    continue
+                fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as fh:
+                    data = fh.read(1_000_000)
             except OSError:
-                pass
+                continue
+            total += len(data)
+            text += data.decode("utf-8", errors="replace")
     return [x for x in ids if not re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", text)]
 
 

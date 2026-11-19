@@ -2099,6 +2099,9 @@ class R32GateExampleFeedbackTest(ReqKit):
         (wt / ".devaccel/expected-ids").write_text("E1-1\nE1-2\n")
         (wt / "tests").mkdir(exist_ok=True)
         (wt / "tests/test_x.py").write_text('IDS = ["E1-1"]\n')
+        os.mkfifo(wt / "tests/test_fifo.py")  # an agent-planted FIFO or link must not hang or steer the hook
+        (wt / "tests/test_link.py").symlink_to(self.tmp / "outside.py")
+        (self.tmp / "outside.py").write_text('IDS = ["E1-2"]\n')
 
         def stop() -> dict:
             r = run(wt, "python3", str(self.root / ".claude/hooks/stop_gate.py"),
