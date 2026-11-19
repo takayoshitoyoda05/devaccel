@@ -2198,3 +2198,13 @@ class R36DualTrackTest(R18BatchEndToEndTest):
         self.assertIn("tests/test_a.py", files)  # the tester's spec tests ship with the implementation
         self.assertNotIn("c_mod.py", files)
         self.assertIn("spec tests changed by the implementer", r.stdout)
+
+
+class R37FingerprintTest(unittest.TestCase):
+    def test_layout_changes_do_not_count_but_content_changes_do(self):
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_batch as b
+        a = b._fingerprint(b"def test_x():\n    assert f(1)==2\n", "t.py")
+        self.assertEqual(a, b._fingerprint(b"def test_x():\n    assert f(1) == 2  # c\n\n", "t.py"))
+        self.assertNotEqual(a, b._fingerprint(b"def test_x():\n    assert f(1) == 3\n", "t.py"))
+        self.assertNotEqual(a, b._fingerprint(b"def test_x():\n    pass\n", "t.py"))

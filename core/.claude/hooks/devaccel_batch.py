@@ -219,15 +219,23 @@ def write_nofollow_deep(base: Path, rel: str, data: bytes) -> bool:
         os.close(fd)
 
 
-def _digest(p: Path) -> str:
-    """sha256 of a regular file (no link followed), '' if absent."""
+def _fingerprint(data: bytes, name: str) -> str:
+    """What the tests say, not how they are laid out: for Python, the AST (the gate's auto-format rewrites the
+    layout and must not count as a change; any change to an assertion or a value still does)."""
+    import ast
     import hashlib
-    try:
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "rb") as fh:
-            return hashlib.sha256(fh.read(5_000_000)).hexdigest()
-    except OSError:
-        return ""
+    if name.endswith(".py"):
+        try:
+            return "ast:" + hashlib.sha256(ast.dump(ast.parse(data)).encode()).hexdigest()
+        except (SyntaxError, ValueError):
+            pass
+    return hashlib.sha256(data).hexdigest()
+
+
+def _digest(p: Path) -> str:
+    """Fingerprint of a regular file (no link followed), '' if absent."""
+    data = _read_nofollow(p)
+    return "" if data is None else _fingerprint(data, p.name)
 
 
 def cleanup(root: Path, units: list[dict], keep: bool, branches: bool = False) -> None:
@@ -568,7 +576,6 @@ def main() -> int:
         t["finished"] = True
         t["failed"] = t["p"].returncode != 0  # killed or crashed: no trustworthy spec tests
         t["hash"] = {}
-        import hashlib
         for f in t["files"]:  # copy the tester's tests over whatever is at that path in the implementer's tree
             src = _read_nofollow(t["wt"] / f)
             ok = (src is not None and bool(Path(f).parts) and ".." not in Path(f).parts and not Path(f).is_absolute()
@@ -577,7 +584,7 @@ def main() -> int:
                 t["failed"] = True
                 t["hash"][f] = ""
                 continue
-            t["hash"][f] = hashlib.sha256(src).hexdigest()  # what was copied, not a re-read of the tree
+            t["hash"][f] = _fingerprint(src, f)  # what was copied, not a re-read of the tree
         write_nofollow(u["wt"] / ".devaccel" / "tester-pending", None)
 
     try:
