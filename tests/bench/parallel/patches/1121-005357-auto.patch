@@ -1,0 +1,177 @@
+diff --git a/src/kakeibo/budget_alerts.py b/src/kakeibo/budget_alerts.py
+new file mode 100644
+index 0000000..27ea6b9
+--- /dev/null
++++ b/src/kakeibo/budget_alerts.py
+@@ -0,0 +1,77 @@
++"""Budget alerts: flag categories that exceeded or are about to exceed a monthly budget.
++
++Pure functions only. Reuses ``Budget`` (per-month limits via ``for_month``) and the
++``monthly_totals`` shape ``{"YYYY-MM": {category: yen}}`` from ``kakeibo.core``.
++
++Decisions:
++D1: actual > limit は "over"(超過)。actual == limit ちょうどは超過ではなく "near"(core.find_overruns と同じ境界)。
++D2: "near" は limit * warn_percent / 100 <= actual <= limit。整数のまま比較し float は使わない。
++D3: 上限が 0 のカテゴリは、支出が 1 円でもあれば "over"。支出 0 は警告しない(near にもしない)。
++D4: 上限の無いカテゴリは警告しない。上限はあるが月の集計に出てこないカテゴリ・月も警告しない。
++D5: 負の合計(返金が多い月)は警告しない。
++D6: warn_percent は 1〜100 の int。bool / float / str / None は TypeError、範囲外は ValueError(引数名つき)。
++    100 は「ちょうど上限に達したときだけ near」。
++D7: 並びは 月(昇順)→ over が先 → カテゴリ名(昇順)。
++D8: 空の totals は空リスト。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Literal
++
++from kakeibo.core import Budget
++
++DEFAULT_WARN_PERCENT = 80
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    month: str
++    category: str
++    status: Literal["over", "near"]
++    limit: int
++    actual: int
++
++    @property
++    def over_by(self) -> int:
++        """Yen over the limit (0 when not over)."""
++        return max(self.actual - self.limit, 0)
++
++    @property
++    def remaining(self) -> int:
++        """Yen left before the limit (0 when at or over it)."""
++        return max(self.limit - self.actual, 0)
++
++
++def _check_percent(warn_percent: object) -> int:
++    if isinstance(warn_percent, bool) or not isinstance(warn_percent, int):
++        raise TypeError(f"warn_percent は int である必要があります: {warn_percent!r}")
++    if not 1 <= warn_percent <= 100:
++        raise ValueError(f"warn_percent は 1〜100 である必要があります: {warn_percent}")
++    return warn_percent
++
++
++def check_budget(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> list[BudgetAlert]:
++    """Return over / near alerts for every (month, category) in ``totals``."""
++    pct = _check_percent(warn_percent)
++    alerts: list[BudgetAlert] = []
++    for month in sorted(totals):
++        limits = budget.for_month(month)
++        for cat, actual in totals[month].items():
++            if cat not in limits or actual <= 0:
++                continue
++            limit = limits[cat]
++            if actual > limit:
++                status: Literal["over", "near"] = "over"
++            elif actual * 100 >= limit * pct:
++                status = "near"
++            else:
++                continue
++            alerts.append(BudgetAlert(month, cat, status, limit, actual))
++    alerts.sort(key=lambda a: (a.month, a.status != "over", a.category))
++    return alerts
+diff --git a/tests/test_budget_alerts.py b/tests/test_budget_alerts.py
+new file mode 100644
+index 0000000..8e1804b
+--- /dev/null
++++ b/tests/test_budget_alerts.py
+@@ -0,0 +1,88 @@
++import pytest
++
++from kakeibo.budget_alerts import BudgetAlert, check_budget
++from kakeibo.core import Budget
++
++B = Budget(default={"食費": 10000, "交通": 5000}, months={"2026-02": {"食費": 20000}})
++
++
++def test_over_near_and_ok():
++    totals = {"2026-01": {"食費": 10500, "交通": 4000, "趣味": 99999}}
++    got = check_budget(totals, B)
++    assert got == [
++        BudgetAlert("2026-01", "食費", "over", 10000, 10500),
++        BudgetAlert("2026-01", "交通", "near", 5000, 4000),
++    ]
++    assert got[0].over_by == 500 and got[0].remaining == 0
++    assert got[1].over_by == 0 and got[1].remaining == 1000
++
++
++def test_exactly_at_limit_is_near_not_over():  # D1
++    (a,) = check_budget({"2026-01": {"食費": 10000}}, B)
++    assert a.status == "near"
++
++
++def test_threshold_boundary():  # D2
++    assert check_budget({"2026-01": {"食費": 7999}}, B) == []
++    assert check_budget({"2026-01": {"食費": 8000}}, B)[0].status == "near"
++    assert (
++        check_budget({"2026-01": {"食費": 5000}}, B, warn_percent=50)[0].status
++        == "near"
++    )
++
++
++def test_zero_limit():  # D3
++    z = Budget(default={"食費": 0}, months={})
++    assert check_budget({"2026-01": {"食費": 1}}, z)[0].status == "over"
++    assert check_budget({"2026-01": {"食費": 0}}, z) == []
++
++
++def test_missing_limit_or_spending():  # D4
++    assert check_budget({"2026-01": {"趣味": 1_000_000}}, B) == []
++    assert (
++        check_budget({"2026-01": {"交通": 4500}, "2026-03": {}}, B)[0].category
++        == "交通"
++    )
++
++
++def test_month_override():
++    totals = {"2026-02": {"食費": 15000}}
++    assert check_budget(totals, B) == []  # 20000 の 75%
++    assert check_budget(totals, B, warn_percent=75)[0].limit == 20000
++
++
++def test_negative_total_ignored():  # D5
++    assert check_budget({"2026-01": {"食費": -500}}, B) == []
++
++
++def test_warn_percent_100():  # D6
++    assert check_budget({"2026-01": {"食費": 9999}}, B, warn_percent=100) == []
++    assert (
++        check_budget({"2026-01": {"食費": 10000}}, B, warn_percent=100)[0].status
++        == "near"
++    )
++
++
++@pytest.mark.parametrize("bad", [True, 80.0, "80", None, float("nan")])
++def test_warn_percent_type(bad):
++    with pytest.raises(TypeError, match="warn_percent"):
++        check_budget({}, B, warn_percent=bad)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize("bad", [0, -1, 101])
++def test_warn_percent_range(bad):
++    with pytest.raises(ValueError, match="warn_percent"):
++        check_budget({}, B, warn_percent=bad)
++
++
++def test_ordering():  # D7
++    totals = {
++        "2026-02": {"食費": 1},
++        "2026-01": {"交通": 5001, "食費": 8000},
++    }
++    got = [(a.month, a.category, a.status) for a in check_budget(totals, B)]
++    assert got == [("2026-01", "交通", "over"), ("2026-01", "食費", "near")]
++
++
++def test_empty():  # D8
++    assert check_budget({}, B) == []

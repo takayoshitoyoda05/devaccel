@@ -6,9 +6,12 @@ guarded call. The evidence is still computed by devaccel_pr (base branch's check
 triage); nothing here is self-reported.
 
 usage: python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md [--branch NAME] [--paths P ...]
-                                              [--units B ...] [--dry-run]
+                                              [--units B ...] [--dry-run] [--check]
   ship.md: line 1 = PR title / commit subject; the rest = what was run and observed (verify notes).
   --paths: new (untracked) files to add; tracked changes are always added (never `git add -A`).
+  --check: run `scripts/check.sh fast` (may auto-format) on the working tree first, exactly like the Stop gate;
+           on failure nothing is committed or pushed and only the failed stage's tail is printed. Saves the
+           agent its own check turn; the PR evidence (check.sh full on a pristine export) is unchanged.
   --units: local branches of parallel units to merge (--no-ff) onto the current work branch first;
            a unit that conflicts is skipped and reported. One PR for all of them.
 Push policy (re-implemented here because the push no longer passes the guard as a shell command):
@@ -28,7 +31,7 @@ sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (planted modules are refused by guard _pr_script_intact)
 from devaccel_common import git, load_config, trusted_root  # noqa: E402
 from devaccel_common import write_nofollow  # noqa: E402
-from devaccel_pr import SECRET, open_pr, read_notes, stamp  # noqa: E402
+from devaccel_pr import SECRET, need_confinement, open_pr, read_notes, stamp  # noqa: E402
 
 IDENT = ["-c", "user.name=devaccel-ship", "-c", "user.email=devaccel-ship@localhost"]
 
@@ -73,6 +76,8 @@ def main() -> int:
     ap.add_argument("--units", nargs="*", default=[])
     ap.add_argument("--branch", default="", help="create this work branch from origin/<base> if on a protected branch")
     ap.add_argument("--dry-run", action="store_true", help="change nothing; show the plan and the evidence for HEAD")
+    ap.add_argument("--check", action="store_true",
+                    help="run check.sh fast on the working tree first; stop (no commit/push) if it fails")
     ap.add_argument("--no-push", action="store_true",
                     help="create the branch, integrate and commit locally, show the evidence; no push, no PR")
     a = ap.parse_args()
@@ -119,6 +124,17 @@ def main() -> int:
     t = time.time()
     merged, skipped = integrate(root, a.units, head) if a.units else ([], [])
     t = stamp("integrate units", t)
+    if a.check:  # after integration: the parts and the parent's own changes are checked together
+        from stop_gate import failed_section, run_check
+        res, _rc, out, secs = run_check(root, int(cfg["gate"].get("timeout_sec", 60)), trusted_root({"cwd": str(root)}),
+                                        sandbox=need_confinement(cfg))
+        t = stamp("check.sh fast", t)
+        if res != "pass":
+            stage, tail = failed_section(out) if res == "fail" else (res, out[-1500:])
+            print(f"check.sh fast: {res} ({stage}, {secs:.0f}s) — your changes are not committed and nothing was pushed"
+                  f"{' (the units are merged)' if merged else ''}; fix and re-run\n{tail}",
+                  file=sys.stderr)
+            return 1
     if a.paths and sh(root, "add", "--", *a.paths).returncode != 0:
         print("git add failed for --paths", file=sys.stderr)
         return 2
@@ -159,6 +175,9 @@ def main() -> int:
         nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
         if root.resolve() in nf.resolve().parents:
             write_nofollow(nf, None)
+        for b in dict.fromkeys(x for x in a.units if x.startswith("unit/")):  # shipped parts: no longer needed
+            if sh(root, "merge-base", "--is-ancestor", f"refs/heads/{b}", "HEAD").returncode == 0:
+                sh(root, "branch", "-q", "-D", b)
     return rc
 
 

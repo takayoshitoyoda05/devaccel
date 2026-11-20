@@ -1,0 +1,250 @@
+diff --git a/src/kakeibo/recurring.py b/src/kakeibo/recurring.py
+new file mode 100644
+index 0000000..ecef759
+--- /dev/null
++++ b/src/kakeibo/recurring.py
+@@ -0,0 +1,108 @@
++"""Detect monthly recurring expenses and predict their next occurrence.
++
++Pure functions only: no I/O, no dependence on the current date.
++"""
++
++from __future__ import annotations
++
++import calendar
++from dataclasses import dataclass
++from datetime import date
++from statistics import median
++
++from kakeibo.core import Expense
++
++
++@dataclass(frozen=True)
++class Recurring:
++    category: str
++    memo: str
++    amount: int  # typical (median) yen per occurrence
++    day: int  # typical day of month
++    count: int  # occurrences in the detected run
++    last_date: date
++    next_date: date
++
++
++def _month_index(d: date) -> int:
++    return d.year * 12 + d.month - 1
++
++
++def _add_months(year: int, month: int, n: int) -> tuple[int, int]:
++    idx = year * 12 + month - 1 + n
++    return idx // 12, idx % 12 + 1
++
++
++def _clamped(year: int, month: int, day: int) -> date:
++    return date(year, month, min(day, calendar.monthrange(year, month)[1]))
++
++
++def _trailing_monthly_run(items: list[Expense]) -> list[Expense]:
++    """Longest tail of items (sorted by date) falling in consecutive months, one per month."""
++    run = [items[-1]]
++    for e in reversed(items[:-1]):
++        if _month_index(run[0].day) - _month_index(e.day) != 1:
++            break
++        run.insert(0, e)
++    return run
++
++
++def find_recurring(
++    rows: list[Expense],
++    *,
++    min_occurrences: int = 3,
++    amount_tolerance: float = 0.1,
++    day_tolerance: int = 3,
++) -> list[Recurring]:
++    """Find monthly recurring expenses.
++
++    Expenses are grouped by (category, memo). A group counts as recurring when its
++    most recent run of consecutive months (exactly one expense per month) has at least
++    ``min_occurrences`` entries, every amount is within ``amount_tolerance`` (ratio)
++    of the median, and every day of month is within ``day_tolerance`` days of the
++    median day. Months with two entries in a group break the run.
++
++    next_date is the month after the last occurrence on the median day, clamped to
++    the end of that month. Results are sorted by next_date, then category, memo.
++    """
++    groups: dict[tuple[str, str], list[Expense]] = {}
++    for e in sorted(rows, key=lambda e: e.day):
++        groups.setdefault((e.category, e.memo.strip()), []).append(e)
++
++    out: list[Recurring] = []
++    for (category, memo), items in groups.items():
++        # Drop months that have more than one entry: not a once-a-month charge.
++        per_month: dict[int, list[Expense]] = {}
++        for e in items:
++            per_month.setdefault(_month_index(e.day), []).append(e)
++        singles = [v[0] for _, v in sorted(per_month.items()) if len(v) == 1]
++        # Dropped multi-entry months leave a gap, which breaks the run below.
++        if not singles or len(per_month[_month_index(items[-1].day)]) != 1:
++            continue
++        run = _trailing_monthly_run(singles)
++        if len(run) < min_occurrences:
++            continue
++        amount = median(e.amount for e in run)
++        day = round(median(e.day.day for e in run))
++        if any(abs(e.amount - amount) > abs(amount) * amount_tolerance for e in run):
++            continue
++        # Month-end clamping (day 31 -> 28/30) is not drift.
++        if any(
++            abs(e.day.day - _clamped(e.day.year, e.day.month, day).day) > day_tolerance
++            for e in run
++        ):
++            continue
++        last = run[-1].day
++        y, m = _add_months(last.year, last.month, 1)
++        out.append(
++            Recurring(
++                category=category,
++                memo=memo,
++                amount=round(amount),
++                day=day,
++                count=len(run),
++                last_date=last,
++                next_date=_clamped(y, m, day),
++            )
++        )
++    return sorted(out, key=lambda r: (r.next_date, r.category, r.memo))
+diff --git a/tests/test_recurring.py b/tests/test_recurring.py
+new file mode 100644
+index 0000000..5710667
+--- /dev/null
++++ b/tests/test_recurring.py
+@@ -0,0 +1,130 @@
++from datetime import date
++
++from kakeibo.core import Expense
++from kakeibo.recurring import find_recurring
++
++
++def E(d: str, cat: str, amt: int, memo: str = "") -> Expense:
++    return Expense(date.fromisoformat(d), cat, amt, memo)
++
++
++def test_basic_monthly_detection_and_next_date():
++    rows = [
++        E("2026-08-25", "住居", 80000, "家賃"),
++        E("2026-09-25", "住居", 80000, "家賃"),
++        E("2026-10-25", "住居", 80000, "家賃"),
++    ]
++    [r] = find_recurring(rows)
++    assert (r.category, r.memo, r.amount, r.day, r.count) == (
++        "住居",
++        "家賃",
++        80000,
++        25,
++        3,
++    )
++    assert r.last_date == date(2026, 10, 25)
++    assert r.next_date == date(2026, 11, 25)
++
++
++def test_year_rollover():
++    rows = [E(f"2026-{m:02d}-10", "娯楽", 1490, "Netflix") for m in (10, 11, 12)]
++    [r] = find_recurring(rows)
++    assert r.next_date == date(2027, 1, 10)
++
++
++def test_month_end_clamped():
++    rows = [
++        E("2026-11-30", "通信", 5000, "回線"),
++        E("2026-12-31", "通信", 5000, "回線"),
++        E("2027-01-31", "通信", 5000, "回線"),
++    ]
++    [r] = find_recurring(rows)
++    assert r.day == 31
++    assert r.next_date == date(2027, 2, 28)
++
++
++def test_too_few_occurrences():
++    rows = [E("2026-09-01", "a", 100, "x"), E("2026-10-01", "a", 100, "x")]
++    assert find_recurring(rows) == []
++    assert len(find_recurring(rows, min_occurrences=2)) == 1
++
++
++def test_gap_month_breaks_run():
++    rows = [
++        E("2026-05-05", "a", 100, "x"),
++        E("2026-06-05", "a", 100, "x"),
++        E("2026-08-05", "a", 100, "x"),
++        E("2026-09-05", "a", 100, "x"),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_old_irregular_history_ignored_if_recent_run_ok():
++    rows = [E("2026-01-03", "a", 100, "x")] + [
++        E(f"2026-{m:02d}-05", "a", 100, "x") for m in (7, 8, 9)
++    ]
++    [r] = find_recurring(rows)
++    assert r.count == 3
++
++
++def test_amount_varies_too_much():
++    rows = [
++        E("2026-08-01", "光熱", 3000, "電気"),
++        E("2026-09-01", "光熱", 6000, "電気"),
++        E("2026-10-01", "光熱", 3000, "電気"),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_amount_within_tolerance_uses_median():
++    rows = [
++        E("2026-08-01", "a", 1000, "x"),
++        E("2026-09-01", "a", 1050, "x"),
++        E("2026-10-01", "a", 1000, "x"),
++    ]
++    [r] = find_recurring(rows)
++    assert r.amount == 1000
++
++
++def test_day_drift_too_large():
++    rows = [
++        E("2026-08-01", "a", 100, "x"),
++        E("2026-09-15", "a", 100, "x"),
++        E("2026-10-01", "a", 100, "x"),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_small_day_drift_allowed():
++    rows = [
++        E("2026-08-26", "a", 100, "x"),
++        E("2026-09-27", "a", 100, "x"),
++        E("2026-10-25", "a", 100, "x"),
++    ]
++    [r] = find_recurring(rows)
++    assert r.day == 26
++
++
++def test_multiple_in_same_month_not_recurring():
++    rows = [
++        E("2026-08-05", "食費", 500, "コンビニ"),
++        E("2026-08-20", "食費", 500, "コンビニ"),
++        E("2026-09-05", "食費", 500, "コンビニ"),
++        E("2026-10-05", "食費", 500, "コンビニ"),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_different_memos_separate_and_sorted_by_next_date():
++    rows = []
++    for m in (8, 9, 10):
++        rows.append(E(f"2026-{m:02d}-28", "住居", 80000, "家賃"))
++        rows.append(E(f"2026-{m:02d}-03", "娯楽", 980, "Spotify"))
++    result = find_recurring(rows)
++    assert [r.memo for r in result] == ["Spotify", "家賃"]
++
++
++def test_unsorted_input_and_empty():
++    rows = [E(f"2026-{m:02d}-01", "a", 10, "x") for m in (10, 8, 9)]
++    assert find_recurring(rows)[0].next_date == date(2026, 11, 1)
++    assert find_recurring([]) == []

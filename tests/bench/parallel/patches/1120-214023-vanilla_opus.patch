@@ -1,0 +1,281 @@
+diff --git a/src/kakeibo/budget_status.py b/src/kakeibo/budget_status.py
+new file mode 100644
+index 0000000..302f653
+--- /dev/null
++++ b/src/kakeibo/budget_status.py
+@@ -0,0 +1,122 @@
++"""Per-category monthly budget status: OK / WARNING (near the limit) / OVER.
++
++Pure functions only (no I/O). Budgets are loaded by ``kakeibo.core.load_budget``.
++
++Rules (consistent with ``core.find_overruns``):
++- OVER:    actual > limit (spending exactly the limit is *not* over)
++- WARNING: actual >= limit * warn_percent / 100 and not OVER, and actual > 0
++- OK:      otherwise
++Comparisons use integer arithmetic, so there is no float rounding at the boundary.
++Categories with spending but no budget are ignored; budgeted categories with no
++spending are reported as OK with actual 0.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable, Mapping
++from dataclasses import dataclass
++from enum import IntEnum
++
++from kakeibo.core import Budget, Expense
++
++DEFAULT_WARN_PERCENT = 80
++
++
++class Level(IntEnum):
++    """Severity; larger is worse, so levels can be compared and sorted."""
++
++    OK = 0
++    WARNING = 1
++    OVER = 2
++
++
++@dataclass(frozen=True)
++class BudgetStatus:
++    category: str
++    limit: int  # yen
++    actual: int  # yen
++    level: Level
++
++    @property
++    def remaining(self) -> int:
++        """limit - actual (negative when over budget)."""
++        return self.limit - self.actual
++
++    @property
++    def percent(self) -> int | None:
++        """Usage as an integer percentage (floored); None when limit is 0."""
++        if self.limit == 0:
++            return None
++        return self.actual * 100 // self.limit
++
++
++def _check_warn_percent(warn_percent: int) -> None:
++    if isinstance(warn_percent, bool) or not isinstance(warn_percent, int):
++        raise TypeError("warn_percent は整数である必要があります")
++    if not 0 <= warn_percent <= 100:
++        raise ValueError("warn_percent は 0〜100 である必要があります")
++
++
++def classify(
++    actual: int, limit: int, warn_percent: int = DEFAULT_WARN_PERCENT
++) -> Level:
++    """Classify one category's spending against its limit."""
++    _check_warn_percent(warn_percent)
++    if limit < 0:
++        raise ValueError("limit は 0 以上である必要があります")
++    if actual > limit:
++        return Level.OVER
++    if actual > 0 and actual * 100 >= limit * warn_percent:
++        return Level.WARNING
++    return Level.OK
++
++
++def check_budget(
++    spent: Mapping[str, int],
++    limits: Mapping[str, int],
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> list[BudgetStatus]:
++    """Status of every budgeted category for one month.
++
++    spent:  {category: yen} actual spending for the month
++    limits: {category: yen} budget for the month (e.g. ``Budget.for_month(m)``)
++
++    Sorted by severity (OVER, WARNING, OK), then usage ratio desc, then name.
++    """
++    _check_warn_percent(warn_percent)
++    out: list[BudgetStatus] = []
++    for cat, limit in limits.items():
++        actual = spent.get(cat, 0)
++        out.append(
++            BudgetStatus(cat, limit, actual, classify(actual, limit, warn_percent))
++        )
++
++    # Float ratio is only used for ordering, never for classification.
++    # limit 0 with spending sorts as an infinite ratio (most urgent within OVER).
++    def key(s: BudgetStatus) -> tuple[int, float, str]:
++        if s.limit == 0:
++            ratio = float("inf") if s.actual else 0.0
++        else:
++            ratio = s.actual / s.limit
++        return (-s.level, -ratio, s.category)
++
++    return sorted(out, key=key)
++
++
++def alerts(statuses: Iterable[BudgetStatus]) -> list[BudgetStatus]:
++    """Only the statuses that need attention (WARNING or OVER), order preserved."""
++    return [s for s in statuses if s.level is not Level.OK]
++
++
++def check_month(
++    rows: Iterable[Expense],
++    budget: Budget,
++    month: str,
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> list[BudgetStatus]:
++    """``check_budget`` for ``month`` ("YYYY-MM") computed from raw expense rows."""
++    spent: dict[str, int] = {}
++    for e in rows:
++        if e.day.strftime("%Y-%m") == month:
++            spent[e.category] = spent.get(e.category, 0) + e.amount
++    return check_budget(spent, budget.for_month(month), warn_percent)
+diff --git a/tests/test_budget_status.py b/tests/test_budget_status.py
+new file mode 100644
+index 0000000..4445e58
+--- /dev/null
++++ b/tests/test_budget_status.py
+@@ -0,0 +1,147 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.budget_status import (
++    BudgetStatus,
++    Level,
++    alerts,
++    check_budget,
++    check_month,
++    classify,
++)
++from kakeibo.core import Budget, Expense
++
++
++@pytest.mark.parametrize(
++    ("actual", "limit", "expected"),
++    [
++        (0, 1000, Level.OK),
++        (799, 1000, Level.OK),
++        (800, 1000, Level.WARNING),  # 境界: ちょうど 80%
++        (1000, 1000, Level.WARNING),  # ちょうど予算は超過ではない
++        (1001, 1000, Level.OVER),
++        (0, 0, Level.OK),  # 予算 0 で未使用は OK
++        (1, 0, Level.OVER),
++    ],
++)
++def test_classify_default(actual, limit, expected):
++    assert classify(actual, limit) == expected
++
++
++def test_classify_integer_boundary_no_float_error():
++    # float だと 0.29 * 100 == 28.999999999999996 になるが、整数比較なので境界が正確
++    assert classify(29, 100, 29) == Level.WARNING
++    assert classify(28, 100, 29) == Level.OK
++    # 端数: 3 * 80% = 2.4 → 2 は OK、3 は WARNING
++    assert classify(2, 3, 80) == Level.OK
++    assert classify(3, 3, 80) == Level.WARNING
++
++
++def test_classify_warn_percent_extremes():
++    assert classify(1, 1000, 0) == Level.WARNING  # 0%: 少しでも使えば警告
++    assert classify(0, 1000, 0) == Level.OK
++    assert classify(999, 1000, 100) == Level.OK  # 100%: ちょうど予算到達で警告
++    assert classify(1000, 1000, 100) == Level.WARNING
++
++
++@pytest.mark.parametrize("bad", [-1, 101])
++def test_classify_rejects_bad_percent(bad):
++    with pytest.raises(ValueError):
++        classify(0, 100, bad)
++
++
++@pytest.mark.parametrize("bad", [True, 0.8, "80"])
++def test_classify_rejects_non_int_percent(bad):
++    with pytest.raises(TypeError):
++        classify(0, 100, bad)
++
++
++def test_classify_rejects_negative_limit():
++    with pytest.raises(ValueError):
++        classify(0, -1)
++
++
++def test_check_budget_levels_and_order():
++    spent = {"food": 1200, "rent": 80000, "fun": 4500, "misc": 999}
++    limits = {"food": 1000, "rent": 90000, "fun": 5000, "book": 3000}
++    got = check_budget(spent, limits)
++    assert got == [
++        BudgetStatus("food", 1000, 1200, Level.OVER),
++        BudgetStatus("fun", 5000, 4500, Level.WARNING),  # 90%
++        BudgetStatus("rent", 90000, 80000, Level.WARNING),  # 88%
++        BudgetStatus("book", 3000, 0, Level.OK),  # 予算あり・支出なし
++    ]
++    # 予算のないカテゴリ(misc)は対象外
++    assert "misc" not in {s.category for s in got}
++
++
++def test_check_budget_ties_sorted_by_name():
++    got = check_budget({"b": 900, "a": 900}, {"b": 1000, "a": 1000})
++    assert [s.category for s in got] == ["a", "b"]
++
++
++def test_check_budget_zero_limit_first_among_over():
++    got = check_budget({"x": 1, "y": 5000}, {"x": 0, "y": 1000})
++    assert [(s.category, s.level) for s in got] == [
++        ("x", Level.OVER),
++        ("y", Level.OVER),
++    ]
++
++
++def test_check_budget_empty_and_bad_percent():
++    assert check_budget({"food": 1}, {}) == []
++    with pytest.raises(ValueError):
++        check_budget({}, {}, 200)  # 予算が空でも引数は検証する
++
++
++def test_status_properties():
++    s = BudgetStatus("food", 1000, 1250, Level.OVER)
++    assert s.remaining == -250
++    assert s.percent == 125
++    assert BudgetStatus("food", 3, 2, Level.OK).percent == 66  # 切り捨て
++    assert BudgetStatus("x", 0, 5, Level.OVER).percent is None
++
++
++def test_alerts_filters_ok_and_keeps_order():
++    statuses = check_budget(
++        {"food": 1200, "fun": 4500, "rent": 100},
++        {"food": 1000, "fun": 5000, "rent": 90000},
++    )
++    assert [(s.category, s.level) for s in alerts(statuses)] == [
++        ("food", Level.OVER),
++        ("fun", Level.WARNING),
++    ]
++    assert alerts([]) == []
++
++
++def test_check_month_uses_month_and_overrides():
++    rows = [
++        Expense(date(2026, 10, 31), "food", 5000),  # 別の月は無視
++        Expense(date(2026, 11, 1), "food", 1200),
++        Expense(date(2026, 11, 3), "food", 800),
++        Expense(date(2026, 11, 2), "rent", 80000),
++    ]
++    budget = Budget(
++        default={"food": 3000, "rent": 90000},
++        months={"2026-11": {"food": 2000}},
++    )
++    assert check_month(rows, budget, "2026-11") == [
++        BudgetStatus("food", 2000, 2000, Level.WARNING),  # 上書き予算でちょうど
++        BudgetStatus("rent", 90000, 80000, Level.WARNING),
++    ]
++    assert check_month(rows, budget, "2026-10") == [
++        BudgetStatus("food", 3000, 5000, Level.OVER),
++        BudgetStatus("rent", 90000, 0, Level.OK),
++    ]
++    assert check_month(rows, budget, "2026-11", warn_percent=95) == [
++        BudgetStatus("food", 2000, 2000, Level.WARNING),
++        BudgetStatus("rent", 90000, 80000, Level.OK),
++    ]
++
++
++def test_check_month_accepts_iterator():
++    rows = iter([Expense(date(2026, 11, 1), "food", 1500)])
++    assert alerts(check_month(rows, Budget({"food": 1000}, {}), "2026-11")) == [
++        BudgetStatus("food", 1000, 1500, Level.OVER)
++    ]

@@ -1,0 +1,193 @@
+diff --git a/src/kakeibo/budget_alert.py b/src/kakeibo/budget_alert.py
+new file mode 100644
+index 0000000..8b43a9f
+--- /dev/null
++++ b/src/kakeibo/budget_alert.py
+@@ -0,0 +1,84 @@
++"""Per-category monthly budget alerts (pure functions).
++
++Decisions:
++D1: 超過は spent > limit。ちょうど limit は超過ではなく警告(limit > 0 のとき)。
++D2: 警告は spent * 100 >= limit * warn_percent かつ spent <= limit。整数のみで比較する(浮動小数を使わない)。
++D3: limit 0 は「使ってはいけない」。spent > 0 で超過、spent == 0 は OK(警告にしない)。
++D4: 返金(負の金額)は同じ月・カテゴリの合計に純額で足す。純額が負なら OK。
++D5: 予算の無いカテゴリは報告しない。予算だけあって支出の無いカテゴリは spent 0 の OK。
++D6: 月は支出の日付の年月で決める(月初・月末の日を含む)。他の月の支出は無視する。
++D7: 負の limit、warn_percent が 0 以下または 100 超、月の形式不正は ValueError。
++D8: 並び: 超過 → 警告 → OK。超過は超過額の降順、警告は残額の昇順、同点はカテゴリ名の昇順。
++D9: used_percent は spent * 100 // limit(切り捨て)。limit 0 のときは None。
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Literal
++
++from .core import Expense
++
++Status = Literal["over", "warn", "ok"]
++
++_MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
++_ORDER: dict[str, int] = {"over": 0, "warn": 1, "ok": 2}
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    category: str
++    status: Status
++    spent: int
++    limit: int
++    remaining: int  # limit - spent (negative when over)
++    used_percent: int | None  # None when limit == 0
++
++
++def classify(spent: int, limit: int, warn_percent: int = 80) -> Status:
++    if limit < 0:
++        raise ValueError(f"予算が負です: {limit}")
++    if not 0 < warn_percent <= 100:
++        raise ValueError(f"warn_percent は 1〜100 である必要があります: {warn_percent}")
++    if spent > limit:
++        return "over"
++    if limit > 0 and spent * 100 >= limit * warn_percent:
++        return "warn"
++    return "ok"
++
++
++def spent_in_month(rows: list[Expense], month: str) -> dict[str, int]:
++    if not _MONTH_RE.fullmatch(month):
++        raise ValueError(f"月の形式が不正です(YYYY-MM): {month!r}")
++    out: dict[str, int] = {}
++    for e in rows:
++        if e.day.strftime("%Y-%m") == month:
++            out[e.category] = out.get(e.category, 0) + e.amount
++    return out
++
++
++def check_budget(
++    rows: list[Expense],
++    limits: dict[str, int],
++    month: str,
++    warn_percent: int = 80,
++) -> list[BudgetAlert]:
++    spent = spent_in_month(rows, month)
++    alerts: list[BudgetAlert] = []
++    for cat, limit in limits.items():
++        s = spent.get(cat, 0)
++        status = classify(s, limit, warn_percent)
++        pct = s * 100 // limit if limit > 0 else None
++        alerts.append(BudgetAlert(cat, status, s, limit, limit - s, pct))
++
++    def key(a: BudgetAlert) -> tuple[int, int, str]:
++        if a.status == "over":
++            return (
++                _ORDER["over"],
++                a.remaining,
++                a.category,
++            )  # remaining < 0: most over first
++        return (_ORDER[a.status], a.remaining, a.category)
++
++    return sorted(alerts, key=key)
+diff --git a/tests/test_budget_alert.py b/tests/test_budget_alert.py
+new file mode 100644
+index 0000000..b53ce88
+--- /dev/null
++++ b/tests/test_budget_alert.py
+@@ -0,0 +1,97 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.budget_alert import check_budget, classify, spent_in_month
++from kakeibo.core import Expense
++
++
++def E(d: str, cat: str, amt: int) -> Expense:
++    return Expense(date.fromisoformat(d), cat, amt)
++
++
++def test_d1_exact_limit_is_warn_not_over():
++    assert classify(1000, 1000) == "warn"
++    assert classify(1001, 1000) == "over"
++
++
++def test_d2_warn_threshold_boundary():
++    assert classify(799, 1000) == "ok"
++    assert classify(800, 1000) == "warn"
++    assert classify(500, 1000, warn_percent=50) == "warn"
++
++
++def test_d3_zero_limit():
++    assert classify(0, 0) == "ok"
++    assert classify(1, 0) == "over"
++
++
++def test_d4_refund_nets_out():
++    rows = [E("2026-01-05", "food", 3000), E("2026-01-06", "food", -3500)]
++    assert spent_in_month(rows, "2026-01") == {"food": -500}
++    (a,) = check_budget(rows, {"food": 1000}, "2026-01")
++    assert a.status == "ok" and a.remaining == 1500
++
++
++def test_d5_unbudgeted_ignored_and_unspent_ok():
++    rows = [E("2026-01-05", "game", 9999)]
++    (a,) = check_budget(rows, {"food": 1000}, "2026-01")
++    assert (a.category, a.status, a.spent, a.used_percent) == ("food", "ok", 0, 0)
++
++
++def test_d6_month_boundaries():
++    rows = [
++        E("2025-12-31", "food", 100),
++        E("2026-01-01", "food", 10),
++        E("2026-01-31", "food", 20),
++        E("2026-02-01", "food", 1000),
++    ]
++    assert spent_in_month(rows, "2026-01") == {"food": 30}
++
++
++@pytest.mark.parametrize("bad", ["2026-13", "2026-1", "202601", ""])
++def test_d7_bad_month(bad: str):
++    with pytest.raises(ValueError):
++        spent_in_month([], bad)
++
++
++def test_d7_bad_args():
++    with pytest.raises(ValueError):
++        classify(0, -1)
++    for w in (0, -5, 101):
++        with pytest.raises(ValueError):
++            classify(0, 100, w)
++
++
++def test_d8_ordering():
++    rows = [
++        E("2026-01-01", "a", 1100),  # over by 100
++        E("2026-01-01", "b", 1300),  # over by 300
++        E("2026-01-01", "c", 900),  # warn, remaining 100
++        E("2026-01-01", "d", 800),  # warn, remaining 200
++        E("2026-01-01", "e", 100),  # ok
++        E("2026-01-01", "f", 1100),  # over by 100 (tie with a)
++    ]
++    limits = {c: 1000 for c in "abcdef"}
++    got = [(x.category, x.status) for x in check_budget(rows, limits, "2026-01")]
++    assert got == [
++        ("b", "over"),
++        ("a", "over"),
++        ("f", "over"),
++        ("c", "warn"),
++        ("d", "warn"),
++        ("e", "ok"),
++    ]
++
++
++def test_d9_used_percent():
++    rows = [E("2026-01-01", "a", 999), E("2026-01-01", "z", 5)]
++    got = {
++        x.category: x.used_percent
++        for x in check_budget(rows, {"a": 1000, "z": 0}, "2026-01")
++    }
++    assert got == {"a": 99, "z": None}
++
++
++def test_empty_inputs():
++    assert check_budget([], {}, "2026-01") == []

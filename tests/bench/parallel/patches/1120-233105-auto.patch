@@ -1,0 +1,260 @@
+diff --git a/src/kakeibo/budget_alert.py b/src/kakeibo/budget_alert.py
+new file mode 100644
+index 0000000..3a16f8a
+--- /dev/null
++++ b/src/kakeibo/budget_alert.py
+@@ -0,0 +1,114 @@
++"""Budget alerts: compare spending with monthly per-category limits.
++
++Pure functions only (no I/O). Amounts are integer yen.
++
++Decisions:
++D1: Over means spent > limit (strictly). spent == limit is "warning", not "over".
++D2: Warning means spent * 100 >= limit * warn_percent (integer arithmetic, no
++    float rounding) and not over. warn_percent defaults to 80 and must be 1..100.
++D3: limit == 0: spent <= 0 is "ok" (nothing was budgeted or spent); spent > 0 is "over".
++D4: A category that has spending but no limit is not reported (unbudgeted).
++    A category that has a limit but no spending is reported as "ok" with spent 0.
++D5: Negative totals (refunds) are used as they are; a negative total is "ok".
++    A negative limit or a warn_percent outside 1..100 raises ValueError; a
++    bool/non-int amount or warn_percent raises TypeError.
++D6: Result order: over, warning, ok; inside a status by category name ascending
++    (deterministic, ties included).
++D7: percent is floor(spent * 100 / limit), None when limit == 0. It can be negative
++    for refunds.
++D8: Category names are compared exactly (load_csv already strips them).
++D9: alerts_by_month reports months in ascending order and uses the month's merged
++    limits (Budget.for_month); months with no applicable limit give an empty list.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Literal
++
++from .core import Budget
++
++Status = Literal["over", "warning", "ok"]
++
++DEFAULT_WARN_PERCENT = 80
++
++_RANK: dict[str, int] = {"over": 0, "warning": 1, "ok": 2}
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    category: str
++    limit: int
++    spent: int
++    status: Status
++
++    @property
++    def remaining(self) -> int:
++        """limit - spent; negative when over."""
++        return self.limit - self.spent
++
++    @property
++    def percent(self) -> int | None:
++        """Floor of spent/limit in percent; None when limit is 0."""
++        if self.limit == 0:
++            return None
++        return self.spent * 100 // self.limit
++
++
++def _check_int(value: object, what: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise TypeError(f"{what} は整数である必要があります: {value!r}")
++    return value
++
++
++def _classify(spent: int, limit: int, warn_percent: int) -> Status:
++    if spent > limit:
++        return "over"
++    if limit == 0 or spent <= 0:
++        return "ok"
++    if spent * 100 >= limit * warn_percent:
++        return "warning"
++    return "ok"
++
++
++def evaluate_budget(
++    spent: dict[str, int],
++    limits: dict[str, int],
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> list[BudgetAlert]:
++    """Evaluate one month's per-category spending against its limits."""
++    if _check_int(warn_percent, "warn_percent") < 1 or warn_percent > 100:
++        raise ValueError(f"warn_percent は 1〜100 である必要があります: {warn_percent}")
++    alerts: list[BudgetAlert] = []
++    for cat, limit in limits.items():
++        _check_int(limit, f"limits.{cat}")
++        if limit < 0:
++            raise ValueError(f"limits.{cat} は 0 以上である必要があります: {limit}")
++        total = _check_int(spent.get(cat, 0), f"spent.{cat}")
++        alerts.append(
++            BudgetAlert(cat, limit, total, _classify(total, limit, warn_percent))
++        )
++    alerts.sort(key=lambda a: (_RANK[a.status], a.category))
++    return alerts
++
++
++def alerts_by_month(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> dict[str, list[BudgetAlert]]:
++    """{"YYYY-MM": alerts}, from monthly_totals() output and a Budget."""
++    return {
++        month: evaluate_budget(totals[month], budget.for_month(month), warn_percent)
++        for month in sorted(totals)
++    }
++
++
++def describe(alert: BudgetAlert) -> str:
++    """One-line Japanese message for an alert."""
++    head = f"{alert.category}: {alert.spent:,}円 / 予算 {alert.limit:,}円"
++    if alert.status == "over":
++        return f"{head} 超過 {-alert.remaining:,}円"
++    if alert.status == "warning":
++        return f"{head} 残り {alert.remaining:,}円(もうすぐ超えそう)"
++    return f"{head} 残り {alert.remaining:,}円"
+diff --git a/tests/test_budget_alert.py b/tests/test_budget_alert.py
+new file mode 100644
+index 0000000..ea23a15
+--- /dev/null
++++ b/tests/test_budget_alert.py
+@@ -0,0 +1,134 @@
++import pytest
++
++from kakeibo.budget_alert import (
++    BudgetAlert,
++    alerts_by_month,
++    describe,
++    evaluate_budget,
++)
++from kakeibo.core import Budget
++
++
++def status(spent: int, limit: int, **kw: int) -> str:
++    return evaluate_budget({"食費": spent}, {"食費": limit}, **kw)[0].status
++
++
++def test_d1_over_is_strict():
++    assert status(10001, 10000) == "over"
++    assert status(10000, 10000) == "warning"
++
++
++def test_d2_warning_threshold_default_80():
++    assert status(7999, 10000) == "ok"
++    assert status(8000, 10000) == "warning"
++    assert status(9999, 10000) == "warning"
++
++
++def test_d2_integer_arithmetic_no_float_rounding():
++    # 0.8 * 3 would be fuzzy in floats; 80% of 3 yen is 2.4 -> 3 warns, 2 does not
++    assert status(2, 3) == "ok"
++    assert status(3, 3) == "warning"
++
++
++def test_d2_custom_warn_percent():
++    assert status(5000, 10000, warn_percent=50) == "warning"
++    assert status(4999, 10000, warn_percent=50) == "ok"
++
++
++@pytest.mark.parametrize("p", [0, -1, 101])
++def test_d5_bad_warn_percent(p):
++    with pytest.raises(ValueError):
++        evaluate_budget({}, {"a": 1}, warn_percent=p)
++
++
++def test_d5_bool_warn_percent_is_type_error():
++    with pytest.raises(TypeError):
++        evaluate_budget({}, {"a": 1}, warn_percent=True)
++
++
++def test_d3_zero_limit():
++    assert status(0, 0) == "ok"
++    assert status(1, 0) == "over"
++    assert evaluate_budget({"食費": 1}, {"食費": 0})[0].percent is None
++
++
++def test_d4_unbudgeted_category_not_reported_and_unspent_is_ok():
++    alerts = evaluate_budget({"交通": 999999}, {"食費": 1000})
++    assert alerts == [BudgetAlert("食費", 1000, 0, "ok")]
++
++
++def test_d5_refund_total_is_ok_and_percent_negative():
++    a = evaluate_budget({"食費": -500}, {"食費": 1000})[0]
++    assert a.status == "ok"
++    assert a.remaining == 1500
++    assert a.percent == -50
++
++
++def test_d5_negative_limit():
++    with pytest.raises(ValueError):
++        evaluate_budget({}, {"食費": -1})
++
++
++@pytest.mark.parametrize("limit", [True, 1.5])
++def test_d5_non_int_limit(limit):
++    with pytest.raises(TypeError):
++        evaluate_budget({}, {"食費": limit})  # type: ignore[dict-item]
++
++
++def test_d5_bad_spent():
++    with pytest.raises(TypeError):
++        evaluate_budget({"食費": 1.5}, {"食費": 10})  # type: ignore[dict-item]
++
++
++def test_d6_order_over_warning_ok_then_name():
++    alerts = evaluate_budget(
++        {"b": 100, "a": 100, "c": 90, "d": 10, "e": 200},
++        {"a": 100, "b": 100, "c": 100, "d": 100, "e": 100},
++    )
++    assert [(x.category, x.status) for x in alerts] == [
++        ("e", "over"),
++        ("a", "warning"),
++        ("b", "warning"),
++        ("c", "warning"),
++        ("d", "ok"),
++    ]
++
++
++def test_d6_empty_inputs():
++    assert evaluate_budget({}, {}) == []
++    assert evaluate_budget({"a": 5}, {}) == []
++
++
++def test_d7_percent_floor_and_properties():
++    a = evaluate_budget({"x": 2999}, {"x": 10000})[0]
++    assert a.percent == 29
++    assert a.remaining == 7001
++
++
++def test_d8_exact_category_match():
++    a = evaluate_budget({"食費 ": 99999}, {"食費": 1000})[0]
++    assert a.spent == 0
++
++
++def test_d9_alerts_by_month_uses_merged_limits_and_sorted_months():
++    budget = Budget({"食費": 1000, "交通": 500}, {"2026-02": {"食費": 2000}})
++    totals = {"2026-02": {"食費": 1500}, "2026-01": {"食費": 1500, "交通": 100}}
++    result = alerts_by_month(totals, budget)
++    assert list(result) == ["2026-01", "2026-02"]
++    assert result["2026-01"][0] == BudgetAlert("食費", 1000, 1500, "over")
++    feb = {a.category: a.status for a in result["2026-02"]}
++    assert feb == {"食費": "ok", "交通": "ok"}
++
++
++def test_d9_month_without_limits_is_empty():
++    assert alerts_by_month({"2026-01": {"食費": 5}}, Budget({}, {})) == {"2026-01": []}
++
++
++def test_describe_messages():
++    over = BudgetAlert("食費", 10000, 12345, "over")
++    warn = BudgetAlert("食費", 10000, 9000, "warning")
++    ok = BudgetAlert("食費", 10000, 100, "ok")
++    assert describe(over) == "食費: 12,345円 / 予算 10,000円 超過 2,345円"
++    assert "もうすぐ超えそう" in describe(warn)
++    assert "残り 9,900円" in describe(ok)
++    assert "もうすぐ" not in describe(ok)
