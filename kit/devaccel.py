@@ -38,12 +38,12 @@ HOOK_CMDS = {
 PIECES = {
     "ruff": {
         "fast": [
-            "stage format $R ruff format --extend-exclude .claude .",
-            "stage lint $R ruff check --fix --quiet --output-format concise --extend-exclude .claude .",
+            "stage format $R ruff format --config 'extend-exclude=[\".claude\"]' .",
+            "stage lint $R ruff check --fix --quiet --output-format concise --config 'extend-exclude=[\".claude\"]' .",
         ],
         "full": [
-            "stage format $R ruff format --check --extend-exclude .claude .",
-            "stage lint $R ruff check --output-format concise --extend-exclude .claude .",
+            "stage format $R ruff format --check --config 'extend-exclude=[\".claude\"]' .",
+            "stage lint $R ruff check --output-format concise --config 'extend-exclude=[\".claude\"]' .",
         ],
         "allow": ["Bash(uv run ruff *)", "Bash(ruff *)"],
     },
@@ -53,7 +53,7 @@ PIECES = {
         "allow": ["Bash(uv run pyright*)", "Bash(pyright*)"],
     },
     "pytest": {
-        "fast": ['stage tests pt -x -q --tb=short -m "not slow"'],
+        "fast": ['stage tests pt -x -q --tb=short'],
         "full": ["stage tests pt -q --tb=short"],
         "allow": ["Bash(uv run pytest*)", "Bash(pytest*)"],
     },
@@ -156,15 +156,19 @@ def kit_ref() -> str:
         return "unknown"
 
 
+CACHE_DIRS = {"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache"}
+
+
 def core_files() -> list[str]:
     return sorted(
         str(p.relative_to(CORE)) for p in CORE.rglob("*")
-        if p.is_file() and "__pycache__" not in p.parts
+        if p.is_file() and not CACHE_DIRS.intersection(p.parts)  # tool caches in a dev checkout
     )
 
 
 def seed_files() -> list[str]:
-    return sorted(str(p.relative_to(SEED)) for p in SEED.rglob("*") if p.is_file())
+    return sorted(str(p.relative_to(SEED)) for p in SEED.rglob("*")
+                  if p.is_file() and not CACHE_DIRS.intersection(p.parts))
 
 
 def read_lock(root: Path) -> tuple[dict, dict]:

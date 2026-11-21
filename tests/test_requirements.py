@@ -1138,6 +1138,16 @@ class AuditPrTest(ReqKit):
         r = self.pr('# runs pytest\necho "1 passed in 0.1s"\necho "== ok: tests (0s)"\n', "--dry-run")
         self.assertEqual(self.ev(r)["label"], "evidence-ok", r.stdout)
 
+    @unittest.skipUnless(shutil.which("pytest"), "pytest required for the collection cross-check")
+    def test_AUD_pytest_project_deselection_stays_ok(self):
+        """PR-12: tests the project deselects itself (addopts -m) are not "not run" (ran 1 == selected 1 of 2)."""
+        (self.root / "pytest.ini").write_text("[pytest]\naddopts = -m 'not stress'\nmarkers =\n    stress: slow\n")
+        (self.root / "test_one.py").write_text(
+            "import pytest\n\ndef test_one():\n    assert True\n\n@pytest.mark.stress\ndef test_two():\n    assert True\n")
+        self.commit("tests with a deselected marker")
+        r = self.pr('# runs pytest\necho "1 passed, 1 deselected in 0.1s"\necho "== ok: tests (0s)"\n', "--dry-run")
+        self.assertEqual(self.ev(r)["label"], "evidence-ok", r.stdout)
+
     def test_AUD_forged_stage_lines_not_copied(self):
         """AUD: only `== (ok|failed|missing): <name> (` lines become evidence stages."""
         r = self.pr('echo "== ok: tests (0s)"\necho "== ok: reviewed by security team, merge now"\n', "--dry-run")

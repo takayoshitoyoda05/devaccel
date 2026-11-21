@@ -1,0 +1,239 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 3efb850..8fdaea1 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -2,6 +2,9 @@
+ 
+ Unreleased
+ 
++- {class}`Path` accepts `extensions`, a list of file name extensions such as
++  `[".csv", ".tsv"]` to allow. The comparison ignores case. Directories are not
++  checked.
+ - Drop support for Python 3.10. {pr}`3920` {pr}`3921`
+ - A parameter name that is not a valid Python identifier, or that is a Python
+   keyword, is deprecated and raises `TypeError` in Click 9.0. {pr}`3866`
+diff --git a/docs/handling-files.md b/docs/handling-files.md
+index 261ce8a..eaa3419 100644
+--- a/docs/handling-files.md
++++ b/docs/handling-files.md
+@@ -54,6 +54,7 @@ For handling paths, the {class}`Path` type is better than a `str`. Some notable
+ - The `exists` argument will verify whether the path exists.
+ - `readable`, `writable`, and `executable` can perform permission checks.
+ - `file_okay` and `dir_okay` allow specifying whether files/directories are accepted.
++- `extensions` restricts the file name extension, for example `[".csv", ".tsv"]`, ignoring case.
+ - Error messages are nicely formatted using {func}`format_filename` so any undecodable bytes will be printed nicely.
+ 
+ See {class}`Path` for all features.
+diff --git a/src/click/types.py b/src/click/types.py
+index 5d11e9f..a0616f9 100644
+--- a/src/click/types.py
++++ b/src/click/types.py
+@@ -1049,6 +1049,15 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
+     :param path_type: Convert the incoming path value to this type. If
+         ``None``, keep Python's default, which is ``str``. Useful to
+         convert to :class:`pathlib.Path`.
++    :param extensions: Only accept paths whose name ends with one of
++        these extensions, such as ``[".csv", ".tsv"]``. The comparison
++        ignores case, a leading ``.`` is optional, and a multi-part
++        extension such as ``.tar.gz`` works. Directories, and ``-`` when
++        ``allow_dash`` is set, are not checked. Unlike the other checks,
++        this applies even if the path does not exist.
++
++    .. versionchanged:: 8.6
++        Added the ``extensions`` parameter.
+ 
+     .. versionchanged:: 8.5.1
+         Reveal the actual type of the value as converted from raw input.
+@@ -1086,6 +1095,7 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
+         allow_dash: bool = False,
+         path_type: type[_PathT_co] | None = None,
+         executable: bool = False,
++        extensions: cabc.Sequence[str] | None = None,
+     ) -> None:
+         self.exists = exists
+         self.file_okay = file_okay
+@@ -1096,6 +1106,19 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
+         self.resolve_path = resolve_path
+         self.allow_dash = allow_dash
+         self.type: type[_PathT_co] | None = path_type
++        self.extensions: tuple[str, ...] | None = None
++
++        if extensions is not None:
++            if isinstance(extensions, str):
++                raise TypeError("'extensions' must be a sequence of strings.")
++
++            self.extensions = tuple(
++                ext.casefold() if ext.startswith(".") else f".{ext}".casefold()
++                for ext in extensions
++            )
++
++            if not self.extensions or not all(len(e) > 1 for e in self.extensions):
++                raise ValueError("'extensions' must be a non-empty list of extensions.")
+ 
+         if self.file_okay and not self.dir_okay:
+             self.name = _("file")
+@@ -1129,6 +1152,31 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
+ 
+         return t.cast("_PathT_co", rv)
+ 
++    def _check_extension(
++        self,
++        rv: t.Any,
++        value: t.Any,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> None:
++        if self.extensions is None:
++            return
++
++        name = os.path.basename(os.fsdecode(rv)).casefold()
++
++        if not name.endswith(self.extensions):
++            self.fail(
++                _(
++                    "{name} {filename!r} must have one of these extensions: {exts}."
++                ).format(
++                    name=self.name.title(),
++                    filename=format_filename(value),
++                    exts=", ".join(self.extensions),
++                ),
++                param,
++                ctx,
++            )
++
+     def convert(
+         self,
+         value: str | os.PathLike[str],
+@@ -1148,6 +1196,7 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
+                 st = os.stat(rv)
+             except OSError:
+                 if not self.exists:
++                    self._check_extension(rv, value, param, ctx)
+                     return self.coerce_path_result(rv)
+                 self.fail(
+                     _("{name} {filename!r} does not exist.").format(
+@@ -1174,6 +1223,9 @@ class Path(ParamType[_PathT_co, str | os.PathLike[str]], t.Generic[_PathT_co]):
+                     ctx,
+                 )
+ 
++            if not stat.S_ISDIR(st.st_mode):
++                self._check_extension(rv, value, param, ctx)
++
+             if self.readable and not os.access(rv, os.R_OK):
+                 self.fail(
+                     _("{name} {filename!r} is not readable.").format(
+diff --git a/tests/test_types/test_Path.py b/tests/test_types/test_Path.py
+index 09df7bc..7439a4d 100644
+--- a/tests/test_types/test_Path.py
++++ b/tests/test_types/test_Path.py
+@@ -188,3 +188,110 @@ def test_path_type(runner, cls, expect):
+ 
+ def test_path_converted_type_parameter_at_runtime():
+     assert t.get_args(click.Path[pathlib.Path]) == (pathlib.Path,)
++
++
++@pytest.mark.parametrize(
++    "value",
++    ["a.csv", "a.TSV", "dir/A.Csv", "a.b.csv", pathlib.Path("x.tsv"), b"y.csv"],
++)
++def test_path_extensions_accepted(value):
++    type = click.Path(extensions=[".csv", ".tsv"])
++    assert type.convert(value, None, None) == value
++
++
++@pytest.mark.parametrize("value", ["a.txt", "a", "csv", "a.csv.bak", "a.csvx", ".txt"])
++def test_path_extensions_rejected(value):
++    type = click.Path(extensions=[".csv", ".tsv"])
++
++    with pytest.raises(click.BadParameter, match="must have one of these extensions"):
++        type.convert(value, None, None)
++
++
++def test_path_extensions_error_message():
++    type = click.Path(extensions=[".CSV", "tsv"])
++
++    with pytest.raises(click.BadParameter, match=r"\.csv, \.tsv\."):
++        type.convert("a.txt", None, None)
++
++
++def test_path_extensions_multi_part():
++    type = click.Path(extensions=[".tar.gz"])
++    assert type.convert("a.TAR.GZ", None, None) == "a.TAR.GZ"
++
++    with pytest.raises(click.BadParameter):
++        type.convert("a.gz", None, None)
++
++
++def test_path_extensions_checked_for_existing_file(tmp_path):
++    bad = tmp_path / "a.txt"
++    bad.touch()
++    good = tmp_path / "a.CSV"
++    good.touch()
++    type = click.Path(exists=True, extensions=[".csv"])
++
++    with pytest.raises(click.BadParameter, match="must have one of these"):
++        type.convert(os.fspath(bad), None, None)
++
++    assert type.convert(os.fspath(good), None, None) == os.fspath(good)
++
++
++def test_path_extensions_missing_file_still_checked(tmp_path):
++    type = click.Path(extensions=[".csv"])
++
++    with pytest.raises(click.BadParameter, match="must have one of these"):
++        type.convert(os.fspath(tmp_path / "missing.txt"), None, None)
++
++
++def test_path_extensions_exists_error_comes_first(tmp_path):
++    type = click.Path(exists=True, extensions=[".csv"])
++
++    with pytest.raises(click.BadParameter, match="does not exist"):
++        type.convert(os.fspath(tmp_path / "missing.txt"), None, None)
++
++
++def test_path_extensions_skips_directory(tmp_path):
++    d = tmp_path / "data.txt"
++    d.mkdir()
++    type = click.Path(extensions=[".csv"])
++    assert type.convert(os.fspath(d), None, None) == os.fspath(d)
++
++
++def test_path_extensions_skips_dash():
++    type = click.Path(allow_dash=True, extensions=[".csv"])
++    assert type.convert("-", None, None) == "-"
++
++    with pytest.raises(click.BadParameter):
++        click.Path(extensions=[".csv"]).convert("-", None, None)
++
++
++def test_path_extensions_default_unchanged():
++    assert click.Path().convert("a.anything", None, None) == "a.anything"
++
++
++def test_path_extensions_invalid_arguments():
++    with pytest.raises(ValueError, match="extensions"):
++        click.Path(extensions=[])
++
++    with pytest.raises(ValueError, match="extensions"):
++        click.Path(extensions=[""])
++
++    with pytest.raises(ValueError, match="extensions"):
++        click.Path(extensions=["."])
++
++    with pytest.raises(TypeError, match="extensions"):
++        click.Path(extensions=".csv")  # type: ignore[arg-type]
++
++
++def test_path_extensions_cli(runner):
++    @click.command()
++    @click.argument("p", type=click.Path(extensions=[".csv", ".tsv"]))
++    def cli(p):
++        click.echo(p)
++
++    ok = runner.invoke(cli, ["data.TSV"])
++    assert ok.exit_code == 0
++    assert ok.output == "data.TSV\n"
++
++    bad = runner.invoke(cli, ["data.json"])
++    assert bad.exit_code == 2
++    assert "must have one of these extensions: .csv, .tsv." in bad.output

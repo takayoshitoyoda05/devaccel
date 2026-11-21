@@ -190,10 +190,11 @@ def _pytest_collected(check_text: str, workdir: Path, sandbox: bool, timeout: in
     text = r.stdout + r.stderr
     if r.returncode == 5 or "no tests collected" in text:
         return 0
-    m2 = re.search(r"(\d+) tests? collected", text)
+    # "2653/33653 tests collected (31000 deselected)": the project's own -m/-k selection (addopts) counts
+    m2 = re.search(r"(?:(\d+)/)?(\d+) tests? collected", text)
     if r.returncode != 0 or not m2:
         return None
-    return int(m2.group(1))
+    return int(m2.group(1) or m2.group(2))
 
 
 def static_triage(root: Path, cfg: dict, base: str, ref: str,

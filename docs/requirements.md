@@ -161,7 +161,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | PR-09 | 同じブランチに open の PR があれば新しく作らず本文とラベルを更新し(反対のラベルは外す)、その PR がフォーク由来・base 不一致・head 不一致なら更新せず終了コード 2 で止まらなければならない。 | 0.5.0 | unit(gh を偽装) |
 | PR-10 | 既存 PR が `needs-human` で、ブランチが最新の base を取り込んでいない間は、再実行しても `evidence-ok` に戻してはならない。 | 0.5.0 | integration(gh を偽装) |
 | PR-11 | `--dry-run` は GitHub を一切変更せず本文とラベルを出力しなければならず、`gh` の呼び出しは origin の設定から得た `-R owner/repo` に固定しなければならない。自動マージは既定で無効、有効でも `evidence-ok` かつ base に必須ステータスチェックがあるときだけ設定しなければならない。 | 0.3.1、0.4.0、D11 | unit(gh を偽装) |
-| PR-12 | 振り分けはリネーム・非 ASCII のパス・ファイル種別の変更・`.gitattributes` による差分抑止に影響されてはならない。ツール/テスト設定ファイル(`pyproject.toml`、`.gitattributes`、入れ子の ruff/pytest/pyright 設定ほか)の変更はすべて needs-human。pytest を使う check.sh で 1 件も passed が無ければ失敗扱い。PR 本文に認証情報らしき文字列が入るなら作成を拒否しなければならない。自動マージは検証した head に固定しなければならない。 | 0.10.0 監査 H2/H5 | unit |
+| PR-12 | 振り分けはリネーム・非 ASCII のパス・ファイル種別の変更・`.gitattributes` による差分抑止に影響されてはならない。ツール/テスト設定ファイル(`pyproject.toml`、`.gitattributes`、入れ子の ruff/pytest/pyright 設定ほか)の変更はすべて needs-human。pytest を使う check.sh で 1 件も passed が無ければ失敗扱い(実行数は別に数えた収集数と照合し、プロジェクト自身の `-m`/`-k` で外したテストは収集数に含めない: 0.15.4)。PR 本文に認証情報らしき文字列が入るなら作成を拒否しなければならない。自動マージは検証した head に固定しなければならない。 | 0.10.0 監査 H2/H5 | unit |
 | SHIP-01 | `devaccel_ship.py` は 1 回の実行で、追跡済みの変更と `--paths` の新規ファイル(`-A` はしない)をコミットし、作業ブランチを origin へ push し、`devaccel_pr` と同じ証拠・振り分けで PR を作成/更新しなければならない。題名は `ship.md` の 1 行目、確認メモは 2 行目以降(`--verify-notes` と同じ制限)。 | 0.11.0 | unit |
 | SHIP-02 | ship は main/master/base/origin HEAD/detached では何もコミット・push してはならない。push 先は origin の同名ブランチだけで、force してはならない。`--paths` はリポジトリ内の相対パスに限る。 | 0.11.0 | unit |
 | SHIP-03 | `--units` は各単位のローカルブランチを `--no-ff` で統合し、衝突した単位は外して PR 本文に明記し、統合後の木に対して base の check.sh を 1 回だけ実行しなければならない。 | 0.11.0 | unit |
