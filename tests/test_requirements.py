@@ -1876,6 +1876,20 @@ class R18BatchEndToEndTest(R6ShipTest):
         self.assertEqual(sh(self.root, "git", "worktree", "list").stdout.count("\n"), 1)  # worktrees removed
         self.assertEqual(sh(self.root, "git", "branch", "--list", "unit/*").stdout.strip(), "")
 
+    def test_BATCH_DEPS_items_naming_another_items_file_are_refused(self):
+        """BATCH-DEPS: an item that names a file/module another item creates cannot be built in parallel (its
+        worktree starts without it); the batch stops before starting any unit."""
+        self.with_origin()
+        (self.bin / "claude").write_text(self.STUB)
+        (self.bin / "claude").chmod(0o755)
+        tasks = self.tmp / "tasks.md"
+        tasks.write_text("1. `src/p/values.py` + `tests/test_values.py` — parse amounts. " + "x" * 80 + "\n"
+                         "2. `src/p/reader.py` + `tests/test_reader.py` — use `p.values` parse. " + "x" * 80 + "\n")
+        r, log = self.land(str(tasks), "--branch", "batch/t", script="devaccel_batch.py")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("task 2 uses `src/p/values.py` that task 1 creates", r.stderr)
+        self.assertEqual(sh(self.root, "git", "worktree", "list").stdout.count("\n"), 1)
+
     def test_batch_preflight_refuses_before_running_anything(self):
         self.with_origin()
         (self.bin / "claude").write_text(self.STUB)

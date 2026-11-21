@@ -95,6 +95,25 @@ def task_warnings(item: str) -> list[str]:
     return w
 
 
+def cross_deps(items: list[str]) -> list[str]:
+    """An item that names a file (or its module) another item creates can't be built in parallel: its worktree
+    starts without that file, so the unit either fails or quietly writes its own copy (measured: the importer
+    unit re-implemented a narrow amount parser and the real one went unused). Each item must stand alone."""
+    owned = []
+    for it in items:
+        head = it.split("\n", 1)[0]
+        owned.append([p for p in re.findall(r"`([\w./-]+\.py)`", head) if "test" not in Path(p).name])
+    errs = []
+    for i, files in enumerate(owned):
+        for f in files:
+            mod = re.sub(r"^src/", "", f)[:-3].replace("/", ".")
+            for j, it in enumerate(items):
+                if j != i and (f in it or re.search(rf"(?<![\w.]){re.escape(mod)}(?![\w])", it)):
+                    errs.append(f"task {j + 1} uses `{f}` that task {i + 1} creates: units build in parallel from "
+                                "the same start, so put what it needs in the same item (or merge the two items)")
+    return errs
+
+
 EDGE_KEYS = {  # edge-cases.md section title prefix -> words in an item that make it relevant
     "金額": ("金額", "円", "amount", "yen", "price", "数値", "parse"),
     "CSV": ("csv", "CSV", "列", "ヘッダー", "header", "tsv", "取り込"),
@@ -164,7 +183,7 @@ def plan_jobs(n_units: int, cli: int, cfg: dict, mem_mb: int, cpus: int) -> tupl
         return min(cli, n_units), f"--jobs {cli}"
     par = cfg.get("parallel", {})
     cap = int(par.get("max_jobs") or 0)
-    per = max(50, int(par.get("unit_mem_mb") or 300))
+    per = max(50, int(par.get("unit_mem_mb") or 500))
     by_mem = max(1, int(mem_mb * 0.8) // per) if mem_mb else 4
     by_cpu = max(1, cpus * 2)
     jobs = min(n_units, by_mem, by_cpu, cap or n_units)
@@ -375,6 +394,7 @@ def main() -> int:
     if in_sandbox():
         errs.append("inside Claude Code's sandbox the nested `claude` cannot reach the API: run it from a "
                     "terminal, or let devaccel's settings run it outside the sandbox (/devaccel-setup)")
+    errs += cross_deps(items)
     for n, it in enumerate(items, 1):
         for msg in task_warnings(it):
             print(f"warning: task {n}: {msg}", flush=True)
@@ -456,7 +476,7 @@ def main() -> int:
         for k in range(1, copies + 1):  # --hedge: the same task in k worktrees; the first to pass the gate wins
             tag = f"{slug}-{i}" + (f"h{k}" if copies > 1 else "")
             br, wt = f"unit/{tag}", root / ".claude" / "worktrees" / tag
-            r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", br, str(wt), start],
+            r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "--no-track", "-B", br, str(wt), start],
                                capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
@@ -469,7 +489,7 @@ def main() -> int:
                 # the tester works in its OWN worktree (the implementer can't touch its files); its tests are copied
                 # into the implementer's tree when it exits, and fingerprinted at that moment
                 twt = root / ".claude" / "worktrees" / (tag + "t")
-                r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", f"unit/{tag}t", str(twt),
+                r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "--no-track", "-B", f"unit/{tag}t", str(twt),
                                     start], capture_output=True, text=True)
                 if r.returncode != 0:
                     print(f"tester worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
@@ -550,7 +570,7 @@ def main() -> int:
         """A second copy of a straggler's task in a fresh worktree (speculative execution)."""
         tag = f"{slug}-{u['i']}s"
         br, wt = f"unit/{tag}", root / ".claude" / "worktrees" / tag
-        r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-B", br, str(wt), start],
+        r = subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "--no-track", "-B", br, str(wt), start],
                            capture_output=True, text=True)
         if r.returncode != 0:
             return None

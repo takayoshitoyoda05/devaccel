@@ -207,6 +207,19 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
                   "4. 待つ間に、自分は CLI の配線と、部品をつなぐ統合テストを書く(部品のファイルは触らない)。\n"
                   "5. 完了通知の `parts: …` を受けて `python3 .claude/hooks/devaccel_ship.py --check --file .devaccel/ship.md "
                   "--units <parts のブランチ...> --paths <自分が作ったファイル...>` で統合・検査・PR。\n" + TAIL)
+    elif arm_base == "auto_fn":  # experiment: function-sized leaves on many haiku units, parent glues meanwhile
+        prompt = (tasks + "\n(計測) 「関数 1 つ = 単位 1 つ」で進めて(haiku は小さい件なら迷わず速い):\n"
+                  "1. `docs/design/<名前>.md` に、冒頭(目的・共通前提・判断一覧)を書き、続けて部品を番号付きで 1 件ずつ書く。"
+                  "1 件 = 純粋な関数 1〜2 個 + そのテスト(`src/kakeibo/_<部品>.py` + `tests/test__<部品>.py`)。"
+                  "関数の型・規則・例の表を書く。部品どうしは import しない(必要なものは引数で受け取る)。"
+                  "最初に冒頭と 2〜3 件を書いたら最後の行に `<!-- more -->` を置く。\n"
+                  "2. すぐに Bash を run_in_background で `python3 .claude/hooks/devaccel_batch.py docs/design/<名前>.md "
+                  "--branch batch/<名前> --watch --parts`(書いた件から単位が動き出す)。\n"
+                  "3. 残りの部品を Edit で `<!-- more -->` の前に書き足し、最後に `<!-- end -->` を置く。\n"
+                  "4. 待つ間に、各機能の公開モジュール(部品をつなぐ薄い関数)と、つないだ振る舞いのテストを自分で書く"
+                  "(部品のファイルは触らない)。\n"
+                  "5. 完了通知の `parts: …` を受けて `python3 .claude/hooks/devaccel_ship.py --check --file .devaccel/ship.md "
+                  "--branch feat/<名前> --units <parts のブランチ...> --paths <自分が作ったファイル...>` で統合・検査・PR。\n" + TAIL)
     elif arm_base == "auto_nodesign":  # baseline for loosely worded requests: no design doc
         prompt = tasks + "\n設計書は書かずに、そのまま進めて。\n" + TAIL
     elif arm_base == "auto_design":  # the proposal under test: a design doc with acceptance criteria first
