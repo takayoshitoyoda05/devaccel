@@ -59,24 +59,26 @@ def run(cmd: list[str], cwd: Path, timeout: int = 600, env: dict | None = None) 
 DOCS = ["*.md", "**/*.md", "docs/**"]
 
 
+def in_agent_sandbox() -> bool:
+    """Inside Claude Code's sandbox (bwrap cannot nest; processes left running die with the command). A positive
+    signal only: an excluded (unsandboxed) command never gets it, and the guard admits no env prefix on the scripts."""
+    return os.environ.get("SANDBOX_RUNTIME") == "1"
+
+
 def need_confinement(cfg: dict) -> bool:
     """Branch code must not run with the user's full rights. Inside Claude Code's sandbox (an agent running
     ship/pr) a nested bwrap cannot start and the code is already confined, so it runs as is; anywhere else
     (devaccel_batch run by a human in a terminal) it is confined, and fails closed if bwrap can't run."""
     if not cfg["gate"].get("sandbox", True):
         return False
-    if os.environ.get("CLAUDECODE"):
-        import shutil
-        bw = shutil.which("bwrap")
-        probe = subprocess.run([bw, "--unshare-pid", "--ro-bind", "/", "/", "true"], capture_output=True,
-                               stdin=subprocess.DEVNULL) if bw else None
-        if probe is None or probe.returncode != 0:
-            return False
-    return True
+    # already confined only on a positive signal: ship/batch run outside the sandbox (excludedCommands), and there
+    # a failed bwrap must fail closed (the confined run refuses), never fall back to running branch code as is
+    return not in_agent_sandbox()
 
 
 def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path, sandbox: bool = False,
-                   export_from: Path | None = None) -> tuple[bool, list[str], str, float]:
+                   export_from: Path | None = None, rev: str = "HEAD",
+                   mask: list[Path] | None = None) -> tuple[bool, list[str], str, float]:
     """Run the *base branch's* check.sh full in workdir: a branch cannot weaken the check that judges it."""
     t0 = time.time()
     base_check = git(root, "show", f"{base_ref}:scripts/check.sh") if base_ref else ""
@@ -88,7 +90,8 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path, sandbox:
     try:
         cmd, env = ["bash", f.name, "full"], {**os.environ}
         if sandbox:  # land runs PR code on the human's machine: confine it (the PR script itself is sandboxed)
-            wrapped = confined(["bash", "-c", Path(f.name).read_text(encoding="utf-8"), "check.sh", "full"], workdir)
+            wrapped = confined(["bash", "-c", Path(f.name).read_text(encoding="utf-8"), "check.sh", "full"], workdir,
+                               mask_env_in=mask)
             if wrapped is None:
                 return False, ["== failed: check.sh full (bwrap がないので隔離できない)"], "", 0.0
             cmd, env = wrapped
@@ -104,9 +107,9 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path, sandbox:
                 with tempfile.TemporaryDirectory(prefix="devaccel-collect-") as cdir:
                     # the same commit the check judges, from a checkout the caller names (never inferred from
                     # files inside the tree being judged): the branch HEAD for PRs, land's merge worktree for land
-                    if not export_head(export_from or root, Path(cdir)):
+                    if not export_head(export_from or root, Path(cdir), rev):
                         return None
-                    return _pytest_collected(base_check, Path(cdir), sandbox, int(cfg["gate"]["timeout_sec"]))
+                    return _pytest_collected(base_check, Path(cdir), sandbox, int(cfg["gate"]["timeout_sec"]), mask)
             pending = pool.submit(collect_own_copy)
             if not sandbox:  # side by side only when both runs are confined: each then sees just its own tree
                 pending.result()  # (bwrap gives every run a private /tmp). Unconfined: finish collecting first
@@ -130,11 +133,11 @@ def run_base_check(root: Path, cfg: dict, base_ref: str, workdir: Path, sandbox:
     return ok, stages, ("" if ok else "\n".join(out[-30:])), round(time.time() - t0, 1)
 
 
-def export_head(root: Path, dest: Path) -> bool:
+def export_head(root: Path, dest: Path, rev: str = "HEAD") -> bool:
     """Write HEAD's tracked files into dest from git objects. Not `git archive`: that honours
     `export-ignore` in the branch's .gitattributes, which would drop a failing test from the check.
     Symlinks are written as plain files holding the target text (never followed)."""
-    ls = subprocess.run(["git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+    ls = subprocess.run(["git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", rev],
                         capture_output=True)
     if ls.returncode != 0:
         return False
@@ -173,13 +176,14 @@ def _pytest_ran(output: str) -> int:
     return sum(int(n) for n, kind in re.findall(_OUTCOMES, lines[-1]) if kind != "deselected")
 
 
-def _pytest_collected(check_text: str, workdir: Path, sandbox: bool, timeout: int) -> int | None:
+def _pytest_collected(check_text: str, workdir: Path, sandbox: bool, timeout: int,
+                      mask: list[Path] | None = None) -> int | None:
     m = re.search(r'^R="([^"]*)"', check_text, re.M)
     runner = m.group(1) if m else ""
     cmd = ["bash", "-c", f"{runner} pytest --collect-only -q -p no:cacheprovider"]
     env = {**os.environ}
     if sandbox:
-        wrapped = confined(cmd, workdir)
+        wrapped = confined(cmd, workdir, mask_env_in=mask)
         if wrapped is None:
             return None
         cmd, env = wrapped
@@ -238,8 +242,12 @@ def static_triage(root: Path, cfg: dict, base: str, ref: str,
     return files, reasons, risky
 
 
-def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1, fetched: bool = False) -> dict:
-    head = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1, fetched: bool = False,
+            rev: str = "HEAD", branch: str = "", base_ref: str = "", state_root: Path | None = None) -> dict:
+    """base_ref/state_root: finalize judges from a private repository fetched from GitHub (root), with the base
+    at base_ref; the project's own files (gate log, .env to mask) are under state_root."""
+    head = branch or git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    fetched = fetched or bool(base_ref)
     # best effort: judge against the latest base. The fetch overlaps the snapshot export (which needs only HEAD);
     # skipped when the caller fetched the base seconds ago (ship creating the work branch: ~1.3 s each)
     fetch = subprocess.Popen(["true"] if fetched else
@@ -247,31 +255,32 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1,
                               "fetch", "-q", "origin", base_branch], stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     snap_dir = tempfile.TemporaryDirectory(prefix="devaccel-pr-")
-    exported = export_head(root, Path(snap_dir.name))
+    exported = export_head(root, Path(snap_dir.name), rev)
     try:
         fetch.wait(timeout=60)
     except subprocess.TimeoutExpired:
         fetch.kill()
-    base = (git(root, "merge-base", "HEAD", f"origin/{base_branch}").strip()
-            or git(root, "merge-base", "HEAD", base_branch).strip())
-    files, static, risky = static_triage(root, cfg, base, "HEAD", units)
-    stat = git(root, "diff", "--shortstat", f"{base}..HEAD").strip()
+    base = (git(root, "merge-base", rev, base_ref).strip() if base_ref else
+            git(root, "merge-base", rev, f"origin/{base_branch}").strip()
+            or git(root, "merge-base", rev, base_branch).strip())
+    files, static, risky = static_triage(root, cfg, base, rev, units)
+    stat = git(root, "diff", "--shortstat", f"{base}..{rev}").strip()
     designs = [f for f in files if f.startswith("docs/design/") and f.endswith(".md") and "TEMPLATE" not in f]
     acs: list[str] = []
     for d in designs:
-        p = root / d
-        if p.exists():
-            acs += [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
-                    if re.match(r"\s*- \[[ xX]\] ", ln)]
+        text = git(root, "show", f"{rev}:{d}")  # the judged commit's copy, not the (still edited) working tree
+        acs += [ln.strip() for ln in text.splitlines() if re.match(r"\s*- \[[ xX]\] ", ln)]
 
     # judge the commit, not the working tree: untracked/ignored files (a stray conftest.py) must not count
     with snap_dir as snap:
         if exported:
-            check_ok, stages, tail, check_secs = run_base_check(root, cfg, base, Path(snap),
-                                                                sandbox=need_confinement(cfg))
+            check_ok, stages, tail, check_secs = run_base_check(
+                root, cfg, base, Path(snap), sandbox=need_confinement(cfg), rev=rev,
+                mask=[trusted_root({"cwd": str(state_root or root)})])
         else:  # never judge an empty or partial tree as passing
             check_ok, stages, tail, check_secs = False, ["== failed: snapshot (HEAD を取り出せない)"], "", 0.0
-    base_sha = (git(root, "rev-parse", "-q", "--verify", f"origin/{base_branch}").strip()
+    base_sha = (git(root, "rev-parse", "-q", "--verify", base_ref).strip() if base_ref else
+                git(root, "rev-parse", "-q", "--verify", f"origin/{base_branch}").strip()
                 or git(root, "rev-parse", "-q", "--verify", base_branch).strip())
     # display only: behaviour changed but no docs touched (parallel units drift apart here)
     docs_untouched = any(not match_any(f, DOCS) for f in files) and not any(match_any(f, DOCS) for f in files)
@@ -280,9 +289,9 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1,
     # integrated (merge subjects "integrate <branch>"; a forged subject can only add reasons, never remove them).
     # Records without a branch (e.g. a broken unit worktree) belong to no PR.
     mine = {head} | set(re.findall(r"^integrate (\S+)$", git(root, "log", "--merges", "--format=%s",
-                                                             f"{base}..HEAD") if base else "", re.M))
+                                                             f"{base}..{rev}") if base else "", re.M))
     escalations = 0
-    log = trusted_root({"cwd": str(root)}) / ".claude" / "state" / "gate-log.jsonl"
+    log = trusted_root({"cwd": str(state_root or root)}) / ".claude" / "state" / "gate-log.jsonl"
     if log.exists():
         for line in log.read_text(encoding="utf-8").splitlines():
             try:
@@ -305,7 +314,7 @@ def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1,
         "head": head, "base": base_branch, "files": files, "stat": stat, "risky": risky,
         "acs": acs, "designs": designs, "check_ok": check_ok, "stages": stages, "tail": tail,
         "check_secs": check_secs, "reasons": reasons, "base_sha": base_sha,
-        "head_sha": git(root, "rev-parse", "HEAD").strip(), "docs_untouched": docs_untouched,
+        "head_sha": git(root, "rev-parse", rev).strip(), "docs_untouched": docs_untouched,
         "label": "needs-human" if reasons else "evidence-ok",
     }
 
@@ -367,9 +376,144 @@ def main() -> int:
     ap.add_argument("--title", required=True)
     ap.add_argument("--verify-notes", default="", help="file with what was run and observed")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--finalize", metavar="SHA", default="", help="(ship) judge this pushed commit and ready the draft")
+    ap.add_argument("--branch", default="", help="(with --finalize) the work branch the commit was pushed to")
     a = ap.parse_args()
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
+    if a.finalize:
+        if not re.fullmatch(r"[0-9a-f]{40}", a.finalize) or not re.fullmatch(r"\w[\w./-]*", a.branch) or ".." in a.branch:
+            print("--finalize needs a full commit sha and --branch <work branch>", file=sys.stderr)
+            return 2
+        notes = read_notes(a.verify_notes, root)
+        if a.verify_notes and Path(a.verify_notes).resolve().parent == Path(tempfile.gettempdir()).resolve():
+            Path(a.verify_notes).unlink(missing_ok=True)  # ship's private copy
+        return finalize(root, a.title, notes, a.finalize, a.branch)
     return open_pr(root, a.title, read_notes(a.verify_notes, root), a.dry_run)
+
+
+PENDING = ("**devaccel: 証拠を作成中** — base の `check.sh full` をこの commit の取り出しで実行しています。"
+           "終わるとこの本文とラベルが置き換わり、下書きが解除されます(下書きのあいだはマージできません)。\n")
+
+
+def open_draft(root: Path, title: str, head: str, sha: str) -> str:
+    """ship's fast path: the PR exists (as a draft, unmergeable) before its evidence; finalize fills it in.
+    An open PR for the branch goes back to draft with the pending body. Returns the URL ("" on failure)."""
+    repo = github_repo(root)
+    if not repo:
+        return ""
+    cur = run(["gh", "pr", "view", head, "-R", repo, "--json", "url,state,isCrossRepository,baseRefName"], root)
+    existing = json.loads(cur.stdout) if cur.returncode == 0 and cur.stdout.strip() else {}
+    base = load_config(trusted_root({"cwd": str(root)}))["scale"]["base_branch"]
+    if existing.get("state") == "OPEN":
+        if existing.get("isCrossRepository") or existing.get("baseRefName") != base:
+            return ""
+        url = existing["url"]
+        # back to draft before anything else: if that fails (no drafts on this plan), the synchronous path runs
+        if run(["gh", "pr", "ready", url, "-R", repo, "--undo"], root).returncode != 0:
+            return ""
+        r = run(["gh", "pr", "edit", url, "-R", repo, "--remove-label", "evidence-ok",
+                 "--body", PENDING + f"\n<!-- pending head={sha} -->\n"], root)
+        return url if r.returncode == 0 else ""
+    r = run(["gh", "pr", "create", "-R", repo, "--draft", "--base", base, "--head", head, "--title", title,
+             "--body", PENDING + f"\n<!-- pending head={sha} -->\n"], root)
+    return r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+
+
+def finalize(root: Path, title: str, notes: str, sha: str, branch: str) -> int:
+    """Background step after ship's draft PR (started by the finalize hook, outside the sandbox). The evidence is
+    built from a private repository fetched from GitHub, not from the project's .git (writable from the sandbox:
+    `git replace`, swapped objects or a forged origin/<base> would make a failing commit look green). Only the
+    draft ship opened for exactly this commit is filled in; it is readied only while its head is still `sha`."""
+    import shutil
+    project = trusted_root({"cwd": str(root)})
+    cfg = load_config(project)
+    base_branch = cfg["scale"]["base_branch"]
+    repo = github_repo(project)
+    if not repo or branch in {"main", "master", base_branch}:
+        print("finalize: no GitHub origin or a protected branch", file=sys.stderr)
+        return 2
+    fields = "url,state,isDraft,headRefOid,baseRefName,isCrossRepository,labels,body"
+
+    def view() -> dict:
+        v = run(["gh", "pr", "view", branch, "-R", repo, "--json", fields], project)
+        return json.loads(v.stdout) if v.returncode == 0 and v.stdout.strip() else {}
+
+    pr = view()
+    if not (pr.get("state") == "OPEN" and pr.get("isDraft") and pr.get("headRefOid") == sha
+            and pr.get("baseRefName") == base_branch and not pr.get("isCrossRepository")
+            and f"<!-- pending head={sha} -->" in (pr.get("body") or "")):
+        print("finalize: no draft PR pending for this commit (a newer ship owns it, or none)", file=sys.stderr)
+        return 2
+    url = pr["url"]
+    state = project / ".claude" / "state"  # not writable from the sandbox
+    if state.is_symlink():
+        return 2
+    (state / "judge").mkdir(parents=True, exist_ok=True)
+    judge = Path(tempfile.mkdtemp(prefix="j-", dir=state / "judge"))
+    try:
+        jgit = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-C", str(judge)]
+        run([*jgit[:-2], "init", "-q", "--bare", str(judge)], project)
+        f = run([*jgit, "-c", "transfer.fsckObjects=true", "fetch", "-q", "--no-tags", f"https://github.com/{repo}.git",
+                 f"+refs/heads/{branch}:refs/judge/head", f"+refs/heads/{base_branch}:refs/judge/base"], project,
+                timeout=600)
+        if f.returncode != 0 or git(judge, "rev-parse", "-q", "--verify", "refs/judge/head").strip() != sha:
+            print("finalize: could not fetch exactly this commit from GitHub (a newer push?): "
+                  + (f.stderr.strip()[-200:]), file=sys.stderr)
+            return 2
+        ev = collect(judge, cfg, base_branch, notes, 1, True, rev=sha, branch=branch, base_ref="refs/judge/base",
+                     state_root=project)
+        body = render(ev, notes)
+        if SECRET.search(body):
+            print("PR body looks like it contains a credential (check output / notes); refused", file=sys.stderr)
+            return 2
+        labels = {x.get("name") for x in pr.get("labels") or []}
+        up_to_date = bool(ev["base_sha"]) and git(judge, "merge-base", sha, ev["base_sha"]).strip() == ev["base_sha"]
+        if ev["label"] == "evidence-ok" and "needs-human" in labels and not up_to_date:
+            ev["label"], ev["reasons"] = "needs-human", ev["reasons"] + [
+                f"base より遅れている(`git merge origin/{ev['base']}` してから再実行)"]
+            body = render(ev, notes)
+    finally:
+        shutil.rmtree(judge, ignore_errors=True)
+    for name, (color, desc) in LABELS.items():
+        run(["gh", "label", "create", name, "-R", repo, "--color", color, "--description", desc], project)
+
+    def still_ours() -> bool:
+        now = view()
+        return now.get("state") == "OPEN" and now.get("headRefOid") == sha
+
+    def disown(why: str) -> int:  # this evidence is not about the head: unmergeable, or at least not "ok"
+        for _ in range(3):
+            if run(["gh", "pr", "ready", url, "-R", repo, "--undo"], project).returncode == 0:
+                break
+        run(["gh", "pr", "edit", url, "-R", repo, "--remove-label", "evidence-ok", "--add-label", "needs-human"],
+            project)
+        print(why, file=sys.stderr)
+        return 1
+    if not still_ours():  # a newer ship took the PR over meanwhile: its own finalize writes the body
+        print("finalize: the PR head moved; leaving it to the newer ship", file=sys.stderr)
+        return 1
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as bf:
+        bf.write(body)
+    try:
+        other = "needs-human" if ev["label"] == "evidence-ok" else "evidence-ok"
+        r = run(["gh", "pr", "edit", url, "-R", repo, "--body-file", bf.name, "--add-label", ev["label"],
+                 "--remove-label", other], project)
+    finally:
+        Path(bf.name).unlink(missing_ok=True)
+    if r.returncode != 0:
+        print(r.stderr.strip() or r.stdout.strip(), file=sys.stderr)
+        return 1
+    # gh has no head-match for ready: check right before and right after it
+    if not still_ours():
+        return disown("the PR head moved during finalize: left as a draft (the newer ship judges it)")
+    rd = run(["gh", "pr", "ready", url, "-R", repo], project)
+    if rd.returncode != 0:
+        print("could not mark the PR ready: " + (rd.stderr.strip() or rd.stdout.strip())[:200], file=sys.stderr)
+        return 1
+    if not still_ours():
+        return disown("the PR head moved while readying: back to draft (the newer ship judges it)")
+    print(f"{url}  [{ev['label']}]" + (f" reasons: {' / '.join(ev['reasons'])}" if ev["reasons"] else ""))
+    return 0
 
 
 def stamp(label: str, t0: float) -> float:

@@ -50,7 +50,7 @@ DEFAULTS: dict = {
     # memory with 10 units)
     "parallel": {"auto_merge": False, "max_jobs": 0, "unit_mem_mb": 500, "strong": 1},
     # sessions: when Claude stops with uncommitted code changes, ask once to open the evidence PR (devaccel-pr)
-    "pr": {"auto": True},
+    "pr": {"auto": True, "async_evidence": True},  # ship returns at the draft PR; the finalize hook finishes it
 }
 
 MODES = ("off", "observe", "enforce")
