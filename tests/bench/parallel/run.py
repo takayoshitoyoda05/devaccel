@@ -38,16 +38,36 @@ def sh(cmd: list[str], cwd: Path, timeout: int = 3600) -> subprocess.CompletedPr
 CAP: int | None = None  # --cap: CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS for this run (command-line settings win)
 
 
-def claude(prompt: str, cwd: Path, model: str, effort: str = "") -> tuple[dict, float]:
+FOLLOWUP: str | None = None  # --followup: a second request in the same session (e.g. "rename this")
+
+
+def claude(prompt: str, cwd: Path, model: str, effort: str = "", resume: str = "") -> tuple[dict, float]:
     t0 = time.time()
     extra = ["--settings", json.dumps({"env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": str(CAP)}})] if CAP else []
     r = sh(["claude", "-p", prompt, "--output-format", "json", "--model", model, "--permission-mode", "acceptEdits",
-            *(["--effort", effort] if effort else []), *extra], cwd)
+            *(["--effort", effort] if effort else []), *(["--resume", resume] if resume else []), *extra], cwd)
     wall = time.time() - t0
     try:
         return json.loads(r.stdout), wall
     except ValueError:
         return {"is_error": True, "result": (r.stdout + r.stderr)[-800:]}, wall
+
+
+def with_followup(j: dict, wall: float, cwd: Path, model: str, effort: str, suffix: str = "") -> tuple[dict, float]:
+    """--followup: send the second request into the same session; time and cost are the sum of both."""
+    if not FOLLOWUP or not j.get("session_id"):
+        return j, wall
+    j2, w2 = claude(FOLLOWUP + suffix + TAIL, cwd, model, effort, resume=j["session_id"])
+    merged = dict(j2)
+    merged["total_cost_usd"] = round((j.get("total_cost_usd") or 0) + (j2.get("total_cost_usd") or 0), 4)
+    merged["num_turns"] = (j.get("num_turns") or 0) + (j2.get("num_turns") or 0)
+    merged["first_wall"] = round(wall)
+    merged["result"] = (j.get("result") or "") + "\n\n--- followup ---\n" + (j2.get("result") or "")
+    return merged, wall + w2
+
+
+def save_answer(patch: Path, j: dict) -> None:
+    patch.with_suffix(".answer.md").write_text(j.get("result") or "", encoding="utf-8")
 
 
 def open_prs(trial: Path) -> list[dict]:
@@ -134,11 +154,13 @@ def run_vanilla(arm: str, tasks: str, heldout: Path, effort: str = "") -> dict:
     base = sh(["git", "rev-parse", "HEAD"], VANILLA).stdout.strip()
     prompt = tasks + "\n実装とテストが終わったら git commit して。" + TAIL
     j, wall = claude(prompt, VANILLA, model, effort)
+    j, wall = with_followup(j, wall, VANILLA, model, effort, "\n終わったら git commit して。")
     sh(["git", "add", "-A"], VANILLA)
     sh(["git", "-c", "user.name=b", "-c", "user.email=b@b", "commit", "-qm", "leftover"], VANILLA)
     patch = HERE / "patches" / f"{dt.datetime.now():%m%d-%H%M%S}-{arm}.patch"
     patch.parent.mkdir(exist_ok=True)
     patch.write_text(sh(["git", "diff", base, "HEAD"], VANILLA).stdout, encoding="utf-8")
+    save_answer(patch, j)
     wt = Path(sh(["mktemp", "-d"], VANILLA).stdout.strip()) / "g"
     sh(["git", "worktree", "add", "-q", "--detach", str(wt), "HEAD"], VANILLA)
     shutil.copy(heldout, wt / "tests" / heldout.name)
@@ -150,7 +172,7 @@ def run_vanilla(arm: str, tasks: str, heldout: Path, effort: str = "") -> dict:
     return {"arm": arm + ("_med" if effort else ""), "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"),
             "turns": j.get("num_turns"), "models": usage(j), "prs": [], "result_tail": (j.get("result") or "")[-300:],
             "heldout": (r.stdout.strip().splitlines() or [""])[-1], "heldout_ok": r.returncode == 0,
-            "merge_conflicts": [], "patch": patch.name}
+            "merge_conflicts": [], "patch": patch.name, "first_wall": j.get("first_wall")}
 
 
 def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dict:
@@ -180,6 +202,8 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
         effort, arm = "low", arm[: -len("_low")]
     elif arm.endswith("_med"):  # the parent session at medium effort (units keep their own)
         effort, arm = "medium", arm[: -len("_med")]
+    elif arm.endswith("_high"):  # the parent session at high effort
+        effort, arm = "high", arm[: -len("_high")]
     if arm.endswith("_haiku"):  # the whole session (parent) on haiku; units are haiku anyway
         model = "claude-haiku-5-5"
         arm_base = arm[: -len("_haiku")]
@@ -231,6 +255,7 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
         prompt = tasks + "\n上の各件を 1 つのセッションで順番に実装し、" + how + TAIL
     t_start = time.time()
     j, wall = claude(prompt, trial, model, effort)
+    j, wall = with_followup(j, wall, trial, model, effort)
     new = [p for p in open_prs(trial) if p["number"] not in before]
     fan = trial / ".devaccel" / "batch-last.json"  # nested fan-out units are billed outside this session's JSON
     fan_cost = None
@@ -247,6 +272,8 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
     patch.parent.mkdir(exist_ok=True)
     rec.update(grade(trial, [p["headRefName"] for p in new], heldout, patch))
     rec["patch"] = patch.name
+    rec["first_wall"] = j.get("first_wall")
+    save_answer(patch, j)
     cleanup(trial, new)
     return rec
 
@@ -260,14 +287,51 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--model", default="claude-sonnet-5-5")
     ap.add_argument("--cap", type=int, default=None, help="max concurrent subagents for this run")
+    ap.add_argument("--followup", default=None, help="a second request sent into the same session")
+    ap.add_argument("--setup", type=Path, default=None,
+                    help="a patch applied (and committed) to both the trial's main and the vanilla clone before the "
+                         "runs, removed afterwards: a planted bug, a precondition")
     a = ap.parse_args()
-    global CAP
+    global CAP, FOLLOWUP
     CAP = a.cap
+    FOLLOWUP = a.followup
     trial = a.trial.expanduser().resolve()
     tasks = a.tasks.read_text(encoding="utf-8")
     global TASKS_PATH
     TASKS_PATH = a.tasks.resolve()
     out = HERE / "results.jsonl"
+    undo = setup(trial, a.setup.resolve()) if a.setup else None
+    try:
+        return run_all(a, trial, tasks, out)
+    finally:
+        if undo:
+            undo()
+
+
+def setup(trial: Path, patch: Path):
+    """Commit the patch on the trial's main (pushed: units and ship start from origin/main) and on the vanilla
+    clone; returns the undo (a revert commit on the trial, a hard reset on the vanilla clone)."""
+    sh(["git", "checkout", "-q", "main"], trial)
+    sh(["git", "pull", "-q"], trial)
+    vbase = sh(["git", "rev-parse", "HEAD"], VANILLA).stdout.strip()
+    for repo in (trial, VANILLA):
+        r = sh(["git", "apply", str(patch)], repo)
+        if r.returncode != 0:
+            raise SystemExit(f"setup patch does not apply in {repo}: {r.stderr.strip()}")
+        sh(["git", "add", "-A", "src", "tests"], repo)
+        sh(["git", "-c", "user.name=b", "-c", "user.email=b@b", "commit", "-qm", f"bench setup: {patch.name}"], repo)
+    sh(["git", "push", "-q", "origin", "main"], trial)
+    tsetup = sh(["git", "rev-parse", "HEAD"], trial).stdout.strip()
+
+    def undo() -> None:
+        sh(["git", "checkout", "-q", "-f", "main"], trial)
+        sh(["git", "revert", "--no-edit", tsetup], trial)
+        sh(["git", "push", "-q", "origin", "main"], trial)
+        sh(["git", "reset", "-q", "--hard", vbase], VANILLA)
+    return undo
+
+
+def run_all(a, trial: Path, tasks: str, out: Path) -> int:
     for rep in range(a.reps):
         for arm in a.arms.split(","):
             rec = run_arm(arm, trial, tasks, a.heldout.resolve(), a.model)
