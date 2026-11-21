@@ -1,0 +1,202 @@
+diff --git a/README.md b/README.md
+index c1dc8c6..e0f2fb2 100644
+--- a/README.md
++++ b/README.md
+@@ -66,8 +66,9 @@ $ uv run kakeibo data/sample.csv --report
+ 
+ ### --budget <json>
+ 
+-月×カテゴリの合計が予算を超えると、stderr に警告を出す(ちょうど予算は警告しない。終了コードは 0)。
+-予算のないカテゴリは対象外。stdout は変わらない。
++月×カテゴリの合計が予算を超えると `警告`、超えていなくても予算の 90% 以上(ちょうど 90% を含む)なら `注意` を stderr に出す(ちょうど予算は警告ではなく注意。終了コードは 0)。
++どちらも括弧の最後に予算に対する割合(%、小数点以下切り捨て)を付ける。予算 0 のカテゴリは、使っていれば割合なしで警告のみ(注意は出さない)。
++予算のないカテゴリは対象外。出力は月の昇順・カテゴリは既定の並びで、警告と注意が混ざる。stdout は変わらない。
+ 
+ 予算 JSON の形式。`default` は全月共通、`months` はその月だけ `default` をカテゴリ単位で上書きする。どちらも省略可。金額は 0 以上の整数、月キーは `YYYY-MM`。
+ 
+@@ -80,7 +81,7 @@ $ uv run kakeibo data/sample.csv --report
+ 
+ ```
+ $ uv run kakeibo data/sample.csv --budget budget.json
+-警告: 2026-11 food 1,000円超過 (予算 1,000 / 実績 2,000)
++警告: 2026-11 food 1,000円超過 (予算 1,000 / 実績 2,000 / 200%)
+ rent	80,000
+ food	2,000
+ ```
+diff --git a/src/kakeibo/__init__.py b/src/kakeibo/__init__.py
+index d8ec261..e73445e 100644
+--- a/src/kakeibo/__init__.py
++++ b/src/kakeibo/__init__.py
+@@ -9,11 +9,12 @@ from pathlib import Path
+ from kakeibo.core import (
+     BudgetError,
+     CsvError,
+-    find_overruns,
++    find_budget_alerts,
+     load_budget,
+     load_csv,
+     monthly_totals,
+     total_by_category,
++    usage_percent,
+ )
+ 
+ 
+@@ -53,7 +54,11 @@ def main() -> None:
+         default="amount",
+         help="既定出力の並び順: amount=金額降順(既定) / name=カテゴリ名昇順(--report では無視)",
+     )
+-    p.add_argument("--budget", type=Path, help="予算 JSON(超過を stderr に警告)")
++    p.add_argument(
++        "--budget",
++        type=Path,
++        help="予算 JSON(超過を警告、90%% 以上は注意を stderr に出す。割合つき)",
++    )
+     args = p.parse_args()
+     budget = None
+     if args.budget is not None:
+@@ -103,8 +108,12 @@ def main() -> None:
+             if args.total:
+                 print(f"TOTAL\t{sum(totals_by_cat.values()):,}")
+     if budget is not None:
+-        for month, cat, over, limit, actual in find_overruns(totals, budget):
+-            print(
+-                f"警告: {month} {cat} {over:,}円超過 (予算 {limit:,} / 実績 {actual:,})",
+-                file=sys.stderr,
++        for month, cat, over, limit, actual in find_budget_alerts(totals, budget):
++            pct = usage_percent(actual, limit)
++            tail = f" / {pct}%" if pct is not None else ""
++            head = (
++                f"警告: {month} {cat} {over:,}円超過"
++                if over
++                else f"注意: {month} {cat} 予算の{pct}%"
+             )
++            print(f"{head} (予算 {limit:,} / 実績 {actual:,}{tail})", file=sys.stderr)
+diff --git a/src/kakeibo/core.py b/src/kakeibo/core.py
+index 8c3cbab..e8231fe 100644
+--- a/src/kakeibo/core.py
++++ b/src/kakeibo/core.py
+@@ -122,14 +122,40 @@ def load_budget(path: Path) -> Budget:
+     return Budget(default, months)
+ 
+ 
+-def find_overruns(
++NEAR_LIMIT_PERCENT = 90
++
++
++def usage_percent(actual: int, limit: int) -> int | None:
++    """actual / limit in whole percent (rounded down); None when limit is 0."""
++    if limit == 0:
++        return None
++    return actual * 100 // limit
++
++
++def find_budget_alerts(
+     totals: dict[str, dict[str, int]], budget: Budget
+ ) -> list[tuple[str, str, int, int, int]]:
+-    """(month, category, over, limit, actual) for actual > limit."""
++    """(month, category, over, limit, actual) in month/category order.
++
++    over > 0 is an overrun; over == 0 is a near-limit notice
++    (actual >= NEAR_LIMIT_PERCENT% of a positive limit, not over it).
++    """
+     out: list[tuple[str, str, int, int, int]] = []
+     for month, cats in totals.items():
+         limits = budget.for_month(month)
+         for cat, actual in cats.items():
+-            if cat in limits and actual > limits[cat]:
+-                out.append((month, cat, actual - limits[cat], limits[cat], actual))
++            if cat not in limits:
++                continue
++            limit = limits[cat]
++            if actual > limit:
++                out.append((month, cat, actual - limit, limit, actual))
++            elif limit > 0 and actual * 100 >= limit * NEAR_LIMIT_PERCENT:
++                out.append((month, cat, 0, limit, actual))
+     return out
++
++
++def find_overruns(
++    totals: dict[str, dict[str, int]], budget: Budget
++) -> list[tuple[str, str, int, int, int]]:
++    """(month, category, over, limit, actual) for actual > limit."""
++    return [a for a in find_budget_alerts(totals, budget) if a[2] > 0]
+diff --git a/tests/test_budget.py b/tests/test_budget.py
+index 3420921..4a8fc50 100644
+--- a/tests/test_budget.py
++++ b/tests/test_budget.py
+@@ -7,9 +7,11 @@ from kakeibo import main
+ from kakeibo.core import (
+     BudgetError,
+     Expense,
++    find_budget_alerts,
+     find_overruns,
+     load_budget,
+     monthly_totals,
++    usage_percent,
+ )
+ 
+ HEADER = "date,category,amount,memo\n"
+@@ -104,7 +106,9 @@ def test_main_report(tmp_path, monkeypatch, capsys):
+     assert cap.out == (
+         "2026-10\tfood\t500\n2026-11\trent\t80000\n2026-11\tfood\t2000\n"
+     )
+-    assert cap.err == "警告: 2026-11 food 1,000円超過 (予算 1,000 / 実績 2,000)\n"
++    assert cap.err == (
++        "警告: 2026-11 food 1,000円超過 (予算 1,000 / 実績 2,000 / 200%)\n"
++    )
+ 
+ 
+ def test_main_budget_warns(tmp_path, monkeypatch, capsys):
+@@ -112,7 +116,51 @@ def test_main_budget_warns(tmp_path, monkeypatch, capsys):
+     assert _run(monkeypatch, _csv(tmp_path), "--budget", b) == 0
+     cap = capsys.readouterr()
+     assert cap.out == "rent\t80,000\nfood\t2,500\n"
+-    assert cap.err == ""  # 2026-11 food == 2000 は超過ではない
++    # 2026-11 food == 2000 は超過ではないが 100% なので注意
++    assert cap.err == "注意: 2026-11 food 予算の100% (予算 2,000 / 実績 2,000 / 100%)\n"
++
++
++@pytest.mark.parametrize(
++    ("actual", "limit", "expected"),
++    [
++        (899, 1000, []),  # 89.9% は出さない
++        (900, 1000, [("注意", 90)]),  # ちょうど 90%
++        (999, 1000, [("注意", 99)]),  # 切り捨て
++        (1000, 1000, [("注意", 100)]),
++        (1001, 1000, [("警告", 100)]),  # 超過は警告(割合は切り捨て)
++        (1500, 1000, [("警告", 150)]),
++        (0, 1000, []),
++        (-500, 1000, []),  # 返金で負でも落ちない
++        (0, 0, []),  # 予算 0 で使っていない
++        (5, 0, [("警告", None)]),  # 予算 0 は割合なしで超過のみ
++    ],
++)
++def test_budget_alert_thresholds(tmp_path, actual, limit, expected):
++    b = load_budget(_budget(tmp_path, {"default": {"food": limit}}))
++    got = find_budget_alerts({"2026-11": {"food": actual}}, b)
++    kinds = [("警告" if a[2] else "注意", usage_percent(a[4], a[3])) for a in got]
++    assert kinds == expected
++
++
++def test_main_alerts_interleave_in_month_order(tmp_path, monkeypatch, capsys):
++    body = (
++        "2026-10-01,food,950,\n2026-10-02,rent,100,\n"
++        "2026-11-01,food,1200,\n2026-11-02,rent,95000,\n2026-11-03,misc,9,\n"
++        "2026-12-01,food,100,\n2026-12-02,rent,0,\n"
++    )
++    b = _budget(
++        tmp_path,
++        {"default": {"food": 1000, "rent": 100000, "gym": 0, "misc": 0}},
++    )
++    assert _run(monkeypatch, _csv(tmp_path, body), "--budget", b) == 0
++    cap = capsys.readouterr()
++    assert cap.err.splitlines() == [
++        "注意: 2026-10 food 予算の95% (予算 1,000 / 実績 950 / 95%)",
++        "注意: 2026-11 rent 予算の95% (予算 100,000 / 実績 95,000 / 95%)",
++        "警告: 2026-11 food 200円超過 (予算 1,000 / 実績 1,200 / 120%)",
++        "警告: 2026-11 misc 9円超過 (予算 0 / 実績 9)",
++    ]
++    assert "注意" not in cap.out and "警告" not in cap.out
+ 
+ 
+ def test_main_bad_budget(tmp_path, monkeypatch, capsys):
