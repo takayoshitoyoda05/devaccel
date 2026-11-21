@@ -46,8 +46,9 @@ DEFAULTS: dict = {
     # strong = how many of the longest items run on sonnet (the slowest haiku unit set the wall clock and was
     # where the quality dips came from: same blind score as all-haiku at ~18% less time; 0 = all haiku)
     # max_jobs 0 = decide per machine at run time (memory and CPUs); unit_mem_mb = per-unit estimate
-    # (claude -p + its confined check; depends on the project's tools)
-    "parallel": {"auto_merge": False, "max_jobs": 0, "unit_mem_mb": 300, "strong": 1},
+    # (claude -p ~240 MB + its own check, then our confined check ~195 MB: measured; 300 ran a 7.8 GB WSL out of
+    # memory with 10 units)
+    "parallel": {"auto_merge": False, "max_jobs": 0, "unit_mem_mb": 500, "strong": 1},
     # sessions: when Claude stops with uncommitted code changes, ask once to open the evidence PR (devaccel-pr)
     "pr": {"auto": True},
 }

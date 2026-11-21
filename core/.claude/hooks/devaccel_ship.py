@@ -105,12 +105,13 @@ def main() -> int:
             print("(evidence is computed after the commit/integration; use --no-push to see it locally)")
             return 0
         return open_pr(root, title, notes, True)
+    fetched = False  # the base was fetched just now (the evidence then skips its own fetch)
     if a.branch and (not head or head in protected(root, cfg)):  # saves the parent its own git turns
         if a.branch in protected(root, cfg) or not re.fullmatch(r"\w[\w./-]*", a.branch) or ".." in a.branch:
             print(f"--branch {a.branch!r} is not a valid work branch name", file=sys.stderr)
             return 2
         base = cfg["scale"]["base_branch"]
-        sh(root, "fetch", "-q", "origin", base)
+        fetched = sh(root, "fetch", "-q", "origin", base).returncode == 0
         start = f"origin/{base}" if git(root, "rev-parse", "-q", "--verify", f"origin/{base}").strip() else base
         sw = sh(root, "switch", "--no-track", "-c", a.branch, start)  # no upstream: .git/config is not writable in the sandbox
         if sw.returncode != 0:
@@ -192,7 +193,7 @@ def main() -> int:
             print("push failed: " + (p.stderr.strip() or p.stdout.strip())[:300], file=sys.stderr)
             return 1
         return 0
-    rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
+    rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push, fetched=fetched)
     pool.shutdown()
     if redo:  # the evidence judged the commit before the fix: commit the fix, then judge that commit
         sh(root, "add", "-u")
@@ -201,7 +202,7 @@ def main() -> int:
         else:
             sh(root, "commit", "-q", "-m", title)
         fast, redo = None, []
-        rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
+        rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push, fetched=fetched)
     if rc == 0:  # used: a later ship must never reuse these notes (a failed Write would ship stale ones)
         nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
         if root.resolve() in nf.resolve().parents:

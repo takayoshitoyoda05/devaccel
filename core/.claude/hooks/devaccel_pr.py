@@ -237,10 +237,12 @@ def static_triage(root: Path, cfg: dict, base: str, ref: str,
     return files, reasons, risky
 
 
-def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1) -> dict:
+def collect(root: Path, cfg: dict, base_branch: str, notes: str, units: int = 1, fetched: bool = False) -> dict:
     head = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
-    # best effort: judge against the latest base. The fetch overlaps the snapshot export (which needs only HEAD)
-    fetch = subprocess.Popen(["git", "-C", str(root), "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+    # best effort: judge against the latest base. The fetch overlaps the snapshot export (which needs only HEAD);
+    # skipped when the caller fetched the base seconds ago (ship creating the work branch: ~1.3 s each)
+    fetch = subprocess.Popen(["true"] if fetched else
+                             ["git", "-C", str(root), "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
                               "fetch", "-q", "origin", base_branch], stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     snap_dir = tempfile.TemporaryDirectory(prefix="devaccel-pr-")
@@ -377,7 +379,8 @@ def stamp(label: str, t0: float) -> float:
     return now
 
 
-def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1, before_publish=None) -> int:
+def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1, before_publish=None,
+            fetched: bool = False) -> int:
     """Build the evidence for HEAD, triage it, and create/update the PR (shared with devaccel_ship.py)."""
     cfg = load_config(trusted_root({"cwd": str(root)}))  # never the unit's own project.json
     par = cfg.get("parallel", {})
@@ -400,7 +403,7 @@ def open_pr(root: Path, title: str, notes: str, dry_run: bool, units: int = 1, b
                                              d], **bg) for n, (c, d) in LABELS.items()]
         early["view"] = subprocess.Popen(["gh", "pr", "view", head0, "-R", repo0, "--json",
                                           "url,state,headRefOid,baseRefName,isCrossRepository,labels"], **bg)
-    ev = collect(root, cfg, cfg["scale"]["base_branch"], notes, units)
+    ev = collect(root, cfg, cfg["scale"]["base_branch"], notes, units, fetched)
     t = stamp("evidence (snapshot + base check + triage)", t)
     body = render(ev, notes)
     if SECRET.search(body):  # check output and acceptance criteria end up in the body too
