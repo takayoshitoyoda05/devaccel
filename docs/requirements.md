@@ -170,6 +170,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | SHIP-06 | `--branch` は保護ブランチ上でだけ、origin/<base> から作業ブランチを作って切り替えなければならない(main 自体は動かさない)。保護ブランチ名・不正な名前は拒否。 | 0.11.0 | unit |
 | SHIP-07 | `--check` は作業ツリーで check.sh fast を先に実行し、失敗したら何も commit・push せず失敗した段の末尾を出さなければならない(PR の証拠の計算は変えない)。 | 0.15.0 | unit |
 | SHIP-08 | `--check --units` は部品のブランチを作業ブランチ(親の未コミットの変更を含む)に統合してから全体を検査し、通るまで commit・push しない。出荷後、HEAD に含まれる `unit/` ブランチを消す。 | 0.15.0 | unit |
+| SHIP-09 | `--check` の check.sh fast は、ローカルの commit の後に PR の証拠(check.sh full)と並べて実行してよい。fast が落ちたら commit を取り消し(新規ファイルは未追跡に戻る)、push しない。fast が自動修正したら、修正を commit してその commit で証拠を取り直す。 | 0.15.1 | unit |
 | BATCH-EDGE | 関数の型が書かれていない番号付きの件の単位には、件が触れる端のケースの節(最大 2 つ)を渡す。型まで書かれた件には渡さない。 | 0.15.0 | unit |
 | BATCH-01 | `devaccel_batch.py` は単位ごとに `<main>/.claude/worktrees/<x>` を作り、`claude -p` を同時に起動しなければならない。Claude Code のサンドボックスの中(入れ子の bwrap が起動できない)では、単位を起動する前に拒否する。 | 0.12.0 / 0.13.0 | integration |
 | BATCH-02 | 単位を統合するのは、コミットがあり、かつスクリプト自身がそのコミットを本体の check.sh fast で隔離して検査して通り、検査の前後で木が変わらなかったものだけでなければならない(単位が書けるゲートの記録は信用しない)。 | 0.12.0 / 0.13.0(監査 M2) | integration |
@@ -179,6 +180,8 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | BATCH-07 | 単位の自由文(報告)は、端末とPR本文に出す前に制御文字・双方向文字を除き、PR 本文ではコードスパンに入れなければならない。単位ごとに時間とターン数の上限を持ち、中断時もプロセス・worktree・単位ブランチを後始末しなければならない。 | 0.13.0(監査 M4/M5) | integration |
 | PR-13 | 対話セッションが未コミットのコード変更を残して止まるとき(`pr.auto`、既定 on)、1 回だけ止めて devaccel-pr での PR 化を促さなければならない。同じ状態でもう一度止まれば通す(ユーザーが PR 不要と言った場合に従える)。 | 0.13.0(ユーザー方針) | unit |
 | BATCH-05 | 同時に走らせる単位の数は固定値であってはならない。`--jobs` > `project.json` の `parallel.max_jobs` > 実行時のマシン(空きメモリ × 0.8 ÷ `parallel.unit_mem_mb`、CPU 数 × 2)の順に決め、決めた数と根拠を表示しなければならない。 | 0.12.1(ユーザー方針) | unit |
+| BATCH-STRONG | 一番長い件 `parallel.strong` 件(既定 1)は sonnet の単位で走らせる。単位の worktree を作った直後に、その作業ツリーの仮想環境(`uv.lock` があれば `uv sync`)を隔離して準備し始めてよい(作業ツリーはまだ開始コミットのまま)。WSL では単位の `claude` を `WSL_INTEROP` 空で起動する(起動時の reg.exe 問い合わせが約 5 秒止まる)。 | 0.15.1 | unit |
+| GUARD-SHIPFIX | ガードは、ship の呼び出しに付いた末尾の `2>&1 \| tail -N` と先頭の `git checkout -b X &&` だけを外し(`--branch X` に置き換え)、その形が単独の ship としてガードに通るときに限り、書き換えて実行させてよい。それ以外の形は従来どおり拒否する。 | 0.15.1 | unit |
 
 ### 2.8 LAND(`devaccel_land.py`)
 

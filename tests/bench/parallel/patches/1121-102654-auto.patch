@@ -1,0 +1,356 @@
+diff --git a/src/kakeibo/recurring.py b/src/kakeibo/recurring.py
+new file mode 100644
+index 0000000..f9a3936
+--- /dev/null
++++ b/src/kakeibo/recurring.py
+@@ -0,0 +1,147 @@
++"""毎月決まって出ていく支出(サブスク・家賃など)の検出と、次回予定日の推定。
++
++純粋な関数のみ。入力は core.Expense(新しい型は作らない)。
++
++判断(D):
++D1: 同一の系列 = 同じカテゴリ + 正規化したメモ。正規化は NFKC・大文字小文字無視・
++    空白の畳み込み・末尾の番号(`#12` `3`)の除去。メモが空ならカテゴリだけで束ねる。
++D2: 金額が 0 以下(返金・0 円)の明細は系列に混ぜず無視する。
++D3: 同じ系列でも金額が前回から `amount_tolerance`(既定 10%)以内なら同じ系列
++    (値上げ・端数の揺れを許す)。超えるものは別系列(5 日と 20 日の別サブスクを分離)。
++D4: 同じ月に 2 回あるものは同一系列に入れず、別系列に振り分ける。
++D5: 繰り返しとみなす条件 = 末尾から連続した月が `min_months`(既定 3、下限 2)以上。
++    途中で月が欠けたら、欠けた後の連続部分だけを数える。
++D6: 基準日 = 末尾の連続部分の日の最大値。次回 = 最後の月の翌月のその日。
++    翌月に存在しない日は月末に丸める(31 日 → 2/28 または閏年 2/29)。12 月の次は翌年 1 月。
++D7: `as_of` を渡すと、次回予定日が `as_of` より前のもの(解約済みとみなす)を除く。
++    当日は含める。None なら除かない。
++D8: 引数の検査: `min_months` は bool 不可の int で 2 以上、`amount_tolerance` は
++    bool 不可・nan 不可の 0 以上 1 未満の数、`as_of` は date(datetime 不可)か None、
++    rows の要素は Expense。違反は TypeError(型)/ ValueError(範囲)。
++D9: 金額は円の整数のまま扱う。系列の金額・メモは最新の明細のもの。
++D10: 並びは次回予定日 → カテゴリ → メモ の昇順(安定)。空入力は空リスト。
++"""
++
++from __future__ import annotations
++
++import calendar
++import math
++import re
++import unicodedata
++from collections.abc import Iterable
++from dataclasses import dataclass
++from datetime import date
++
++from .core import Expense
++
++
++@dataclass(frozen=True)
++class Recurring:
++    category: str
++    memo: str  # 最新の明細のメモ(元の表記)
++    amount: int  # 最新の金額(円)
++    months: int  # 末尾の連続した月の数
++    last_date: date
++    next_date: date
++
++
++_TRAILING_NO = re.compile(r"[\s#]*[0-9]+$")
++
++
++def _normalize_memo(memo: str) -> str:
++    s = unicodedata.normalize("NFKC", memo).casefold()
++    s = " ".join(s.split())
++    s = _TRAILING_NO.sub("", s)
++    return s.strip()
++
++
++def _month_index(d: date) -> int:
++    return d.year * 12 + d.month - 1
++
++
++def _next_month_date(last: date, day: int) -> date:
++    idx = _month_index(last) + 1
++    year, month = divmod(idx, 12)
++    month += 1
++    return date(year, month, min(day, calendar.monthrange(year, month)[1]))
++
++
++def _validate(
++    min_months: object, amount_tolerance: object, as_of: object
++) -> tuple[int, float, date | None]:
++    if isinstance(min_months, bool) or not isinstance(min_months, int):
++        raise TypeError("min_months は int である必要があります")
++    if min_months < 2:
++        raise ValueError("min_months は 2 以上である必要があります")
++    if isinstance(amount_tolerance, bool) or not isinstance(
++        amount_tolerance, (int, float)
++    ):
++        raise TypeError("amount_tolerance は数値である必要があります")
++    if math.isnan(amount_tolerance) or not 0 <= amount_tolerance < 1:
++        raise ValueError("amount_tolerance は 0 以上 1 未満である必要があります")
++    if as_of is not None and (not isinstance(as_of, date) or hasattr(as_of, "hour")):
++        raise TypeError("as_of は date か None である必要があります")
++    return min_months, float(amount_tolerance), as_of
++
++
++def find_recurring(
++    rows: Iterable[Expense],
++    *,
++    min_months: int = 3,
++    amount_tolerance: float = 0.1,
++    as_of: date | None = None,
++) -> list[Recurring]:
++    """毎月繰り返す支出を見つけ、次回予定日つきで返す(D1〜D10)。"""
++    min_months, tol, as_of = _validate(min_months, amount_tolerance, as_of)
++    items = list(rows)
++    for e in items:
++        if not isinstance(e, Expense):
++            raise TypeError("rows の要素は Expense である必要があります")
++
++    # D1/D2: カテゴリ+メモで束ねる(返金・0 円は除く)
++    groups: dict[tuple[str, str], list[Expense]] = {}
++    for e in sorted(items, key=lambda x: x.day):
++        if e.amount <= 0:
++            continue
++        groups.setdefault((e.category, _normalize_memo(e.memo)), []).append(e)
++
++    found: list[Recurring] = []
++    for entries in groups.values():
++        # D3/D4: 金額の近さと月の重複で系列に振り分ける
++        series: list[list[Expense]] = []
++        for e in entries:
++            for s in series:
++                last = s[-1]
++                if _month_index(e.day) != _month_index(last.day) and (
++                    abs(e.amount - last.amount) <= tol * last.amount
++                ):
++                    s.append(e)
++                    break
++            else:
++                series.append([e])
++        for s in series:
++            # D5: 末尾から連続した月だけを数える
++            run = [s[-1]]
++            for e in reversed(s[:-1]):
++                if _month_index(run[0].day) - _month_index(e.day) == 1:
++                    run.insert(0, e)
++                else:
++                    break
++            if len(run) < min_months:
++                continue
++            latest = run[-1]
++            nxt = _next_month_date(latest.day, max(x.day.day for x in run))
++            if as_of is not None and nxt < as_of:  # D7
++                continue
++            found.append(
++                Recurring(
++                    category=latest.category,
++                    memo=latest.memo,
++                    amount=latest.amount,
++                    months=len(run),
++                    last_date=latest.day,
++                    next_date=nxt,
++                )
++            )
++    found.sort(key=lambda r: (r.next_date, r.category, r.memo))
++    return found
+diff --git a/tests/test_recurring.py b/tests/test_recurring.py
+new file mode 100644
+index 0000000..be1a83a
+--- /dev/null
++++ b/tests/test_recurring.py
+@@ -0,0 +1,197 @@
++from datetime import date, datetime
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.recurring import Recurring, find_recurring
++
++
++def E(ymd: str, cat: str, amount: int, memo: str = "") -> Expense:
++    return Expense(date.fromisoformat(ymd), cat, amount, memo)
++
++
++def monthly(cat: str, amount: int, memo: str, months: list[str], day: int = 5):
++    return [E(f"{m}-{day:02d}", cat, amount, memo) for m in months]
++
++
++def test_basic_monthly_and_next_date():
++    rows = monthly("サブスク", 1490, "Netflix", ["2026-01", "2026-02", "2026-03"])
++    assert find_recurring(rows) == [
++        Recurring("サブスク", "Netflix", 1490, 3, date(2026, 3, 5), date(2026, 4, 5))
++    ]
++
++
++def test_empty_input():
++    assert find_recurring([]) == []
++
++
++def test_too_few_months_not_recurring():
++    rows = monthly("家賃", 80000, "家賃", ["2026-01", "2026-02"])
++    assert find_recurring(rows) == []
++    assert len(find_recurring(rows, min_months=2)) == 1
++
++
++def test_gap_resets_run():
++    rows = monthly("a", 500, "x", ["2026-01", "2026-02", "2026-04", "2026-05"])
++    assert find_recurring(rows) == []
++    rows += monthly("a", 500, "x", ["2026-06"])
++    (r,) = find_recurring(rows)
++    assert r.months == 3 and r.next_date == date(2026, 7, 5)
++
++
++def test_month_end_clamped_and_anchor_is_max_day():
++    rows = [
++        E("2026-01-31", "c", 100, "m"),
++        E("2026-02-28", "c", 100, "m"),
++        E("2026-03-31", "c", 100, "m"),
++    ]
++    (r,) = find_recurring(rows)
++    assert r.next_date == date(2026, 4, 30)
++    rows = [
++        E("2023-12-30", "c", 100),
++        E("2024-01-31", "c", 100),
++        E("2024-02-29", "c", 100),
++        E("2023-11-30", "c", 100),
++    ]
++    (r,) = find_recurring(rows)
++    assert r.next_date == date(2024, 3, 31)
++
++
++def test_leap_february():
++    rows = [E("2023-12-30", "c", 1), E("2024-01-30", "c", 1), E("2024-02-29", "c", 1)]
++    (r,) = find_recurring(rows)
++    assert r.next_date == date(2024, 3, 30)
++    rows = [
++        E("2024-10-31", "c", 1),
++        E("2024-11-30", "c", 1),
++        E("2024-12-31", "c", 1),
++        E("2025-01-31", "c", 1),
++    ]
++    (r,) = find_recurring(rows)
++    assert r.next_date == date(2025, 2, 28)
++
++
++def test_december_to_january():
++    rows = monthly("c", 100, "m", ["2025-10", "2025-11", "2025-12"])
++    (r,) = find_recurring(rows)
++    assert r.next_date == date(2026, 1, 5)
++
++
++def test_memo_normalization():
++    rows = [
++        E("2026-01-05", "c", 100, "ＮＥＴＦＬＩＸ  #1"),
++        E("2026-02-05", "c", 100, "netflix 2"),
++        E("2026-03-05", "c", 100, "Netflix"),
++    ]
++    (r,) = find_recurring(rows)
++    assert r.months == 3 and r.memo == "Netflix"
++
++
++def test_same_category_different_memo_are_separate():
++    rows = monthly("サブスク", 1000, "A", ["2026-01", "2026-02", "2026-03"]) + monthly(
++        "サブスク", 1000, "B", ["2026-01", "2026-02", "2026-03"], day=20
++    )
++    res = find_recurring(rows)
++    assert [(r.memo, r.next_date) for r in res] == [
++        ("A", date(2026, 4, 5)),
++        ("B", date(2026, 4, 20)),
++    ]
++
++
++def test_same_memo_same_month_split_by_amount():
++    months = ["2026-01", "2026-02", "2026-03"]
++    rows = monthly("c", 1000, "", months) + monthly("c", 5000, "", months, day=20)
++    res = find_recurring(rows)
++    assert sorted(r.amount for r in res) == [1000, 5000]
++
++
++def test_two_in_same_month_similar_amount_become_two_series():
++    months = ["2026-01", "2026-02", "2026-03"]
++    rows = monthly("c", 1000, "m", months) + monthly("c", 1050, "m", months, day=20)
++    assert len(find_recurring(rows)) == 2
++
++
++def test_price_increase_within_tolerance_same_series():
++    rows = [
++        E("2026-01-05", "c", 1000, "m"),
++        E("2026-02-05", "c", 1000, "m"),
++        E("2026-03-05", "c", 1080, "m"),
++    ]
++    (r,) = find_recurring(rows)
++    assert r.amount == 1080 and r.months == 3
++
++
++def test_big_change_breaks_series():
++    rows = [
++        E("2026-01-05", "c", 1000, "m"),
++        E("2026-02-05", "c", 1000, "m"),
++        E("2026-03-05", "c", 3000, "m"),
++    ]
++    assert find_recurring(rows) == []
++    assert len(find_recurring(rows, amount_tolerance=0.0)) == 0
++
++
++def test_refund_and_zero_ignored():
++    rows = monthly("c", 100, "m", ["2026-01", "2026-02", "2026-03"]) + [
++        E("2026-04-05", "c", -100, "m"),
++        E("2026-04-06", "c", 0, "m"),
++    ]
++    (r,) = find_recurring(rows)
++    assert r.last_date == date(2026, 3, 5)
++
++
++def test_as_of_drops_lapsed_inclusive():
++    rows = monthly("c", 100, "m", ["2026-01", "2026-02", "2026-03"])
++    assert find_recurring(rows, as_of=date(2026, 4, 5)) != []
++    assert find_recurring(rows, as_of=date(2026, 4, 6)) == []
++    assert find_recurring(rows, as_of=None) != []
++
++
++def test_sort_by_next_date_then_category():
++    months = ["2026-01", "2026-02", "2026-03"]
++    rows = (
++        monthly("b", 1, "x", months, day=10)
++        + monthly("z", 1, "x", months, day=3)
++        + monthly("a", 1, "x", months, day=10)
++    )
++    assert [r.category for r in find_recurring(rows)] == ["z", "a", "b"]
++
++
++def test_accepts_iterable_and_unsorted():
++    rows = monthly("c", 100, "m", ["2026-03", "2026-01", "2026-02"])
++    assert len(find_recurring(iter(rows))) == 1
++
++
++@pytest.mark.parametrize("bad", [True, 3.0, "3", None])
++def test_min_months_type(bad):
++    with pytest.raises(TypeError, match="min_months"):
++        find_recurring([], min_months=bad)
++
++
++@pytest.mark.parametrize("bad", [1, 0, -1])
++def test_min_months_range(bad):
++    with pytest.raises(ValueError, match="min_months"):
++        find_recurring([], min_months=bad)
++
++
++@pytest.mark.parametrize("bad", [True, "0.1", None])
++def test_tolerance_type(bad):
++    with pytest.raises(TypeError, match="amount_tolerance"):
++        find_recurring([], amount_tolerance=bad)
++
++
++@pytest.mark.parametrize("bad", [-0.1, 1, 1.5, float("nan")])
++def test_tolerance_range(bad):
++    with pytest.raises(ValueError, match="amount_tolerance"):
++        find_recurring([], amount_tolerance=bad)
++
++
++@pytest.mark.parametrize("bad", ["2026-01-01", datetime(2026, 1, 1)])
++def test_as_of_type(bad):
++    with pytest.raises(TypeError, match="as_of"):
++        find_recurring([], as_of=bad)
++
++
++def test_row_type():
++    with pytest.raises(TypeError, match="Expense"):
++        find_recurring([("2026-01-01", "c", 1)])  # type: ignore[list-item]

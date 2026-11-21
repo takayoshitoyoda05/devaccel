@@ -396,7 +396,20 @@ def main() -> int:
     # dual track (tester || implementer per item) is experimental and off: measured slower, costlier and with
     # many refused items (implementers rewrote the spec tests). Kept behind parallel.dual_track for research only
     dual = bool(cfg["parallel"].get("dual_track"))
-    strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong)])
+    strong = set(sorted(range(1, len(items) + 1), key=lambda n: -len(items[n - 1]))[: max(0, a.strong or int(cfg["parallel"].get("strong") or 0))])
+    warming: list[subprocess.Popen] = []
+
+    def warm_env(wt: Path) -> None:
+        """Build the unit's .venv while its claude starts and thinks (measured 5-6 s at its first pytest). The
+        tree is still the start commit (base code, not the unit's), and it runs confined like the checks."""
+        if not (wt / "uv.lock").exists():
+            return
+        from devaccel_common import confined
+        wrapped = confined(["uv", "sync", "-q"], wt, [wt / ".claude"])
+        if wrapped is not None:
+            warming.append(subprocess.Popen(wrapped[0], env=wrapped[1], cwd=wt, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
     def add_item(i: int, it: str) -> bool:
         """Worktree(s) and command for item i; False if a worktree could not be made."""
         ctx = "" if a.no_context else context_files(root, head + "\n" + it)
@@ -448,6 +461,7 @@ def main() -> int:
             if r.returncode != 0:
                 print(f"worktree for unit {i} failed: {r.stderr.strip()[:200]}", file=sys.stderr)
                 return False
+            warm_env(wt)
             if example_ids(it):  # the unit's own gate checks these at Stop (feedback); settle re-checks (authority)
                 write_nofollow(wt / ".devaccel" / "expected-ids", "\n".join(example_ids(it)) + "\n")
             u = {"i": i, "k": k, "branch": br, "wt": wt, "cmd": cmd}
@@ -585,6 +599,9 @@ def main() -> int:
     # a fresh session per unit: drop the parent session's markers (the anchor comes from the worktree path)
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")}
+    if "WSL_INTEROP" in env:  # WSL: claude asks Windows' registry for managed settings via reg.exe at start, which
+        env["WSL_INTEROP"] = ""  # often hangs until its ~5 s bound (measured 4.9 s of a 10 s start); a unit never
+        # runs Windows programs, and without interop the lookup is skipped (start 10 s -> 4.4 s)
     think = os.environ.get("DEVACCEL_UNIT_THINK") or str(cfg["parallel"].get("unit_think_tokens") or "")
     if think.isdigit():  # cap the units' thinking (the slowest unit spent 40-50 s thinking before its first write)
         env["MAX_THINKING_TOKENS"] = think
@@ -710,6 +727,10 @@ def main() -> int:
         raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+        for w in warming:  # long done by now (a unit runs for minutes); never left behind
+            if w.poll() is None:
+                w.kill()
+            w.wait()
 
     ok, lines, cost = [], [], 0.0
     log = root / ".devaccel" / f"batch-{slug}.log"

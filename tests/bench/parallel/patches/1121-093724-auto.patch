@@ -1,0 +1,260 @@
+diff --git a/src/kakeibo/budget.py b/src/kakeibo/budget.py
+new file mode 100644
+index 0000000..d018c45
+--- /dev/null
++++ b/src/kakeibo/budget.py
+@@ -0,0 +1,66 @@
++"""Budget check: compare monthly category totals with monthly budgets.
++
++Pure functions only. Reuses ``Budget`` (limits per month) from ``kakeibo.core``.
++
++Decisions:
++D1: actual > limit is "over"; actual == limit is "warn", not "over".
++    e.g. limit 10000: 10000 -> warn (remaining 0), 10001 -> over (remaining -1).
++D2: "warn" iff actual*100 >= limit*warn_percent and actual <= limit (integers only).
++    e.g. limit 10000, warn_percent 80: 8000 -> warn, 7999 -> ok.
++    warn_percent=100 warns only when actual == limit. 1 and 100 are accepted.
++D3: limit 0: actual 0 -> "ok", actual > 0 -> "over".
++D4: actual <= 0 (refunds can make a total negative) is "ok";
++    remaining = limit - actual (limit 5000, actual -300 -> 5300).
++D5: categories without a limit in that month are not reported.
++D6: a category with a limit but no spending in a month present in totals is
++    reported with actual 0 and "ok"; months absent from totals are not reported.
++D7: limits come from ``budget.for_month(month)`` (month override beats default).
++D8: order: over, warn, ok; within a status by (month, category) ascending.
++D9: empty totals or empty budget -> empty list.
++D10: inputs are never modified.
++D11: warn_percent is validated even when totals is empty: bool/non-int ->
++    TypeError, outside 1..100 -> ValueError (message names warn_percent).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from kakeibo.core import Budget
++
++_ORDER = {"over": 0, "warn": 1, "ok": 2}
++
++
++@dataclass(frozen=True)
++class BudgetStatus:
++    month: str
++    category: str
++    limit: int  # yen
++    actual: int  # yen
++    remaining: int  # limit - actual (negative when over)
++    status: str  # "over" | "warn" | "ok"
++
++
++def check_budget(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    warn_percent: int = 80,
++) -> list[BudgetStatus]:
++    if isinstance(warn_percent, bool) or not isinstance(warn_percent, int):
++        raise TypeError("warn_percent は整数である必要があります")
++    if not 1 <= warn_percent <= 100:
++        raise ValueError("warn_percent は 1 以上 100 以下である必要があります")
++
++    out: list[BudgetStatus] = []
++    for month, cats in totals.items():
++        for cat, limit in budget.for_month(month).items():
++            actual = cats.get(cat, 0)
++            if actual > limit:
++                status = "over"
++            elif actual > 0 and actual * 100 >= limit * warn_percent:
++                status = "warn"
++            else:
++                status = "ok"
++            out.append(BudgetStatus(month, cat, limit, actual, limit - actual, status))
++    out.sort(key=lambda s: (_ORDER[s.status], s.month, s.category))
++    return out
+diff --git a/tests/test_budget_check.py b/tests/test_budget_check.py
+new file mode 100644
+index 0000000..7971d18
+--- /dev/null
++++ b/tests/test_budget_check.py
+@@ -0,0 +1,182 @@
++import copy
++
++import pytest
++
++from kakeibo.budget import BudgetStatus, check_budget
++from kakeibo.core import Budget
++
++
++def _budget(default=None, months=None):
++    return Budget(default=dict(default or {}), months=dict(months or {}))
++
++
++def test_d1_actual_equal_limit_is_warn_not_over():
++    b = _budget({"食費": 10000})
++    result = check_budget({"2026-01": {"食費": 10000}}, b)
++    assert result == [BudgetStatus("2026-01", "食費", 10000, 10000, 0, "warn")]
++
++
++def test_d1_actual_above_limit_is_over_with_negative_remaining():
++    b = _budget({"食費": 10000})
++    result = check_budget({"2026-01": {"食費": 10001}}, b)
++    assert result == [BudgetStatus("2026-01", "食費", 10000, 10001, -1, "over")]
++
++
++def test_d2_warn_starts_at_threshold_with_default_80_percent():
++    b = _budget({"食費": 10000})
++    at = check_budget({"2026-01": {"食費": 8000}}, b)
++    below = check_budget({"2026-01": {"食費": 7999}}, b)
++    assert at[0].status == "warn"
++    assert below[0].status == "ok"
++
++
++def test_d2_warn_percent_100_only_equal_limit_is_warn():
++    b = _budget({"食費": 10000})
++    totals = {"2026-01": {"食費": 9999}}
++    assert check_budget(totals, b, warn_percent=100)[0].status == "ok"
++    eq = check_budget({"2026-01": {"食費": 10000}}, b, warn_percent=100)
++    assert eq[0].status == "warn"
++
++
++def test_d2_warn_percent_1_and_100_are_accepted():
++    b = _budget({"食費": 10000})
++    low = check_budget({"2026-01": {"食費": 100}}, b, warn_percent=1)
++    assert low[0].status == "warn"
++    ok = check_budget({"2026-01": {"食費": 99}}, b, warn_percent=1)
++    assert ok[0].status == "ok"
++    high = check_budget({"2026-01": {"食費": 10000}}, b, warn_percent=100)
++    assert high[0].status == "warn"
++
++
++def test_d3_zero_limit_with_zero_actual_is_ok():
++    b = _budget({"食費": 0})
++    result = check_budget({"2026-01": {"食費": 0}}, b)
++    assert result == [BudgetStatus("2026-01", "食費", 0, 0, 0, "ok")]
++
++
++def test_d3_zero_limit_with_positive_actual_is_over():
++    b = _budget({"食費": 0})
++    result = check_budget({"2026-01": {"食費": 1}}, b)
++    assert result == [BudgetStatus("2026-01", "食費", 0, 1, -1, "over")]
++
++
++def test_d4_negative_actual_from_refund_is_ok_with_remaining_above_limit():
++    b = _budget({"食費": 5000})
++    result = check_budget({"2026-01": {"食費": -300}}, b)
++    assert result == [BudgetStatus("2026-01", "食費", 5000, -300, 5300, "ok")]
++
++
++def test_d4_zero_actual_is_ok():
++    b = _budget({"食費": 5000})
++    result = check_budget({"2026-01": {"食費": 0}}, b)
++    assert result[0].status == "ok"
++    assert result[0].remaining == 5000
++
++
++def test_d5_category_without_budget_is_excluded():
++    b = _budget({"食費": 1000})
++    result = check_budget({"2026-01": {"食費": 100, "趣味": 5000}}, b)
++    assert [s.category for s in result] == ["食費"]
++
++
++def test_d6_budgeted_category_without_spending_is_included_as_ok():
++    b = _budget({"食費": 1000, "家賃": 80000})
++    result = check_budget({"2026-01": {"食費": 500}}, b)
++    assert BudgetStatus("2026-01", "家賃", 80000, 0, 80000, "ok") in result
++    assert len(result) == 2
++
++
++def test_d6_months_absent_from_totals_are_not_reported():
++    b = _budget({"食費": 1000})
++    result = check_budget({"2026-01": {"食費": 500}}, b)
++    assert {s.month for s in result} == {"2026-01"}
++
++
++def test_d7_month_override_takes_precedence_over_default():
++    b = _budget({"食費": 30000}, {"2026-02": {"食費": 50000}})
++    totals = {
++        "2026-01": {"食費": 40000},
++        "2026-02": {"食費": 40000},
++    }
++    result = check_budget(totals, b)
++    by_month = {s.month: s for s in result}
++    assert by_month["2026-01"].limit == 30000
++    assert by_month["2026-01"].status == "over"
++    assert by_month["2026-02"].limit == 50000
++    assert by_month["2026-02"].remaining == 10000
++    assert by_month["2026-02"].status == "warn"
++
++
++def test_d8_ordering_by_status_weight_then_month_then_category():
++    b = _budget({"食費": 10000, "交通費": 5000, "家賃": 80000})
++    totals = {
++        "2026-02": {"食費": 8000, "交通費": 6000, "家賃": 1000},
++        "2026-01": {"食費": 12000, "交通費": 3000},
++    }
++    result = check_budget(totals, b)
++    assert [(s.month, s.category, s.status) for s in result] == [
++        ("2026-01", "食費", "over"),
++        ("2026-02", "交通費", "over"),
++        ("2026-02", "食費", "warn"),
++        ("2026-01", "交通費", "ok"),
++        ("2026-01", "家賃", "ok"),
++        ("2026-02", "家賃", "ok"),
++    ]
++
++
++def test_d9_empty_totals_returns_empty_list():
++    assert check_budget({}, _budget({"食費": 1000})) == []
++
++
++def test_d9_empty_budget_returns_empty_list():
++    assert check_budget({"2026-01": {"食費": 500}}, _budget({}, {})) == []
++
++
++def test_d10_inputs_are_not_mutated():
++    totals = {"2026-01": {"食費": 8000, "交通費": -300}}
++    b = _budget({"食費": 10000, "交通費": 5000}, {"2026-01": {"食費": 9000}})
++    totals_before = copy.deepcopy(totals)
++    budget_before = copy.deepcopy(b)
++    check_budget(totals, b)
++    assert totals == totals_before
++    assert b == budget_before
++
++
++def test_d11_warn_percent_bool_true_is_type_error():
++    with pytest.raises(TypeError, match="warn_percent"):
++        check_budget({}, _budget(), warn_percent=True)
++
++
++def test_d11_warn_percent_bool_false_is_type_error():
++    with pytest.raises(TypeError, match="warn_percent"):
++        check_budget({}, _budget(), warn_percent=False)
++
++
++def test_d11_warn_percent_float_is_type_error():
++    with pytest.raises(TypeError, match="warn_percent"):
++        check_budget({}, _budget(), warn_percent=80.0)  # type: ignore[arg-type]
++
++
++def test_d11_warn_percent_str_is_type_error():
++    with pytest.raises(TypeError, match="warn_percent"):
++        check_budget({}, _budget(), warn_percent="80")  # type: ignore[arg-type]
++
++
++def test_d11_warn_percent_zero_is_value_error():
++    with pytest.raises(ValueError, match="warn_percent"):
++        check_budget({}, _budget(), warn_percent=0)
++
++
++def test_d11_warn_percent_101_is_value_error():
++    with pytest.raises(ValueError, match="warn_percent"):
++        check_budget({}, _budget(), warn_percent=101)
++
++
++def test_d11_warn_percent_negative_is_value_error():
++    with pytest.raises(ValueError, match="warn_percent"):
++        check_budget({}, _budget(), warn_percent=-5)
++
++
++def test_d11_warn_percent_validated_even_when_totals_are_empty():
++    with pytest.raises(ValueError, match="warn_percent"):
++        check_budget({}, _budget({}, {}), warn_percent=0)

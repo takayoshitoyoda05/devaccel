@@ -1,0 +1,196 @@
+diff --git a/src/kakeibo/budget_alert.py b/src/kakeibo/budget_alert.py
+new file mode 100644
+index 0000000..263ae47
+--- /dev/null
++++ b/src/kakeibo/budget_alert.py
+@@ -0,0 +1,92 @@
++"""Budget alerts: flag categories that are over budget or close to it.
++
++Pure functions over monthly totals (``core.monthly_totals``) and the existing
++``core.Budget`` (reused, not redefined).
++
++Decisions:
++D1: ``core.Budget`` と ``Budget.for_month`` を再利用する(月別の上書きは for_month が解決)。
++D2: 超過 = 実績 > 上限(find_overruns と同じ)。実績 == 上限は「超過」ではなく「もうすぐ」。
++D3: 「もうすぐ」= 実績 * 100 >= 上限 * warn_percent かつ超過でない。整数演算のみで、
++    浮動小数点の誤差を避ける。warn_percent の既定は 80。
++D4: warn_percent は 1〜100 の int。bool・float・str・None は TypeError、範囲外は ValueError。
++    100 を受けるので「ちょうど上限に達したときだけ知らせる」設定ができる。
++D5: 上限 0 の予算は、実績 0 なら通知なし、実績 > 0 なら超過。
++D6: 返金などで実績が 0 以下のカテゴリは、上限に関わらず通知しない(0 以下は使いすぎではない)。
++D7: 予算の無いカテゴリは対象外(find_overruns と同じ)。予算があるが支出の無い月・
++    カテゴリは通知なし。totals に無い月は評価しない。
++D8: 結果は通知対象だけ。月の昇順 → 超過が先 → 超過額/使用率の大きい順 → カテゴリ名。
++    ``remaining`` = 上限 - 実績(超過なら負)。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from kakeibo.core import Budget
++
++OVER = "over"
++WARN = "warn"
++
++DEFAULT_WARN_PERCENT = 80
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    month: str
++    category: str
++    status: str  # OVER or WARN
++    limit: int
++    actual: int
++
++    @property
++    def remaining(self) -> int:
++        return self.limit - self.actual
++
++
++def _check_warn_percent(warn_percent: object) -> int:
++    if isinstance(warn_percent, bool) or not isinstance(warn_percent, int):
++        raise TypeError(
++            f"warn_percent は int である必要があります: {type(warn_percent).__name__}"
++        )
++    if not 1 <= warn_percent <= 100:
++        raise ValueError(f"warn_percent は 1〜100 である必要があります: {warn_percent}")
++    return warn_percent
++
++
++def classify(
++    actual: int, limit: int, warn_percent: int = DEFAULT_WARN_PERCENT
++) -> str | None:
++    """Return OVER, WARN or None for one category's actual vs. its limit."""
++    pct = _check_warn_percent(warn_percent)
++    if actual <= 0:
++        return None
++    if actual > limit:
++        return OVER
++    if actual * 100 >= limit * pct:
++        return WARN
++    return None
++
++
++def budget_alerts(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> list[BudgetAlert]:
++    """Alerts for every (month, category) that is over or near its budget."""
++    pct = _check_warn_percent(warn_percent)
++    alerts: list[BudgetAlert] = []
++    for month, cats in totals.items():
++        limits = budget.for_month(month)
++        for cat, actual in cats.items():
++            if cat not in limits:
++                continue
++            status = classify(actual, limits[cat], pct)
++            if status is not None:
++                alerts.append(BudgetAlert(month, cat, status, limits[cat], actual))
++
++    def key(a: BudgetAlert) -> tuple[str, int, float, str]:
++        # larger overage / usage first within a status
++        weight = -(a.actual - a.limit) if a.status == OVER else -(a.actual / a.limit)
++        return (a.month, 0 if a.status == OVER else 1, weight, a.category)
++
++    return sorted(alerts, key=key)
+diff --git a/tests/test_budget_alert.py b/tests/test_budget_alert.py
+new file mode 100644
+index 0000000..2c11c20
+--- /dev/null
++++ b/tests/test_budget_alert.py
+@@ -0,0 +1,92 @@
++import pytest
++
++from kakeibo.budget_alert import OVER, WARN, BudgetAlert, budget_alerts, classify
++from kakeibo.core import Budget
++
++
++def _b(default=None, months=None):
++    return Budget(default or {}, months or {})
++
++
++def test_over_warn_ok():
++    totals = {"2026-11": {"food": 10001, "fun": 8000, "rent": 5000}}
++    b = _b({"food": 10000, "fun": 10000, "rent": 10000})
++    got = budget_alerts(totals, b)
++    assert got == [
++        BudgetAlert("2026-11", "food", OVER, 10000, 10001),
++        BudgetAlert("2026-11", "fun", WARN, 10000, 8000),
++    ]
++    assert got[0].remaining == -1
++    assert got[1].remaining == 2000
++
++
++def test_equal_to_limit_is_warn_not_over():
++    assert classify(10000, 10000) == WARN
++
++
++def test_just_below_threshold_is_ok():
++    assert classify(7999, 10000) is None
++    assert classify(8000, 10000) == WARN
++
++
++def test_warn_percent_100_only_at_limit():
++    assert classify(9999, 10000, 100) is None
++    assert classify(10000, 10000, 100) == WARN
++    assert classify(10001, 10000, 100) == OVER
++
++
++def test_zero_limit():
++    assert classify(0, 0) is None
++    assert classify(1, 0) == OVER
++
++
++def test_refund_or_zero_never_alerts():
++    assert classify(-500, 100) is None
++    assert classify(0, 100) is None
++
++
++@pytest.mark.parametrize("bad", [True, False, 80.0, "80", None])
++def test_warn_percent_type_error(bad):
++    with pytest.raises(TypeError):
++        classify(1, 10, bad)  # type: ignore[arg-type]
++    with pytest.raises(TypeError):
++        budget_alerts({}, _b(), bad)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize("bad", [0, -1, 101])
++def test_warn_percent_value_error(bad):
++    with pytest.raises(ValueError, match="warn_percent"):
++        budget_alerts({}, _b(), bad)
++
++
++def test_category_without_budget_skipped():
++    assert budget_alerts({"2026-11": {"misc": 999999}}, _b({"food": 1})) == []
++
++
++def test_month_override_applies():
++    b = _b({"food": 10000}, {"2026-12": {"food": 50000}})
++    totals = {"2026-11": {"food": 12000}, "2026-12": {"food": 12000}}
++    got = budget_alerts(totals, b)
++    assert [(a.month, a.status) for a in got] == [("2026-11", OVER)]
++
++
++def test_empty_inputs():
++    assert budget_alerts({}, _b({"food": 1})) == []
++    assert budget_alerts({"2026-11": {}}, _b({"food": 1})) == []
++
++
++def test_ordering():
++    totals = {
++        "2026-12": {"a": 200},
++        "2026-11": {"w1": 90, "w2": 95, "o1": 120, "o2": 150, "o3": 150},
++    }
++    b = _b({"a": 100, "w1": 100, "w2": 100, "o1": 100, "o2": 100, "o3": 100})
++    got = [(a.month, a.category) for a in budget_alerts(totals, b)]
++    assert got == [
++        ("2026-11", "o2"),
++        ("2026-11", "o3"),
++        ("2026-11", "o1"),
++        ("2026-11", "w2"),
++        ("2026-11", "w1"),
++        ("2026-12", "a"),
++    ]

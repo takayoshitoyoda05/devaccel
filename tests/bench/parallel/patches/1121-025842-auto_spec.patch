@@ -1,0 +1,403 @@
+diff --git a/docs/design/20261121-mom.md b/docs/design/20261121-mom.md
+new file mode 100644
+index 0000000..8b1a87e
+--- /dev/null
++++ b/docs/design/20261121-mom.md
+@@ -0,0 +1,28 @@
++# mom(月別カテゴリ支出と前月比)
++目的: 家計簿の行から月ごとのカテゴリ別支出を出し、前月比(増えた・減った・新しく出てきた・なくなった)を出す純粋関数 / やらないこと: CLI・既存ファイルの変更、CSV 読込、表示整形、予算
++共通前提: 標準ライブラリのみ・既存ファイル不変・件どうしは import しない・使う型 `kakeibo.core.Expense`(day: date, category: str, amount: int, memo)。月キーは `"YYYY-MM"`、金額は円の整数
++判断一覧:
++D1 前月 = 暦の直前の月。データに無い月は空の月(全カテゴリ 0)として比べる(2 月が無ければ 1 月のカテゴリは 2 月に「なくなった」。3 月は 2 月の空と比べる)
++D2 結果に含める月 = 入力にある月のうち最小の月以外(最初の月は比べる前月が無いので含めない)。月が 1 つ以下なら空
++D3 種別は金額で決める: 前月 0 または無し かつ 今月 ≠ 0 → "new" / 前月 ≠ 0 かつ 今月 0 または無し → "gone" / 両方 ≠ 0 で今月 > 前月 → "increased"、< → "decreased" / 同額(両方 0 を含む)は結果に含めない
++D4 負の金額(返金)は受ける(int として合算・比較する)。`bool`・`float`・`str` の金額は `TypeError`、月キーが `YYYY-MM`(月 01〜12)以外は `ValueError`(悪い引数名と値を入れる)
++D5 並び: 月は昇順。月の中は変化額の絶対値の降順、同点はカテゴリ名の昇順
++D6 変化率 `ratio` = delta / 前月(前月 > 0 のときだけ。new・gone・前月が 0 以下は None)。四捨五入しない
++
++1. `src/kakeibo/monthly.py` + `tests/test_monthly.py` — `def monthly_category_totals(rows: list[Expense]) -> dict[str, dict[str, int]]`
++規則: R1 月は `row.day` の年月で `YYYY-MM`。最小月から最大月まで 1 か月刻みで全部を キーにし、行の無い月は `{}`(12 月→翌年 1 月をまたぐ) / R2 月は昇順、月の中のカテゴリは金額の降順・同点はカテゴリ名の昇順。同じ月・同じカテゴリは合算(返金の負数も合算、合計 0 のカテゴリも残す) / R3 `rows` が空なら `{}`。`rows` の要素が `Expense` でない・`amount` が `bool` や非 int なら `TypeError`(何番目かを書く)。`rows` を変更しない
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E1-1 | 2026-01-05 食費 300 / 2026-03-02 食費 100 | {"2026-01": {"食費": 300}, "2026-02": {}, "2026-03": {"食費": 100}} | R1 |
++| E1-2 | 2025-12-31 食費 100 / 2026-01-01 食費 -30 | {"2025-12": {"食費": 100}, "2026-01": {"食費": -30}} | R1 R2 |
++| E1-3 | 同月 食費 500 と 交通 500 | {"2026-01": {"交通": 500, "食費": 500}} | R2 |
++
++2. `src/kakeibo/mom.py` + `tests/test_mom.py` — `@dataclass(frozen=True) class CategoryChange: category: str; kind: str; previous: int; current: int; delta: int; ratio: float | None` と `def month_over_month(totals: dict[str, dict[str, int]]) -> dict[str, list[CategoryChange]]`(`totals` は `{"YYYY-MM": {category: yen}}`、`kakeibo` の他モジュールは import しない)
++規則: R1 `kind` は `"increased"` `"decreased"` `"new"` `"gone"` の 4 つだけ(D3)。`delta = current - previous`(無いカテゴリは 0)。`previous` は暦の直前の月の値(月が無い・カテゴリが無いは 0) / R2 結果のキーは D2 の月だけ、昇順。変化の無い月は `[]` で残す。月内の並びは D5 / R3 `totals` が空・1 か月なら `{}`。月キーの形式違い・金額の型違いは D4 の例外。`totals` を変更しない
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E2-1 | {"2026-01": {"食費": 300, "家賃": 500}, "2026-02": {"食費": 100, "趣味": 40}} | "2026-02": 家賃 gone(500→0, delta -500, ratio None) / 食費 decreased(300→100, delta -200, ratio -0.666…) / 趣味 new(0→40) | R1 D5 |
++| E2-2 | {"2026-01": {"食費": 300}, "2026-03": {"食費": 300}} | {"2026-03": [食費 gone→ なし]} ではなく 3 月は前月(2 月)が空なので 食費 new(0→300) | R1 D1 |
++| E2-3 | {"2026-01": {"食費": 0}, "2026-02": {"食費": 0}} | {"2026-02": []} | R2 D3 |
++
++<!-- end -->
+diff --git a/src/kakeibo/mom.py b/src/kakeibo/mom.py
+new file mode 100644
+index 0000000..6d0e5d4
+--- /dev/null
++++ b/src/kakeibo/mom.py
+@@ -0,0 +1,86 @@
++"""Month-over-month category changes (pure functions, standard library only)."""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++_MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
++
++
++@dataclass(frozen=True)
++class CategoryChange:
++    category: str
++    kind: str  # "increased" | "decreased" | "new" | "gone"
++    previous: int
++    current: int
++    delta: int
++    ratio: float | None
++
++
++def _check(totals: dict[str, dict[str, int]]) -> None:
++    for month, cats in totals.items():
++        if not isinstance(month, str) or not _MONTH_RE.fullmatch(month):
++            raise ValueError(f"月の形式が不正です(YYYY-MM): {month!r}")
++        for cat, yen in cats.items():
++            if isinstance(yen, bool) or not isinstance(yen, int):
++                raise TypeError(
++                    f"金額は int である必要があります: {month}.{cat} = {yen!r}"
++                )
++
++
++def _previous_month(month: str) -> str:
++    year, mon = int(month[:4]), int(month[5:])
++    if mon == 1:
++        return f"{year - 1:04d}-12"
++    return f"{year:04d}-{mon - 1:02d}"
++
++
++def _kind(previous: int, current: int) -> str | None:
++    if previous == 0 and current == 0:
++        return None
++    if previous == 0:
++        return "new"
++    if current == 0:
++        return "gone"
++    if current == previous:
++        return None
++    return "increased" if current > previous else "decreased"
++
++
++def month_over_month(
++    totals: dict[str, dict[str, int]],
++) -> dict[str, list[CategoryChange]]:
++    """Compare each month (except the earliest) with its calendar-previous month.
++
++    A month missing from ``totals`` counts as empty. Result keys are ascending;
++    within a month, changes are sorted by |delta| descending, then category name.
++    """
++    _check(totals)
++    months = sorted(totals)
++    if len(months) <= 1:
++        return {}
++
++    result: dict[str, list[CategoryChange]] = {}
++    for month in months[1:]:
++        current_cats = totals[month]
++        previous_cats = totals.get(_previous_month(month), {})
++        changes: list[CategoryChange] = []
++        for category in set(current_cats) | set(previous_cats):
++            previous = previous_cats.get(category, 0)
++            current = current_cats.get(category, 0)
++            kind = _kind(previous, current)
++            if kind is None:
++                continue
++            delta = current - previous
++            ratio = (
++                delta / previous
++                if kind in ("increased", "decreased") and previous > 0
++                else None
++            )
++            changes.append(
++                CategoryChange(category, kind, previous, current, delta, ratio)
++            )
++        changes.sort(key=lambda c: (-abs(c.delta), c.category))
++        result[month] = changes
++    return result
+diff --git a/src/kakeibo/monthly.py b/src/kakeibo/monthly.py
+new file mode 100644
+index 0000000..e4ca0ea
+--- /dev/null
++++ b/src/kakeibo/monthly.py
+@@ -0,0 +1,45 @@
++"""Monthly per-category totals (gap months included as empty)."""
++
++from __future__ import annotations
++
++from kakeibo.core import Expense
++
++
++def _next_month(year: int, month: int) -> tuple[int, int]:
++    return (year + 1, 1) if month == 12 else (year, month + 1)
++
++
++def monthly_category_totals(rows: list[Expense]) -> dict[str, dict[str, int]]:
++    """{"YYYY-MM": {category: yen}} from the earliest to the latest month.
++
++    Months with no rows map to {}. Months ascend; categories within a month are
++    ordered by amount descending, then by name ascending. Refunds (negative
++    amounts) are summed as ints. `rows` is not modified.
++    """
++    if not rows:
++        return {}
++
++    sums: dict[str, dict[str, int]] = {}
++    for i, row in enumerate(rows):
++        if not isinstance(row, Expense):
++            raise TypeError(
++                f"rows[{i}] は Expense である必要があります: {type(row).__name__}"
++            )
++        if isinstance(row.amount, bool) or not isinstance(row.amount, int):
++            raise TypeError(
++                f"rows[{i}].amount は int である必要があります: {type(row.amount).__name__}"
++            )
++        key = row.day.strftime("%Y-%m")
++        month = sums.setdefault(key, {})
++        month[row.category] = month.get(row.category, 0) + row.amount
++
++    first = min(row.day for row in rows)
++    last = max(row.day for row in rows)
++    year, month_no = first.year, first.month
++    out: dict[str, dict[str, int]] = {}
++    while (year, month_no) <= (last.year, last.month):
++        key = f"{year:04d}-{month_no:02d}"
++        cats = sums.get(key, {})
++        out[key] = dict(sorted(cats.items(), key=lambda kv: (-kv[1], kv[0])))
++        year, month_no = _next_month(year, month_no)
++    return out
+diff --git a/tests/test_mom.py b/tests/test_mom.py
+new file mode 100644
+index 0000000..2129557
+--- /dev/null
++++ b/tests/test_mom.py
+@@ -0,0 +1,120 @@
++import copy
++
++import pytest
++
++from kakeibo.mom import CategoryChange, month_over_month
++
++
++@pytest.mark.parametrize(
++    ("totals", "expected"),
++    [
++        pytest.param(
++            {
++                "2026-01": {"食費": 300, "家賃": 500},
++                "2026-02": {"食費": 100, "趣味": 40},
++            },
++            {
++                "2026-02": [
++                    CategoryChange("家賃", "gone", 500, 0, -500, None),
++                    CategoryChange("食費", "decreased", 300, 100, -200, -200 / 300),
++                    CategoryChange("趣味", "new", 0, 40, 40, None),
++                ]
++            },
++            id="E2-1",
++        ),
++        pytest.param(
++            {"2026-01": {"食費": 300}, "2026-03": {"食費": 300}},
++            {"2026-03": [CategoryChange("食費", "new", 0, 300, 300, None)]},
++            id="E2-2",
++        ),
++        pytest.param(
++            {"2026-01": {"食費": 0}, "2026-02": {"食費": 0}},
++            {"2026-02": []},
++            id="E2-3",
++        ),
++    ],
++)
++def test_spec_examples(totals, expected):
++    assert month_over_month(totals) == expected
++
++
++def test_empty_and_single_month_give_empty_dict():
++    assert month_over_month({}) == {}
++    assert month_over_month({"2026-01": {"食費": 300}}) == {}
++
++
++def test_year_boundary_uses_previous_calendar_month():
++    totals = {"2025-12": {"食費": 100}, "2026-01": {"食費": 150}}
++    assert month_over_month(totals) == {
++        "2026-01": [CategoryChange("食費", "increased", 100, 150, 50, 0.5)]
++    }
++
++
++def test_missing_month_counts_as_empty():
++    totals = {
++        "2026-01": {"食費": 300},
++        "2026-02": {"食費": 300},
++        "2026-04": {"食費": 50},
++    }
++    result = month_over_month(totals)
++    assert list(result) == ["2026-02", "2026-04"]
++    assert result["2026-04"] == [CategoryChange("食費", "new", 0, 50, 50, None)]
++
++
++def test_unchanged_amounts_are_omitted():
++    totals = {
++        "2026-01": {"食費": 300, "家賃": 500},
++        "2026-02": {"食費": 300, "家賃": 500},
++    }
++    assert month_over_month(totals) == {"2026-02": []}
++
++
++def test_negative_amounts_are_compared_as_int():
++    totals = {"2026-01": {"食費": 0}, "2026-02": {"食費": -50}}
++    assert month_over_month(totals) == {
++        "2026-02": [CategoryChange("食費", "new", 0, -50, -50, None)]
++    }
++
++
++def test_ratio_is_none_when_previous_not_positive():
++    totals = {"2026-01": {"食費": -100}, "2026-02": {"食費": 50}}
++    assert month_over_month(totals) == {
++        "2026-02": [CategoryChange("食費", "increased", -100, 50, 150, None)]
++    }
++
++
++def test_ratio_is_not_rounded():
++    totals = {"2026-01": {"食費": 3}, "2026-02": {"食費": 4}}
++    (change,) = month_over_month(totals)["2026-02"]
++    assert change.ratio == 1 / 3
++
++
++def test_sort_by_abs_delta_then_category_name():
++    totals = {
++        "2026-01": {"b": 100, "a": 100, "c": 500},
++        "2026-02": {"b": 0, "a": 200, "c": 0},
++    }
++    names = [c.category for c in month_over_month(totals)["2026-02"]]
++    # |delta|: c=500, a=100, b=100 -> ties broken by name
++    assert names == ["c", "a", "b"]
++
++
++def test_input_is_not_mutated():
++    totals = {"2026-01": {"食費": 300}, "2026-02": {"食費": 100, "趣味": 40}}
++    original = copy.deepcopy(totals)
++    month_over_month(totals)
++    assert totals == original
++
++
++@pytest.mark.parametrize(
++    "bad", [True, False, 1.5, "100"], ids=["true", "false", "float", "str"]
++)
++def test_non_int_amount_raises_type_error(bad):
++    with pytest.raises(TypeError):
++        month_over_month({"2026-01": {"食費": bad}, "2026-02": {"食費": 1}})
++
++
++@pytest.mark.parametrize("bad", ["2026-1", "2026-13", "2026-00", "2026/01", "26-01"])
++def test_invalid_month_key_raises_value_error(bad):
++    with pytest.raises(ValueError):
++        month_over_month({"2026-01": {"食費": 1}, bad: {"食費": 1}})
+diff --git a/tests/test_monthly.py b/tests/test_monthly.py
+new file mode 100644
+index 0000000..3900b5f
+--- /dev/null
++++ b/tests/test_monthly.py
+@@ -0,0 +1,94 @@
++from __future__ import annotations
++
++import copy
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.monthly import monthly_category_totals
++
++
++def ex(day: str, category: str, amount: int) -> Expense:
++    return Expense(day=date.fromisoformat(day), category=category, amount=amount)
++
++
++@pytest.mark.parametrize(
++    ("rows", "expected"),
++    [
++        pytest.param(
++            [ex("2026-01-05", "食費", 300), ex("2026-03-02", "食費", 100)],
++            {"2026-01": {"食費": 300}, "2026-02": {}, "2026-03": {"食費": 100}},
++            id="E1-1",
++        ),
++        pytest.param(
++            [ex("2025-12-31", "食費", 100), ex("2026-01-01", "食費", -30)],
++            {"2025-12": {"食費": 100}, "2026-01": {"食費": -30}},
++            id="E1-2",
++        ),
++        pytest.param(
++            [ex("2026-01-03", "食費", 500), ex("2026-01-04", "交通", 500)],
++            {"2026-01": {"交通": 500, "食費": 500}},
++            id="E1-3",
++        ),
++    ],
++)
++def test_examples(rows: list[Expense], expected: dict[str, dict[str, int]]) -> None:
++    assert monthly_category_totals(rows) == expected
++
++
++def test_empty_rows_returns_empty_dict() -> None:
++    assert monthly_category_totals([]) == {}
++
++
++def test_same_month_and_category_are_summed() -> None:
++    rows = [ex("2026-01-01", "食費", 100), ex("2026-01-20", "食費", 250)]
++    assert monthly_category_totals(rows) == {"2026-01": {"食費": 350}}
++
++
++def test_refund_is_summed_and_zero_total_category_kept() -> None:
++    rows = [ex("2026-01-01", "食費", 500), ex("2026-01-02", "食費", -500)]
++    assert monthly_category_totals(rows) == {"2026-01": {"食費": 0}}
++
++
++def test_categories_sorted_by_amount_desc_then_name_asc() -> None:
++    rows = [
++        ex("2026-01-01", "娯楽", 100),
++        ex("2026-01-01", "衣服", 100),
++        ex("2026-01-01", "食費", 900),
++    ]
++    result = monthly_category_totals(rows)
++    # 同額の 娯楽 / 衣服 はカテゴリ名の昇順(コードポイント順: 娯 U+5A2F < 衣 U+8863)
++    assert list(result["2026-01"]) == ["食費", "娯楽", "衣服"]
++
++
++def test_months_are_in_ascending_order_regardless_of_input_order() -> None:
++    rows = [ex("2026-03-01", "食費", 1), ex("2026-01-01", "食費", 2)]
++    assert list(monthly_category_totals(rows)) == ["2026-01", "2026-02", "2026-03"]
++
++
++def test_single_month_has_no_gap_fill() -> None:
++    assert monthly_category_totals([ex("2026-07-15", "食費", 10)]) == {
++        "2026-07": {"食費": 10}
++    }
++
++
++def test_rows_not_mutated() -> None:
++    rows = [ex("2026-03-02", "食費", 100), ex("2026-01-05", "食費", 300)]
++    before = copy.deepcopy(rows)
++    monthly_category_totals(rows)
++    assert rows == before
++
++
++def test_non_expense_element_raises_type_error_with_index() -> None:
++    rows: list[object] = [ex("2026-01-01", "食費", 1), {"amount": 1}]
++    with pytest.raises(TypeError, match="1"):
++        monthly_category_totals(rows)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize("bad", [True, False, 1.0, "100"])
++def test_non_int_amount_raises_type_error_with_index(bad: object) -> None:
++    bad_row = Expense(day=date(2026, 1, 1), category="食費", amount=bad)  # type: ignore[arg-type]
++    rows = [ex("2026-01-01", "食費", 1), bad_row]
++    with pytest.raises(TypeError, match="1"):
++        monthly_category_totals(rows)

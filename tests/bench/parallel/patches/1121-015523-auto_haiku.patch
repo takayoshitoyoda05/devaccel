@@ -1,0 +1,488 @@
+diff --git a/src/kakeibo/bank_csv.py b/src/kakeibo/bank_csv.py
+new file mode 100644
+index 0000000..d024854
+--- /dev/null
++++ b/src/kakeibo/bank_csv.py
+@@ -0,0 +1,265 @@
++"""Bank / credit-card statement CSV import (pure functions, no file I/O).
++
++Turns statement text into Expense rows, and reports every bad cell with its
++line number, column name, raw value and reason.
++
++D1: 列名は別名表 (_ALIASES) で自動判定する。会社固有の列名は column_map で指定する。
++D2: ヘッダー行より前の行(お取引明細 などの前置き)は読み飛ばす。日付列と金額列の両方が
++    揃った最初の行をヘッダーとみなす。
++D3: 金額は円の整数。「,」区切り・「¥」「円」・全角数字・全角記号を許す。負の金額
++    (返金・取消)と小数はエラーにする(取り込まない)。
++D4: 日付は YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYY年M月D日 / YYYYMMDD を受ける。
++    時刻が付いていれば捨てる。2 桁年は受けない(エラー)。
++D5: 判定は行単位。エラーのある行は丸ごと取り込まず、その行のエラーを全て返す。
++    他の行は取り込む。
++D6: 列数がヘッダーと一致しない行はエラー。空行は無視。
++D7: 区分列が無い・空のときは default_category (既定 "未分類")。摘要列が無ければ memo は空。
++D8: 行番号は csv の物理行番号(複数行にまたがるレコードは終わりの行)。
++D9: 同じ項目の候補列が複数あるときはヘッダーを曖昧とみなし BankCsvError。column_map で指定させる。
++"""
++
++from __future__ import annotations
++
++import csv
++import io
++import re
++import unicodedata
++from collections.abc import Mapping
++from dataclasses import dataclass
++from datetime import date
++
++from kakeibo.core import Expense
++
++FIELDS = ("date", "amount", "category", "memo")
++REQUIRED = ("date", "amount")
++DEFAULT_CATEGORY = "未分類"
++
++_ALIASES: dict[str, tuple[str, ...]] = {
++    "date": (
++        "date",
++        "日付",
++        "利用日",
++        "ご利用日",
++        "取引日",
++        "お取引日",
++        "年月日",
++        "取引年月日",
++        "計上日",
++    ),
++    "amount": (
++        "amount",
++        "金額",
++        "利用金額",
++        "ご利用金額",
++        "支払金額",
++        "お支払金額",
++        "支払い金額",
++        "出金金額",
++        "出金額",
++        "利用額",
++    ),
++    "category": ("category", "カテゴリ", "カテゴリー", "区分", "分類", "費目"),
++    "memo": (
++        "memo",
++        "摘要",
++        "内容",
++        "取引内容",
++        "ご利用内容",
++        "利用店名",
++        "利用店名・商品名",
++        "ご利用店名",
++        "店名",
++        "備考",
++        "メモ",
++    ),
++}
++
++
++class BankCsvError(ValueError):
++    """Raised for file-level problems (no header, bad column_map). line may be None."""
++
++    def __init__(self, message: str, line: int | None = None) -> None:
++        super().__init__(message)
++        self.line = line
++
++
++@dataclass(frozen=True)
++class RowError:
++    line: int
++    column: str | None  # header name of the bad cell; None for whole-row problems
++    value: str
++    reason: str
++
++
++@dataclass(frozen=True)
++class ImportResult:
++    rows: list[Expense]
++    errors: list[RowError]
++
++
++class _CellError(ValueError):
++    pass
++
++
++def format_row_error(e: RowError) -> str:
++    """'行 6 列「金額」: 金額が整数ではありません (値: '1,2')' 形式の 1 行。"""
++    msg = f"行 {e.line}"
++    if e.column is not None:
++        msg += f" 列「{e.column}」"
++    msg += f": {e.reason}"
++    if e.value:
++        msg += f" (値: {e.value!r})"
++    return msg
++
++
++def _norm(s: str) -> str:
++    return unicodedata.normalize("NFKC", s).strip()
++
++
++def _key(s: str) -> str:
++    """列名の比較用キー: BOM・空白・大文字小文字・全角半角の差を無視する。"""
++    return _norm(s.lstrip("﻿")).replace(" ", "").lower()
++
++
++_DATE_PATTERNS = (
++    re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"),
++    re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"),
++    re.compile(r"(\d{4})(\d{2})(\d{2})"),
++)
++_AMOUNT_RE = re.compile(r"\d{1,3}(?:,\d{3})+|\d+")
++
++
++def _parse_date(raw: str) -> date:
++    s = _norm(raw)
++    if not s:
++        raise _CellError("日付が空です")
++    for pat in _DATE_PATTERNS:
++        m = pat.fullmatch(s)
++        if m:
++            y, mo, d = (int(g) for g in m.groups())
++            try:
++                return date(y, mo, d)
++            except ValueError:
++                raise _CellError("存在しない日付です") from None
++    raise _CellError("日付の形式が不正です(例: 2026-11-01, 2026/11/01, 2026年11月1日)")
++
++
++def _parse_amount(raw: str) -> int:
++    s = _norm(raw).replace("¥", "").replace("円", "").replace(" ", "")
++    if not s:
++        raise _CellError("金額が空です")
++    if s.startswith("-") or (s.startswith("(") and s.endswith(")")):
++        raise _CellError("負の金額は取り込めません(返金・取消は未対応)")
++    if not _AMOUNT_RE.fullmatch(s):
++        raise _CellError("金額が整数ではありません")
++    return int(s.replace(",", ""))
++
++
++def _resolve_header(
++    cells: list[str], column_map: Mapping[str, str] | None, line: int
++) -> dict[str, int] | None:
++    """field -> column index. None if this row is not the header (日付・金額が揃わない)。"""
++    keys = [_key(c) for c in cells]
++    found: dict[str, int] = {}
++    for field in FIELDS:
++        if column_map is not None and field in column_map:
++            wanted = {_key(column_map[field])}
++        else:
++            wanted = {_key(a) for a in _ALIASES[field]}
++        hits = [i for i, k in enumerate(keys) if k in wanted]
++        if len(hits) > 1:
++            names = "、".join(f"「{cells[i]}」" for i in hits)
++            raise BankCsvError(
++                f"列 {field} の候補が複数あります({names})。column_map で指定してください",
++                line,
++            )
++        if hits:
++            found[field] = hits[0]
++    if not all(f in found for f in REQUIRED):
++        return None
++    return found
++
++
++def _parse_record(
++    cells: list[str],
++    header: list[str],
++    columns: dict[str, int],
++    default_category: str,
++    line: int,
++) -> tuple[Expense | None, list[RowError]]:
++    errors: list[RowError] = []
++    day: date | None = None
++    amount: int | None = None
++
++    raw_date = cells[columns["date"]]
++    try:
++        day = _parse_date(raw_date)
++    except _CellError as e:
++        errors.append(RowError(line, header[columns["date"]], raw_date, str(e)))
++
++    raw_amount = cells[columns["amount"]]
++    try:
++        amount = _parse_amount(raw_amount)
++    except _CellError as e:
++        errors.append(RowError(line, header[columns["amount"]], raw_amount, str(e)))
++
++    category = default_category
++    if "category" in columns:
++        category = _norm(cells[columns["category"]]) or default_category
++    memo = cells[columns["memo"]].strip() if "memo" in columns else ""
++
++    if errors or day is None or amount is None:
++        return None, errors
++    return Expense(day=day, category=category, amount=amount, memo=memo), []
++
++
++def import_bank_csv(
++    text: str,
++    *,
++    column_map: Mapping[str, str] | None = None,
++    default_category: str = DEFAULT_CATEGORY,
++) -> ImportResult:
++    """銀行・カード会社の CSV 文字列を Expense 行に変換する。
++
++    column_map: {"date"|"amount"|"category"|"memo": ヘッダー上の列名} で列を明示する。
++    """
++    if column_map is not None:
++        unknown = sorted(set(column_map) - set(FIELDS))
++        if unknown:
++            raise BankCsvError(f"column_map に不明な項目があります: {unknown}")
++
++    reader = csv.reader(io.StringIO(text, newline=""))
++    columns: dict[str, int] | None = None
++    header: list[str] = []
++    rows: list[Expense] = []
++    errors: list[RowError] = []
++
++    for cells in reader:
++        line = reader.line_num
++        if not any(c.strip() for c in cells):
++            continue
++        if columns is None:
++            columns = _resolve_header(cells, column_map, line)
++            if columns is not None:
++                header = cells
++            continue
++        if len(cells) != len(header):
++            errors.append(
++                RowError(
++                    line,
++                    None,
++                    ",".join(cells),
++                    f"列数が一致しません(ヘッダー {len(header)} 列、この行 {len(cells)} 列)",
++                )
++            )
++            continue
++        expense, row_errors = _parse_record(
++            cells, header, columns, default_category, line
++        )
++        errors.extend(row_errors)
++        if expense is not None:
++            rows.append(expense)
++
++    if columns is None:
++        raise BankCsvError("ヘッダー行が見つかりません(日付列と金額列が必要です)")
++    return ImportResult(rows=rows, errors=errors)
+diff --git a/tests/test_bank_csv.py b/tests/test_bank_csv.py
+new file mode 100644
+index 0000000..e116dc1
+--- /dev/null
++++ b/tests/test_bank_csv.py
+@@ -0,0 +1,211 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.bank_csv import (
++    BankCsvError,
++    RowError,
++    format_row_error,
++    import_bank_csv,
++)
++from kakeibo.core import Expense
++
++# 銀行系: 日付・摘要・入金金額・出金金額・残高 (前置き行あり、出金のみ取り込む)
++BANK = (
++    "お取引明細\n"
++    "口座番号,1234567\n"
++    "\n"
++    "取引日,摘要,入金金額,出金金額,残高\n"
++    '2026/11/01,ATM出金,,"1,200","98,800"\n'
++    '2026/11/02,振込手数料,,220,"98,580"\n'
++)
++
++# カード系: 利用日・利用店名・商品名・区分・支払金額 (BOM付き)
++CARD = (
++    "﻿利用日,利用店名・商品名,区分,支払金額\n"
++    '2026.11.03,スーパーA,食費,"3,450"\n'
++    "20261104,コンビニB,,¥780\n"
++    '2026年11月5日,書店C,書籍,"2,000円"\n'
++)
++
++
++def test_bank_style_skips_preamble_and_uses_withdrawal_column():
++    result = import_bank_csv(BANK)
++    assert result.errors == []
++    assert result.rows == [
++        Expense(date(2026, 11, 1), "未分類", 1200, "ATM出金"),
++        Expense(date(2026, 11, 2), "未分類", 220, "振込手数料"),
++    ]
++
++
++def test_bank_income_row_without_withdrawal_is_reported():
++    text = "取引日,摘要,入金金額,出金金額\n2026/11/02,給与振込,300000,\n"
++    result = import_bank_csv(text)
++    assert result.rows == []
++    assert [(e.line, e.column, e.reason) for e in result.errors] == [
++        (2, "出金金額", "金額が空です")
++    ]
++
++
++def test_card_style_with_category_and_bom():
++    result = import_bank_csv(CARD)
++    assert result.errors == []
++    assert result.rows == [
++        Expense(date(2026, 11, 3), "食費", 3450, "スーパーA"),
++        Expense(date(2026, 11, 4), "未分類", 780, "コンビニB"),
++        Expense(date(2026, 11, 5), "書籍", 2000, "書店C"),
++    ]
++
++
++def test_default_category_argument_and_memo_missing():
++    text = "日付,金額\n2026-11-01,500\n"
++    result = import_bank_csv(text, default_category="雑費")
++    assert result.rows == [Expense(date(2026, 11, 1), "雑費", 500, "")]
++
++
++@pytest.mark.parametrize(
++    "raw",
++    [
++        "2026-11-01",
++        "2026/11/01",
++        "2026.11.01",
++        "2026年11月1日",
++        "20261101",
++        "2026-11-01 12:34",
++        "２０２６－１１－０１",
++    ],
++)
++def test_date_formats(raw):
++    result = import_bank_csv(f"日付,金額\n{raw},100\n")
++    assert result.errors == []
++    assert result.rows[0].day == date(2026, 11, 1)
++
++
++@pytest.mark.parametrize(
++    "raw, expected",
++    [
++        ("1200", 1200),
++        ("1,200", 1200),
++        ("¥1,200", 1200),
++        ("￥1,200", 1200),
++        ("1,200円", 1200),
++        ("１，２００", 1200),
++        (" 1,200 ", 1200),
++        ("0", 0),
++    ],
++)
++def test_amount_formats(raw, expected):
++    result = import_bank_csv(f'日付,金額\n2026-11-01,"{raw}"\n')
++    assert result.errors == []
++    assert result.rows[0].amount == expected
++
++
++def test_each_bad_cell_is_reported_with_line_and_column():
++    text = (
++        "日付,摘要,金額\n"  # line 1
++        "2026-11-01,ok,100\n"  # line 2 ok
++        "2026-13-01,月がない,100\n"  # line 3 存在しない日付
++        "2026-11-02,負,-500\n"  # line 4 負の金額
++        "2026-11-03,小数,12.5\n"  # line 5 整数ではない
++        "2026-11-04,空,\n"  # line 6 金額が空
++        "11/05,二桁年,100\n"  # line 7 日付の形式
++        "2026-11-06,ok3\n"  # line 8 列数不一致
++        "2026-11-07,ok2,1,000\n"  # line 9 列数不一致(区切りの ,)
++    )
++    result = import_bank_csv(text)
++    assert [r.amount for r in result.rows] == [100]
++    got = [(e.line, e.column, e.value, e.reason) for e in result.errors]
++    assert got == [
++        (3, "日付", "2026-13-01", "存在しない日付です"),
++        (4, "金額", "-500", "負の金額は取り込めません(返金・取消は未対応)"),
++        (5, "金額", "12.5", "金額が整数ではありません"),
++        (6, "金額", "", "金額が空です"),
++        (
++            7,
++            "日付",
++            "11/05",
++            "日付の形式が不正です(例: 2026-11-01, 2026/11/01, 2026年11月1日)",
++        ),
++        (8, None, "2026-11-06,ok3", "列数が一致しません(ヘッダー 3 列、この行 2 列)"),
++        (
++            9,
++            None,
++            "2026-11-07,ok2,1,000",
++            "列数が一致しません(ヘッダー 3 列、この行 4 列)",
++        ),
++    ]
++
++
++def test_multiple_bad_cells_in_one_row_are_all_reported():
++    text = "日付,金額\nxxxx,yyy\n2026-11-01,100\n"
++    result = import_bank_csv(text)
++    assert result.rows == [Expense(date(2026, 11, 1), "未分類", 100, "")]
++    assert [(e.line, e.column) for e in result.errors] == [(2, "日付"), (2, "金額")]
++
++
++def test_bad_row_is_excluded_but_good_rows_kept():
++    text = "日付,金額\n2026-11-01,100\n2026-11-02,abc\n2026-11-03,300\n"
++    result = import_bank_csv(text)
++    assert [r.amount for r in result.rows] == [100, 300]
++    assert [e.line for e in result.errors] == [3]
++
++
++def test_blank_lines_are_skipped_and_line_numbers_stay_physical():
++    text = "日付,金額\n\n2026-11-01,100\n\n2026-11-02,x\n"
++    result = import_bank_csv(text)
++    assert len(result.rows) == 1
++    assert [e.line for e in result.errors] == [5]
++
++
++def test_quoted_memo_with_comma_and_newline():
++    text = '日付,摘要,金額\n2026-11-01,"a,b\nc",100\n'
++    result = import_bank_csv(text)
++    assert result.errors == []
++    assert result.rows[0].memo == "a,b\nc"
++
++
++def test_column_map_overrides_aliases():
++    text = "ご利用日時,店,請求額\n2026-11-01,X,700\n"
++    result = import_bank_csv(
++        text, column_map={"date": "ご利用日時", "memo": "店", "amount": "請求額"}
++    )
++    assert result.rows == [Expense(date(2026, 11, 1), "未分類", 700, "X")]
++
++
++def test_column_map_replaces_alias_for_that_field():
++    # amount を列マップで指定したら、別名「金額」は使われない
++    text = "日付,金額,請求額\n2026-11-01,1,700\n"
++    result = import_bank_csv(text, column_map={"amount": "請求額"})
++    assert [r.amount for r in result.rows] == [700]
++
++
++def test_ambiguous_columns_raise_and_ask_for_column_map():
++    text = "日付,利用金額,支払金額\n2026-11-01,1,2\n"
++    with pytest.raises(BankCsvError, match="column_map"):
++        import_bank_csv(text)
++
++
++def test_no_header_raises():
++    with pytest.raises(BankCsvError, match="ヘッダー行が見つかりません"):
++        import_bank_csv("foo,bar\n1,2\n")
++
++
++def test_empty_text_raises():
++    with pytest.raises(BankCsvError, match="ヘッダー行が見つかりません"):
++        import_bank_csv("")
++
++
++def test_unknown_column_map_key_raises():
++    with pytest.raises(BankCsvError, match="不明"):
++        import_bank_csv("日付,金額\n", column_map={"shop": "店"})
++
++
++def test_format_row_error_shows_where_and_what():
++    err = RowError(
++        line=6, column="金額", value="1,2", reason="金額が整数ではありません"
++    )
++    assert (
++        format_row_error(err) == "行 6 列「金額」: 金額が整数ではありません (値: '1,2')"
++    )
++    whole = RowError(line=7, column=None, value="", reason="列数が一致しません")
++    assert format_row_error(whole) == "行 7: 列数が一致しません"

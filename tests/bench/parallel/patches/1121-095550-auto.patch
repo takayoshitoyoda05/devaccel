@@ -1,0 +1,269 @@
+diff --git a/src/kakeibo/alerts.py b/src/kakeibo/alerts.py
+new file mode 100644
+index 0000000..5b27624
+--- /dev/null
++++ b/src/kakeibo/alerts.py
+@@ -0,0 +1,83 @@
++"""Budget alerts: pure functions that flag categories over / near their monthly budget.
++
++Reuses ``Budget`` from ``kakeibo.core``; totals have the shape returned by
++``monthly_totals`` (``{"YYYY-MM": {category: yen}}``).
++
++決めた扱い:
++D1: actual > limit → level="over"。例: limit 10000, actual 10001 → over, remaining=-1。
++D2: actual == limit は "over" ではなく "warn"。例: limit 10000, actual 10000 → warn, remaining=0。
++D3: warn は整数演算 `actual*100 >= limit*warn_percent` かつ actual <= limit。既定 80%。
++    limit 10000 で actual 8000 → warn、7999 → なし。warn_percent=100 なら actual == limit のときだけ warn。
++    warn_percent は 1〜100 を受け付け、0 と 101 は ValueError。int 以外(bool・float・str・None)は TypeError。
++D4: limit 0 のカテゴリは actual > 0 なら over、actual <= 0 ならアラートなし(0 で warn にしない)。
++D5: actual <= 0(返金などで合計が 0 以下)はアラートなし。
++D6: 予算の無いカテゴリの支出、予算はあるが支出の無いカテゴリはアラートなし。
++D7: 月ごとの予算は budget.for_month(month)(months が default を上書き)。
++D8: totals に無い月は対象外(空の月を補わない)。totals が空なら []。
++D9: 並びは 月の昇順 → "over" が先 → カテゴリ名の昇順。
++D10: format_alert: over → "2026-01 食費: 予算超過 1,200円(予算 10,000円 / 実績 11,200円)"、
++     warn → "2026-01 食費: 予算の 85% に到達(残り 1,500円 / 予算 10,000円 / 実績 8,500円)"(% は切り捨て)。
++D11: 入力の totals・budget を書き換えない。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from kakeibo.core import Budget
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    month: str  # "YYYY-MM"
++    category: str
++    level: str  # "over" or "warn"
++    limit: int  # yen
++    actual: int  # yen
++    remaining: int  # limit - actual (negative when over)
++
++
++def check_budget(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    warn_percent: int = 80,
++) -> list[BudgetAlert]:
++    if not isinstance(totals, dict):
++        raise TypeError("totals must be a dict")
++    if not isinstance(budget, Budget):
++        raise TypeError("budget must be a Budget")
++    if isinstance(warn_percent, bool) or not isinstance(warn_percent, int):
++        raise TypeError("warn_percent must be an int")
++    if not 1 <= warn_percent <= 100:
++        raise ValueError(f"warn_percent must be between 1 and 100: {warn_percent}")
++
++    alerts: list[BudgetAlert] = []
++    for month, cats in totals.items():
++        limits = budget.for_month(month)
++        for cat, actual in cats.items():
++            if cat not in limits or actual <= 0:
++                continue
++            limit = limits[cat]
++            if actual > limit:
++                level = "over"
++            elif actual * 100 >= limit * warn_percent:
++                level = "warn"
++            else:
++                continue
++            alerts.append(BudgetAlert(month, cat, level, limit, actual, limit - actual))
++    alerts.sort(key=lambda a: (a.month, a.level != "over", a.category))
++    return alerts
++
++
++def format_alert(alert: BudgetAlert) -> str:
++    head = f"{alert.month} {alert.category}:"
++    if alert.level == "over":
++        return (
++            f"{head} 予算超過 {-alert.remaining:,}円"
++            f"(予算 {alert.limit:,}円 / 実績 {alert.actual:,}円)"
++        )
++    pct = alert.actual * 100 // alert.limit
++    return (
++        f"{head} 予算の {pct}% に到達"
++        f"(残り {alert.remaining:,}円 / 予算 {alert.limit:,}円 / 実績 {alert.actual:,}円)"
++    )
+diff --git a/tests/test_alerts.py b/tests/test_alerts.py
+new file mode 100644
+index 0000000..7db1bd1
+--- /dev/null
++++ b/tests/test_alerts.py
+@@ -0,0 +1,174 @@
++import copy
++
++import pytest
++
++from kakeibo.alerts import BudgetAlert, check_budget, format_alert
++from kakeibo.core import Budget
++
++
++def _budget(default=None, months=None):
++    return Budget(default=default or {}, months=months or {})
++
++
++def _one(totals, limit, **kw):
++    """food 1 カテゴリ・1 か月だけの予算で check_budget を呼ぶ。"""
++    budget = _budget(default={"food": limit})
++    return check_budget({"2026-01": {"food": totals}}, budget, **kw)
++
++
++# D1: actual > limit は over。remaining は負になる。
++def test_d1_over_remaining_negative():
++    alerts = _one(10001, 10000)
++    assert alerts == [
++        BudgetAlert(
++            month="2026-01",
++            category="food",
++            level="over",
++            limit=10000,
++            actual=10001,
++            remaining=-1,
++        )
++    ]
++
++
++# D2: actual == limit は over ではなく warn。
++def test_d2_equal_is_warn_not_over():
++    alerts = _one(10000, 10000)
++    assert [(a.level, a.remaining) for a in alerts] == [("warn", 0)]
++
++
++# D3: 既定 80% で warn。7999 はアラートなし。
++@pytest.mark.parametrize(
++    "actual, expected",
++    [(8000, [("warn", 2000)]), (7999, [])],
++)
++def test_d3_default_warn_threshold(actual, expected):
++    alerts = _one(actual, 10000)
++    assert [(a.level, a.remaining) for a in alerts] == expected
++
++
++# D3: warn_percent=100 なら actual == limit のときだけ warn、超過は over。
++def test_d3_warn_percent_100_equal_warn_and_excess_over():
++    assert [a.level for a in _one(10000, 10000, warn_percent=100)] == ["warn"]
++    assert [a.level for a in _one(10001, 10000, warn_percent=100)] == ["over"]
++    assert _one(9999, 10000, warn_percent=100) == []
++
++
++# D3: warn_percent=1 は受け付ける。
++def test_d3_warn_percent_1_accepted():
++    assert [a.level for a in _one(1, 100, warn_percent=1)] == ["warn"]
++
++
++# D3: warn_percent が 1 未満・100 超は ValueError（メッセージに warn_percent を含む）。
++@pytest.mark.parametrize("bad", [0, 101])
++def test_d3_warn_percent_out_of_range_value_error(bad):
++    with pytest.raises(ValueError, match="warn_percent"):
++        _one(100, 1000, warn_percent=bad)
++
++
++# 型違い（bool・float・str・None）は TypeError。
++@pytest.mark.parametrize("bad", [True, 80.0, "80", None])
++def test_warn_percent_wrong_type_type_error(bad):
++    with pytest.raises(TypeError):
++        _one(100, 1000, warn_percent=bad)
++
++
++# 型エラー: totals が dict でない / budget が Budget でない。
++def test_totals_not_dict_type_error():
++    with pytest.raises(TypeError):
++        check_budget([("2026-01", {"food": 1})], _budget(default={"food": 1}))  # type: ignore[arg-type]
++
++
++def test_budget_not_budget_type_error():
++    with pytest.raises(TypeError):
++        check_budget({"2026-01": {"food": 1}}, {"food": 1})  # type: ignore[arg-type]
++
++
++# D4: limit 0 は actual > 0 で over、actual <= 0 はアラートなし（warn にしない）。
++@pytest.mark.parametrize(
++    "actual, expected",
++    [(1, [("over", -1)]), (0, [])],
++)
++def test_d4_zero_limit(actual, expected):
++    alerts = _one(actual, 0)
++    assert [(a.level, a.remaining) for a in alerts] == expected
++
++
++# D5: 合計が 0 以下（返金など）はアラートなし。
++@pytest.mark.parametrize("actual", [0, -500])
++def test_d5_non_positive_actual_no_alert(actual):
++    assert _one(actual, 10000) == []
++
++
++# D6: 予算の無いカテゴリ、支出の無い予算カテゴリはアラートなし。
++def test_d6_no_budget_or_no_spend_no_alert():
++    budget = _budget(default={"food": 1000})
++    totals = {"2026-01": {"rent": 99999}}
++    assert check_budget(totals, budget) == []
++
++
++# D7: months が default を上書きする。
++def test_d7_month_override_limit():
++    budget = _budget(
++        default={"food": 10000},
++        months={"2026-02": {"food": 5000}},
++    )
++    totals = {
++        "2026-01": {"food": 6000},
++        "2026-02": {"food": 6000},
++    }
++    alerts = check_budget(totals, budget)
++    assert [(a.month, a.level, a.limit) for a in alerts] == [("2026-02", "over", 5000)]
++
++
++# D8: totals に無い月は対象外。空 totals は []。budget にだけある月も無視。
++def test_d8_months_only_in_totals_and_empty_totals():
++    budget = _budget(
++        default={"food": 1000},
++        months={"2026-03": {"food": 1000}},
++    )
++    assert check_budget({}, budget) == []
++    alerts = check_budget({"2026-01": {"food": 500}}, budget)
++    assert alerts == []
++
++
++# D9: 並びは 月の昇順 → over が先 → カテゴリ名の昇順。
++def test_d9_ordering():
++    budget = _budget(default={"food": 1000, "rent": 1000, "book": 1000})
++    totals = {
++        "2026-02": {"rent": 1000, "food": 1100, "book": 1200},
++        "2026-01": {"rent": 800, "food": 500, "book": 1100},
++    }
++    alerts = check_budget(totals, budget)
++    assert [(a.month, a.category, a.level) for a in alerts] == [
++        ("2026-01", "book", "over"),
++        ("2026-01", "rent", "warn"),
++        ("2026-02", "book", "over"),
++        ("2026-02", "food", "over"),
++        ("2026-02", "rent", "warn"),
++    ]
++
++
++# D10: format_alert の over / warn 文言（warn の % は切り捨て）。
++def test_d10_format_over_and_warn():
++    over = BudgetAlert("2026-01", "食費", "over", 10000, 11200, -1200)
++    warn = BudgetAlert("2026-01", "食費", "warn", 10000, 8500, 1500)
++    assert (
++        format_alert(over)
++        == "2026-01 食費: 予算超過 1,200円(予算 10,000円 / 実績 11,200円)"
++    )
++    assert (
++        format_alert(warn)
++        == "2026-01 食費: 予算の 85% に到達(残り 1,500円 / 予算 10,000円 / 実績 8,500円)"
++    )
++
++
++# D11: 入力の totals・budget を書き換えない。
++def test_d11_inputs_not_mutated():
++    budget = _budget(default={"food": 10000}, months={"2026-02": {"food": 5000}})
++    totals = {"2026-01": {"food": 9000}, "2026-02": {"food": 6000}}
++    budget_before = copy.deepcopy(budget)
++    totals_before = copy.deepcopy(totals)
++    check_budget(totals, budget)
++    assert totals == totals_before
++    assert budget == budget_before

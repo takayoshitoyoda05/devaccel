@@ -124,17 +124,25 @@ def main() -> int:
     t = time.time()
     merged, skipped = integrate(root, a.units, head) if a.units else ([], [])
     t = stamp("integrate units", t)
-    if a.check:  # after integration: the parts and the parent's own changes are checked together
-        from stop_gate import failed_section, run_check
+    from stop_gate import failed_section, run_check
+
+    def fast_check() -> tuple[str, str, float]:
         res, _rc, out, secs = run_check(root, int(cfg["gate"].get("timeout_sec", 60)), trusted_root({"cwd": str(root)}),
                                         sandbox=need_confinement(cfg))
+        return res, out, secs
+
+    def fast_failed(res: str, out: str, secs: float) -> int:
+        stage, tail = failed_section(out) if res == "fail" else (res, out[-1500:])
+        print(f"check.sh fast: {res} ({stage}, {secs:.0f}s) — your changes are not committed and nothing was pushed"
+              f"{' (the units are merged)' if merged else ''}; fix and re-run\n{tail}",
+              file=sys.stderr)
+        return 1
+    if a.check and a.no_push:  # local only: nothing to overlap with
+        res, out, secs = fast_check()
         t = stamp("check.sh fast", t)
         if res != "pass":
-            stage, tail = failed_section(out) if res == "fail" else (res, out[-1500:])
-            print(f"check.sh fast: {res} ({stage}, {secs:.0f}s) — your changes are not committed and nothing was pushed"
-                  f"{' (the units are merged)' if merged else ''}; fix and re-run\n{tail}",
-                  file=sys.stderr)
-            return 1
+            return fast_failed(res, out, secs)
+    pre = git(root, "rev-parse", "-q", "--verify", "HEAD").strip()
     if a.paths and sh(root, "add", "--", *a.paths).returncode != 0:
         print("git add failed for --paths", file=sys.stderr)
         return 2
@@ -160,17 +168,40 @@ def main() -> int:
     if not git(root, "config", "--get", "remote.origin.url").strip():
         print("no origin remote", file=sys.stderr)
         return 2
-    # push runs while the evidence is computed (they don't depend on each other); the PR waits for it
-    push = subprocess.Popen(["git", "-C", str(root), "push", "origin", f"HEAD:refs/heads/{head}"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+    # check.sh fast (working tree) and the evidence (check.sh full on a snapshot of HEAD) run side by side;
+    # the push waits for fast to pass, so a failure still leaves nothing committed and nothing pushed
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(1)
+    fast = pool.submit(fast_check) if a.check else None
+    redo: list[bool] = []
 
     def wait_push() -> int:
-        out, err = push.communicate()
-        if push.returncode != 0:
-            print("push failed: " + (err.strip() or out.strip())[:300], file=sys.stderr)
+        if fast is not None:
+            res, out, secs = fast.result()
+            stamp("waited for check.sh fast", t)
+            if res != "pass":
+                if git(root, "rev-parse", "HEAD").strip() != pre:
+                    sh(root, "reset", "-q", pre) if pre else sh(root, "update-ref", "-d", "HEAD")
+                return fast_failed(res, out, secs)
+            if git(root, "status", "--porcelain", "--untracked-files=no").strip():  # fast auto-fixed formatting
+                redo.append(True)
+                return 3
+        p = subprocess.run(["git", "-C", str(root), "push", "origin", f"HEAD:refs/heads/{head}"],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if p.returncode != 0:
+            print("push failed: " + (p.stderr.strip() or p.stdout.strip())[:300], file=sys.stderr)
             return 1
         return 0
     rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
+    pool.shutdown()
+    if redo:  # the evidence judged the commit before the fix: commit the fix, then judge that commit
+        sh(root, "add", "-u")
+        if pre and git(root, "rev-parse", "HEAD").strip() != pre:
+            sh(root, "commit", "-q", "--amend", "--no-edit")
+        else:
+            sh(root, "commit", "-q", "-m", title)
+        fast, redo = None, []
+        rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push)
     if rc == 0:  # used: a later ship must never reuse these notes (a failed Write would ship stale ones)
         nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
         if root.resolve() in nf.resolve().parents:

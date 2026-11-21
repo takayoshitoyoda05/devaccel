@@ -43,9 +43,11 @@ DEFAULTS: dict = {
     "guard": {"deny_regex": [], "ask_regex": []},
     # Anthropic-style parallel work: /batch fans out, devaccel-pr turns each unit into an
     # evidence PR labeled evidence-ok / needs-human. auto_merge only for evidence-ok.
+    # strong = how many of the longest items run on sonnet (the slowest haiku unit set the wall clock and was
+    # where the quality dips came from: same blind score as all-haiku at ~18% less time; 0 = all haiku)
     # max_jobs 0 = decide per machine at run time (memory and CPUs); unit_mem_mb = per-unit estimate
     # (claude -p + its confined check; depends on the project's tools)
-    "parallel": {"auto_merge": False, "max_jobs": 0, "unit_mem_mb": 300},
+    "parallel": {"auto_merge": False, "max_jobs": 0, "unit_mem_mb": 300, "strong": 1},
     # sessions: when Claude stops with uncommitted code changes, ask once to open the evidence PR (devaccel-pr)
     "pr": {"auto": True},
 }

@@ -1,0 +1,793 @@
+diff --git a/docs/design/20261121-budget-alerts.md b/docs/design/20261121-budget-alerts.md
+new file mode 100644
+index 0000000..dec821d
+--- /dev/null
++++ b/docs/design/20261121-budget-alerts.md
+@@ -0,0 +1,36 @@
++# budget-alerts
++目的: カテゴリ別の月予算に対し、超過・警告(もうすぐ超えそう)・月末予測超えを判定し、通知文にする純粋関数群 / やらないこと: CLI・既存ファイルの変更、予算ファイル読込(`core.load_budget` が既にある)、I/O
++共通前提: 標準ライブラリのみ・既存ファイル不変・予算は既存の `kakeibo.core.Budget`(`for_month(month)` が `dict[str,int]` を返す)を再利用し新しい予算型は作らない。各件は互いに import しない(`kakeibo.core` の import だけ可)。件どうしのデータ受け渡しは素の dict / tuple。金額は円の整数。
++判断一覧(依頼から決められない点の既定):
++D1 超過 = `actual > limit`(ちょうど上限は超過でない)。警告 = 超過でなく `actual >= limit * warn_ratio`(`warn_ratio` 既定 0.8、`0 < warn_ratio <= 1`、外れたら `ValueError("warn_ratio ...")`)。比較は整数演算で誤差を出さない(`actual * 100 >= limit * round(warn_ratio*100)` のような近似は禁止。`Fraction(str(warn_ratio))` などで厳密に)。
++D2 型: 金額・上限は `int` のみ。`bool`・`float`・`str`・`None` は `TypeError`(どの引数かをメッセージに書く)。上限が負は `ValueError`。実績(actual)は返金で負になりうるので負を受ける。
++D3 上限 0: `actual > 0` なら over、`actual <= 0` は ok(warn にしない)。
++D4 予算にないカテゴリの支出は対象外(結果に出さない)。予算だけあって支出のないカテゴリは actual 0 として結果に出す(level は ok)。
++D5 レベルの強さ: over > forecast > warn > ok。forecast = 超過でなく、月末予測 > limit。warn と forecast が両方成り立てば forecast。
++D6 並び: 強いレベル順、同レベルは超過額(over のとき `actual-limit`、他は `limit-actual` の昇順=余裕の少ない順)、同点はカテゴリ名の昇順(`sorted` の文字列順)。
++
++1. `src/kakeibo/budget_status.py` + `tests/test_budget_status.py` — `@dataclass(frozen=True) class BudgetStatus: category: str; limit: int; actual: int; level: str; margin: int`(level は `"over"|"forecast"|"warn"|"ok"`、margin = `limit - actual`、over のとき負) と `def evaluate_month(actuals: dict[str, int], limits: dict[str, int], warn_ratio: float = 0.8, projected: dict[str, int] | None = None) -> list[BudgetStatus]`
++規則: R1 受け付ける `warn_ratio`: `0.8` `0.5` `1` `1.0` `0.01`(`0`・負・`1.01`・`nan`・`bool`・`str` は拒否: 数値型違いは `TypeError`、範囲外は `ValueError`) / R2 並びは D6、同点はカテゴリ名昇順 / R3 `projected` が `None` または当該カテゴリを含まなければ forecast 判定はしない。`projected` のカテゴリ値は `int` のみ(それ以外は `TypeError`)。`actuals` / `limits` の各値も D2 の検査(キーが `str` でなければ `TypeError`) / R4 空の `limits` は空リスト。入力 dict を変更しない。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E1-1 | actuals={"食費":40000}, limits={"食費":40000} | level "warn"、margin 0(ちょうどは超過でない) | D1 |
++| E1-2 | actuals={"食費":10000}, limits={"食費":30000}, projected={"食費":35000} | level "forecast" | D5 |
++| E1-3 | actuals={"交通":5}, limits={"交通":0} | level "over"、margin -5 | D3 |
++
++2. `src/kakeibo/budget_projection.py` + `tests/test_budget_projection.py` — `def project_month_end(actuals: dict[str, int], today: date) -> dict[str, int]`(`from datetime import date`、`calendar.monthrange` で月の日数)
++規則: R1 予測 = 日割り線形: `actual * days_in_month // elapsed`(整数の切り捨て、`elapsed = today.day`)。負の actual(返金超過)は 0 に切り上げず `//` の床除算のまま返さず、`0` を下限にする(`max(0, …)`) / R2 `today` が月末日(`elapsed == days_in_month`)なら予測 = `max(0, actual)` / R3 受け付ける `today`: `date` のみ(`datetime` は `date` のサブクラスだが `TypeError` にして弾く。`str`・`None` も `TypeError`)。`actuals` の値は D2 の型検査(実績は負も可)、キーは `str` でなければ `TypeError` / R4 空の `actuals` は空 dict。入力を変更しない。返す dict のキー順は入力順。閏年 2024-02 は 29 日として計算する。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E2-1 | {"食費":10000}, date(2026,11,10) | {"食費":30000}(30 日の月、10 日で 10000) | R1 |
++| E2-2 | {"食費":10001}, date(2026,11,3) | {"食費":100010} | R1 |
++| E2-3 | {"食費":-500}, date(2026,11,15) | {"食費":0} | R1 |
++
++3. `src/kakeibo/budget_report.py` + `tests/test_budget_report.py` — `def format_alerts(rows: list[tuple[str, str, int, int]], month: str | None = None) -> list[str]`(rows の要素は `(category, level, limit, actual)`、level は `"over"|"forecast"|"warn"|"ok"`。`BudgetStatus` は import せず素の tuple を受ける)
++規則: R1 出力は 1 件 1 行の日本語。`ok` は出さない(行に含めない)。書式は over: `{prefix}{category}: 予算超過 {over:,}円(予算 {limit:,}円 / 使用 {actual:,}円)`、forecast: `{prefix}{category}: このままでは超過しそう(予算 {limit:,}円 / 使用 {actual:,}円)`、warn: `{prefix}{category}: 予算の {pct}% に達しました(予算 {limit:,}円 / 使用 {actual:,}円)`(`pct = actual*100 // limit` の整数、limit 0 の warn は出ない前提だが来たら `ValueError("limit ...")`)。`prefix` は `month` があれば `"{month} "`、無ければ空 / R2 並びは入力順を保つ(並べ替えない。並べるのは呼び出し側) / R3 検査: level が上記 4 つ以外は `ValueError("level ...")`、金額・上限が `int` 以外(`bool`・`float` 含む)は `TypeError`、`limit` が負は `ValueError`、`month` は `YYYY-MM`(`2026-11`、1〜12 月のみ)以外の文字列は `ValueError`、`str` 以外は `TypeError`。空の rows は空リスト。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E3-1 | [("食費","over",30000,32500)], "2026-11" | ["2026-11 食費: 予算超過 2,500円(予算 30,000円 / 使用 32,500円)"] | R1 |
++| E3-2 | [("交通","ok",5000,100)] | [] | R1 |
++| E3-3 | [("交通","warn",5000,4000)] | ["交通: 予算の 80% に達しました(予算 5,000円 / 使用 4,000円)"] | R1 |
++
++<!-- end -->
+diff --git a/src/kakeibo/budget_projection.py b/src/kakeibo/budget_projection.py
+new file mode 100644
+index 0000000..1d993c1
+--- /dev/null
++++ b/src/kakeibo/budget_projection.py
+@@ -0,0 +1,37 @@
++"""カテゴリ別の月末予測(日割り線形)。純粋関数のみ。"""
++
++import calendar
++from datetime import date
++
++
++def _check_int(name: str, value: object) -> None:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise TypeError(f"{name} must be int, got {type(value).__name__}")
++
++
++def project_month_end(actuals: dict[str, int], today: date) -> dict[str, int]:
++    """各カテゴリの月末予測を返す。
++
++    予測 = actual * days_in_month // elapsed (elapsed = today.day)。
++    負の結果は 0 に下限を設ける。today が月末日なら予測 = max(0, actual)。
++    """
++    # datetime は date のサブクラスなので type() で厳密に弾く
++    if type(today) is not date:
++        raise TypeError(f"today must be date, got {type(today).__name__}")
++
++    for key, value in actuals.items():
++        if not isinstance(key, str):
++            raise TypeError(f"category key must be str, got {type(key).__name__}")
++        _check_int(f"actual for {key!r}", value)
++
++    days_in_month = calendar.monthrange(today.year, today.month)[1]
++    elapsed = today.day
++
++    result: dict[str, int] = {}
++    for key, actual in actuals.items():
++        if elapsed == days_in_month:
++            projected = actual
++        else:
++            projected = actual * days_in_month // elapsed
++        result[key] = max(0, projected)
++    return result
+diff --git a/src/kakeibo/budget_report.py b/src/kakeibo/budget_report.py
+new file mode 100644
+index 0000000..de8dd19
+--- /dev/null
++++ b/src/kakeibo/budget_report.py
+@@ -0,0 +1,64 @@
++"""予算アラートの通知文を作る純粋関数。
++
++入力は (category, level, limit, actual) の素の tuple。判定自体は行わない。
++"""
++
++from __future__ import annotations
++
++import re
++
++_LEVELS = ("over", "forecast", "warn", "ok")
++_MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
++
++
++def _check_int(value: object, name: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise TypeError(f"{name} は int である必要があります: {value!r}")
++    return value
++
++
++def _check_month(month: object) -> str:
++    if month is None:
++        return ""
++    if not isinstance(month, str):
++        raise TypeError(f"month は str である必要があります: {month!r}")
++    if not _MONTH_RE.fullmatch(month):
++        raise ValueError(f"month は YYYY-MM 形式である必要があります: {month!r}")
++    return f"{month} "
++
++
++def format_alerts(
++    rows: list[tuple[str, str, int, int]], month: str | None = None
++) -> list[str]:
++    """各行を通知文にする。ok は出さず、入力順を保つ。"""
++    prefix = _check_month(month)
++    lines: list[str] = []
++    for category, level, limit, actual in rows:
++        if level not in _LEVELS:
++            raise ValueError(f"level は {_LEVELS} のいずれかです: {level!r}")
++        _check_int(limit, "limit")
++        _check_int(actual, "actual")
++        if limit < 0:
++            raise ValueError(f"limit は負にできません: {limit!r}")
++
++        if level == "ok":
++            continue
++        if level == "over":
++            lines.append(
++                f"{prefix}{category}: 予算超過 {actual - limit:,}円"
++                f"(予算 {limit:,}円 / 使用 {actual:,}円)"
++            )
++        elif level == "forecast":
++            lines.append(
++                f"{prefix}{category}: このままでは超過しそう"
++                f"(予算 {limit:,}円 / 使用 {actual:,}円)"
++            )
++        else:  # warn
++            if limit == 0:
++                raise ValueError(f"limit は warn では 0 にできません: {limit!r}")
++            pct = actual * 100 // limit
++            lines.append(
++                f"{prefix}{category}: 予算の {pct}% に達しました"
++                f"(予算 {limit:,}円 / 使用 {actual:,}円)"
++            )
++    return lines
+diff --git a/src/kakeibo/budget_status.py b/src/kakeibo/budget_status.py
+new file mode 100644
+index 0000000..d09c5a7
+--- /dev/null
++++ b/src/kakeibo/budget_status.py
+@@ -0,0 +1,99 @@
++"""Per-category monthly budget status: over / forecast / warn / ok.
++
++Pure functions only: no I/O. Budget values are plain dicts (``dict[str, int]``),
++as returned by ``kakeibo.core.Budget.for_month``.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from fractions import Fraction
++
++_RANK = {"over": 0, "forecast": 1, "warn": 2, "ok": 3}
++
++
++@dataclass(frozen=True)
++class BudgetStatus:
++    category: str
++    limit: int
++    actual: int
++    level: str  # "over" | "forecast" | "warn" | "ok"
++    margin: int  # limit - actual; negative when over
++
++
++def _check_int(value: object, where: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise TypeError(f"{where} は int である必要があります: {value!r}")
++    return value
++
++
++def _check_str_key(key: object, where: str) -> str:
++    if not isinstance(key, str):
++        raise TypeError(f"{where} のキーは str である必要があります: {key!r}")
++    return key
++
++
++def _warn_fraction(warn_ratio: object) -> Fraction:
++    if isinstance(warn_ratio, bool) or not isinstance(warn_ratio, (int, float)):
++        raise TypeError(f"warn_ratio は数値である必要があります: {warn_ratio!r}")
++    # nan は比較が偽になるので、この検査で弾かれる。
++    if not 0 < warn_ratio <= 1:
++        raise ValueError(
++            f"warn_ratio は 0 < warn_ratio <= 1 である必要があります: {warn_ratio!r}"
++        )
++    # str 経由で厳密な有理数にする (float の二進誤差を持ち込まない)。
++    return Fraction(str(warn_ratio))
++
++
++def evaluate_month(
++    actuals: dict[str, int],
++    limits: dict[str, int],
++    warn_ratio: float = 0.8,
++    projected: dict[str, int] | None = None,
++) -> list[BudgetStatus]:
++    """Judge each budgeted category for one month.
++
++    - over: actual > limit
++    - forecast: not over, and projected month-end > limit
++    - warn: not over, limit > 0, and actual >= limit * warn_ratio
++    - ok: otherwise
++
++    Only categories in ``limits`` are reported. Results are sorted by level
++    (over > forecast > warn > ok), then by slack (least slack first; for over,
++    the overrun amount), then by category name.
++    """
++    ratio = _warn_fraction(warn_ratio)
++
++    for cat, amount in actuals.items():
++        _check_str_key(cat, "actuals")
++        _check_int(amount, f"actuals[{cat!r}]")
++    for cat, limit in limits.items():
++        _check_str_key(cat, "limits")
++        _check_int(limit, f"limits[{cat!r}]")
++        if limit < 0:
++            raise ValueError(f"limits[{cat!r}] は 0 以上である必要があります: {limit}")
++    if projected is not None:
++        for cat, amount in projected.items():
++            _check_int(amount, f"projected[{cat!r}]")
++
++    found: list[tuple[tuple[int, int, str], BudgetStatus]] = []
++    for cat, limit in limits.items():
++        actual = actuals.get(cat, 0)
++        margin = limit - actual
++        if actual > limit:
++            level = "over"
++        elif projected is not None and cat in projected and projected[cat] > limit:
++            level = "forecast"
++        elif limit > 0 and actual >= limit * ratio:
++            level = "warn"
++        else:
++            level = "ok"
++        # 同レベル内は余裕の少ない順 (over は超過額の昇順)、同点はカテゴリ名順。
++        slack = -margin if level == "over" else margin
++        status = BudgetStatus(
++            category=cat, limit=limit, actual=actual, level=level, margin=margin
++        )
++        found.append(((_RANK[level], slack, cat), status))
++
++    found.sort(key=lambda item: item[0])
++    return [status for _, status in found]
+diff --git a/tests/test_budget_projection.py b/tests/test_budget_projection.py
+new file mode 100644
+index 0000000..5921840
+--- /dev/null
++++ b/tests/test_budget_projection.py
+@@ -0,0 +1,105 @@
++from datetime import date, datetime
++
++import pytest
++
++from kakeibo.budget_projection import project_month_end
++
++
++# 例の表(E2-1 〜 E2-3)
++@pytest.mark.parametrize(
++    ("actuals", "today", "expected"),
++    [
++        pytest.param({"食費": 10000}, date(2026, 11, 10), {"食費": 30000}, id="E2-1"),
++        pytest.param({"食費": 10001}, date(2026, 11, 3), {"食費": 100010}, id="E2-2"),
++        pytest.param({"食費": -500}, date(2026, 11, 15), {"食費": 0}, id="E2-3"),
++    ],
++)
++def test_spec_examples(actuals, today, expected):
++    assert project_month_end(actuals, today) == expected
++
++
++# R1: 日割り線形 + 床除算
++def test_floor_division_truncates():
++    # 11/3 は 30 日の月で 10001 * 30 // 3 = 100010 (割り切れる)
++    # 11/4: 10001 * 30 // 4 = 75007 (切り捨て)
++    assert project_month_end({"食費": 10001}, date(2026, 11, 4)) == {"食費": 75007}
++
++
++# R1: 負の実績は 0 を下限にする
++def test_negative_actual_clamped_to_zero():
++    assert project_month_end({"食費": -1}, date(2026, 11, 1)) == {"食費": 0}
++
++
++# R1: 実績 0 は 0
++def test_zero_actual_projects_zero():
++    assert project_month_end({"食費": 0}, date(2026, 11, 10)) == {"食費": 0}
++
++
++# R2: 月末日は実績そのまま(負は 0)
++def test_month_end_returns_actual():
++    assert project_month_end({"食費": 12345}, date(2026, 11, 30)) == {"食費": 12345}
++
++
++def test_month_end_negative_clamped_to_zero():
++    assert project_month_end({"食費": -700}, date(2026, 11, 30)) == {"食費": 0}
++
++
++# 閏年 2024-02 は 29 日
++def test_leap_year_february_has_29_days():
++    # 2 日で 1000 → 1000 * 29 // 2 = 14500
++    assert project_month_end({"食費": 1000}, date(2024, 2, 2)) == {"食費": 14500}
++
++
++def test_leap_year_february_month_end_is_29():
++    assert project_month_end({"食費": 500}, date(2024, 2, 29)) == {"食費": 500}
++
++
++def test_non_leap_february_has_28_days():
++    # 2026-02-28 は月末
++    assert project_month_end({"食費": 500}, date(2026, 2, 28)) == {"食費": 500}
++
++
++# R4: 空 dict は空 dict
++def test_empty_actuals_returns_empty():
++    assert project_month_end({}, date(2026, 11, 10)) == {}
++
++
++# 入力を変更しない
++def test_input_not_mutated():
++    actuals = {"食費": 10000, "交通費": -300}
++    snapshot = dict(actuals)
++    project_month_end(actuals, date(2026, 11, 10))
++    assert actuals == snapshot
++
++
++# 返す dict のキー順は入力順
++def test_key_order_preserved():
++    actuals = {"食費": 100, "交通費": 200, "娯楽": 300}
++    result = project_month_end(actuals, date(2026, 11, 10))
++    assert list(result) == ["食費", "交通費", "娯楽"]
++
++
++# R3: today は date のみ。datetime は date のサブクラスだが TypeError
++def test_datetime_today_rejected():
++    with pytest.raises(TypeError):
++        project_month_end({"食費": 100}, datetime(2026, 11, 10))
++
++
++@pytest.mark.parametrize("bad_today", ["2026-11-10", None, 20261110])
++def test_non_date_today_rejected(bad_today):
++    with pytest.raises(TypeError):
++        project_month_end({"食費": 100}, bad_today)
++
++
++# D2: 値の型検査(実績は負も可だが bool/float/str/None は TypeError)
++@pytest.mark.parametrize("bad_value", [True, 1.5, "100", None])
++def test_non_int_actual_rejected(bad_value):
++    with pytest.raises(TypeError, match="食費"):
++        project_month_end({"食費": bad_value}, date(2026, 11, 10))
++
++
++# キーは str でなければ TypeError
++@pytest.mark.parametrize("bad_key", [1, None, b"food"])
++def test_non_str_key_rejected(bad_key):
++    with pytest.raises(TypeError):
++        project_month_end({bad_key: 100}, date(2026, 11, 10))
+diff --git a/tests/test_budget_report.py b/tests/test_budget_report.py
+new file mode 100644
+index 0000000..ee3ce36
+--- /dev/null
++++ b/tests/test_budget_report.py
+@@ -0,0 +1,185 @@
++from typing import Any
++
++import pytest
++
++from kakeibo.budget_report import format_alerts
++
++
++# 例の表 E3-1〜E3-3 (仕様どおり)
++@pytest.mark.parametrize(
++    ("rows", "month", "expected"),
++    [
++        pytest.param(
++            [("食費", "over", 30000, 32500)],
++            "2026-11",
++            ["2026-11 食費: 予算超過 2,500円(予算 30,000円 / 使用 32,500円)"],
++            id="E3-1",
++        ),
++        pytest.param(
++            [("交通", "ok", 5000, 100)],
++            None,
++            [],
++            id="E3-2",
++        ),
++        pytest.param(
++            [("交通", "warn", 5000, 4000)],
++            None,
++            ["交通: 予算の 80% に達しました(予算 5,000円 / 使用 4,000円)"],
++            id="E3-3",
++        ),
++    ],
++)
++def test_spec_examples(rows, month, expected):
++    assert format_alerts(rows, month) == expected
++
++
++# 端のケース (仕様の文面から)
++def test_empty_rows_returns_empty_list():
++    assert format_alerts([]) == []
++
++
++def test_ok_only_returns_empty_list():
++    assert format_alerts([("食費", "ok", 1000, 0), ("娯楽", "ok", 0, 0)]) == []
++
++
++def test_forecast_format():
++    assert format_alerts([("娯楽", "forecast", 10000, 6000)]) == [
++        "娯楽: このままでは超過しそう(予算 10,000円 / 使用 6,000円)"
++    ]
++
++
++def test_forecast_with_month_prefix():
++    assert format_alerts([("娯楽", "forecast", 10000, 6000)], "2026-01") == [
++        "2026-01 娯楽: このままでは超過しそう(予算 10,000円 / 使用 6,000円)"
++    ]
++
++
++def test_over_line_with_zero_excess_is_rendered_as_given():
++    # level は呼び出し側が決める。over が渡されたら超過額 0円 でもそのまま行にする
++    assert format_alerts([("食費", "over", 1000, 1000)]) == [
++        "食費: 予算超過 0円(予算 1,000円 / 使用 1,000円)"
++    ]
++
++
++def test_warn_pct_is_floor_of_integer_division():
++    # 2 / 3 = 66.66...% -> 66
++    assert format_alerts([("食費", "warn", 3, 2)]) == [
++        "食費: 予算の 66% に達しました(予算 3円 / 使用 2円)"
++    ]
++
++
++def test_order_is_kept_as_input():
++    rows = [
++        ("b", "warn", 1000, 800),
++        ("a", "over", 1000, 1500),
++        ("c", "forecast", 1000, 500),
++    ]
++    out = format_alerts(rows)
++    assert [line.split(":")[0] for line in out] == ["b", "a", "c"]
++
++
++def test_ok_rows_are_skipped_among_others():
++    rows = [("食費", "ok", 1000, 10), ("交通", "warn", 1000, 900)]
++    assert format_alerts(rows) == [
++        "交通: 予算の 90% に達しました(予算 1,000円 / 使用 900円)"
++    ]
++
++
++def test_negative_actual_is_accepted_for_ok_and_warn():
++    # 返金で実績が負になりうる
++    assert format_alerts([("食費", "ok", 1000, -500)]) == []
++
++
++def test_large_amounts_use_thousands_separator():
++    assert format_alerts([("家賃", "over", 1_000_000, 1_234_567)]) == [
++        "家賃: 予算超過 234,567円(予算 1,000,000円 / 使用 1,234,567円)"
++    ]
++
++
++# 検査 (R3)
++@pytest.mark.parametrize(
++    "rows",
++    [
++        [("食費", "danger", 1000, 2000)],
++        [("食費", "OVER", 1000, 2000)],
++        [("食費", None, 1000, 2000)],
++    ],
++)
++def test_bad_level_raises_value_error(rows):
++    with pytest.raises(ValueError, match="level"):
++        format_alerts(rows)
++
++
++@pytest.mark.parametrize(
++    "row",
++    [
++        ("食費", "over", True, 2000),
++        ("食費", "over", 1000, True),
++        ("食費", "over", 1000.0, 2000),
++        ("食費", "over", 1000, 2000.0),
++        ("食費", "over", "1000", 2000),
++        ("食費", "over", 1000, None),
++        ("食費", "ok", None, 0),
++    ],
++)
++def test_non_int_amount_raises_type_error(row):
++    bad: Any = [row]  # 型外の値を意図的に渡す
++    with pytest.raises(TypeError):
++        format_alerts(bad)
++
++
++def test_type_error_message_names_the_argument():
++    with pytest.raises(TypeError, match="limit"):
++        bad_limit: Any = [("食費", "over", 1.5, 2000)]
++        format_alerts(bad_limit)
++    with pytest.raises(TypeError, match="actual"):
++        bad_actual: Any = [("食費", "over", 1000, 2.0)]
++        format_alerts(bad_actual)
++
++
++def test_negative_limit_raises_value_error():
++    with pytest.raises(ValueError, match="limit"):
++        format_alerts([("食費", "ok", -1, 0)])
++
++
++def test_zero_limit_warn_raises_value_error():
++    with pytest.raises(ValueError, match="limit"):
++        format_alerts([("食費", "warn", 0, 0)])
++
++
++def test_zero_limit_over_is_allowed():
++    assert format_alerts([("食費", "over", 0, 100)]) == [
++        "食費: 予算超過 100円(予算 0円 / 使用 100円)"
++    ]
++
++
++@pytest.mark.parametrize(
++    "month",
++    [
++        "2026-13",
++        "2026-00",
++        "2026-1",
++        "26-11",
++        "2026/11",
++        "2026-11 ",
++        "２０２６-11",
++        "",
++        "2026-011",
++    ],
++)
++def test_bad_month_raises_value_error(month):
++    with pytest.raises(ValueError, match="month"):
++        format_alerts([("食費", "over", 1, 2)], month)
++
++
++@pytest.mark.parametrize("month", ["2026-01", "2026-12"])
++def test_month_boundaries_accepted(month):
++    assert format_alerts([("食費", "over", 1, 2)], month) == [
++        f"{month} 食費: 予算超過 1円(予算 1円 / 使用 2円)"
++    ]
++
++
++@pytest.mark.parametrize("month", [202611, 11, b"2026-11"])
++def test_non_str_month_raises_type_error(month):
++    with pytest.raises(TypeError, match="month"):
++        format_alerts([("食費", "over", 1, 2)], month)
+diff --git a/tests/test_budget_status.py b/tests/test_budget_status.py
+new file mode 100644
+index 0000000..5741c72
+--- /dev/null
++++ b/tests/test_budget_status.py
+@@ -0,0 +1,225 @@
++"""Tests for kakeibo.budget_status.evaluate_month."""
++
++from __future__ import annotations
++
++import math
++
++import pytest
++
++from kakeibo.budget_status import BudgetStatus, evaluate_month
++
++
++# 仕様の例の表 (E1-1 ... E1-3) をそのまま写す。
++@pytest.mark.parametrize(
++    ("actuals", "limits", "projected", "level", "margin"),
++    [
++        ({"食費": 40000}, {"食費": 40000}, None, "warn", 0),
++        ({"食費": 10000}, {"食費": 30000}, {"食費": 35000}, "forecast", 20000),
++        ({"交通": 5}, {"交通": 0}, None, "over", -5),
++    ],
++    ids=["E1-1", "E1-2", "E1-3"],
++)
++def test_spec_examples(actuals, limits, projected, level, margin):
++    [status] = evaluate_month(actuals, limits, projected=projected)
++    assert status.level == level
++    assert status.margin == margin
++
++
++# --- D1: over / warn の境界 ---
++
++
++def test_over_is_strictly_greater_than_limit():
++    [status] = evaluate_month({"食費": 30001}, {"食費": 30000})
++    assert status.level == "over"
++    assert status.margin == -1
++
++
++def test_warn_at_exact_ratio_boundary():
++    # 10000 * 0.8 = 8000 ちょうどは warn
++    [status] = evaluate_month({"食費": 8000}, {"食費": 10000})
++    assert status.level == "warn"
++
++
++def test_just_below_ratio_boundary_is_ok():
++    [status] = evaluate_month({"食費": 7999}, {"食費": 10000})
++    assert status.level == "ok"
++
++
++def test_warn_ratio_one_warns_only_at_limit():
++    [at_limit] = evaluate_month({"食費": 10000}, {"食費": 10000}, warn_ratio=1)
++    [below] = evaluate_month({"食費": 9999}, {"食費": 10000}, warn_ratio=1)
++    assert at_limit.level == "warn"
++    assert below.level == "ok"
++
++
++def test_warn_comparison_is_exact_for_decimal_ratio():
++    # 0.1 は float では誤差があるが、10 * 0.1 = 1 ちょうどで warn になること
++    [status] = evaluate_month({"x": 1}, {"x": 10}, warn_ratio=0.1)
++    assert status.level == "warn"
++
++
++# --- D3: 上限 0 ---
++
++
++def test_zero_limit_and_zero_actual_is_ok_not_warn():
++    [status] = evaluate_month({"交通": 0}, {"交通": 0})
++    assert status.level == "ok"
++    assert status.margin == 0
++
++
++def test_zero_limit_and_negative_actual_is_ok():
++    [status] = evaluate_month({"交通": -300}, {"交通": 0})
++    assert status.level == "ok"
++    assert status.margin == 300
++
++
++# --- D2: 負の実績・型・負の上限 ---
++
++
++def test_negative_actual_from_refund_is_accepted_as_ok():
++    [status] = evaluate_month({"食費": -100}, {"食費": 1000})
++    assert status.level == "ok"
++    assert status.margin == 1100
++
++
++@pytest.mark.parametrize("bad", [True, 1.0, "100", None])
++def test_actual_value_wrong_type_raises_type_error(bad):
++    with pytest.raises(TypeError, match="actuals"):
++        evaluate_month({"食費": bad}, {"食費": 1000})
++
++
++@pytest.mark.parametrize("bad", [True, 1.0, "1000", None])
++def test_limit_value_wrong_type_raises_type_error(bad):
++    with pytest.raises(TypeError, match="limits"):
++        evaluate_month({"食費": 0}, {"食費": bad})
++
++
++@pytest.mark.parametrize("bad", [True, 1.0, "100"])
++def test_projected_value_wrong_type_raises_type_error(bad):
++    with pytest.raises(TypeError, match="projected"):
++        evaluate_month({"食費": 0}, {"食費": 1000}, projected={"食費": bad})
++
++
++def test_non_str_category_key_raises_type_error():
++    with pytest.raises(TypeError):
++        evaluate_month({1: 0}, {"食費": 1000})  # type: ignore[dict-item]
++    with pytest.raises(TypeError):
++        evaluate_month({"食費": 0}, {1: 1000})  # type: ignore[dict-item]
++
++
++def test_negative_limit_raises_value_error():
++    with pytest.raises(ValueError, match="limits"):
++        evaluate_month({"食費": 0}, {"食費": -1})
++
++
++# --- R1: warn_ratio の受け付け・拒否 ---
++
++
++@pytest.mark.parametrize("ratio", [0.8, 0.5, 1, 1.0, 0.01])
++def test_valid_warn_ratio_accepted(ratio):
++    evaluate_month({"食費": 0}, {"食費": 1000}, warn_ratio=ratio)
++
++
++@pytest.mark.parametrize("ratio", [0, -0.5, 1.01, math.nan])
++def test_out_of_range_warn_ratio_raises_value_error(ratio):
++    with pytest.raises(ValueError, match="warn_ratio"):
++        evaluate_month({"食費": 0}, {"食費": 1000}, warn_ratio=ratio)
++
++
++@pytest.mark.parametrize("ratio", [True, "0.8", None])
++def test_non_numeric_warn_ratio_raises_type_error(ratio):
++    with pytest.raises(TypeError, match="warn_ratio"):
++        evaluate_month({"食費": 0}, {"食費": 1000}, warn_ratio=ratio)
++
++
++# --- R3 / D5: forecast ---
++
++
++def test_forecast_over_limit_when_not_yet_over():
++    [status] = evaluate_month({"食費": 0}, {"食費": 1000}, projected={"食費": 1001})
++    assert status.level == "forecast"
++
++
++def test_projected_equal_to_limit_is_not_forecast():
++    [status] = evaluate_month({"食費": 0}, {"食費": 1000}, projected={"食費": 1000})
++    assert status.level == "ok"
++
++
++def test_forecast_wins_over_warn():
++    [status] = evaluate_month({"食費": 900}, {"食費": 1000}, projected={"食費": 1200})
++    assert status.level == "forecast"
++
++
++def test_over_wins_over_forecast():
++    [status] = evaluate_month({"食費": 1500}, {"食費": 1000}, projected={"食費": 2000})
++    assert status.level == "over"
++
++
++def test_no_forecast_when_projected_is_none_or_missing_category():
++    [a] = evaluate_month({"食費": 0}, {"食費": 1000}, projected=None)
++    [b] = evaluate_month({"食費": 0}, {"食費": 1000}, projected={"交通": 5000})
++    assert a.level == "ok"
++    assert b.level == "ok"
++
++
++# --- D4: 対象カテゴリ ---
++
++
++def test_actual_category_without_budget_is_not_reported():
++    result = evaluate_month({"食費": 0, "娯楽": 99999}, {"食費": 1000})
++    assert [s.category for s in result] == ["食費"]
++
++
++def test_budget_category_without_spending_is_reported_as_zero_ok():
++    [status] = evaluate_month({}, {"住居": 80000})
++    assert status == BudgetStatus(
++        category="住居", limit=80000, actual=0, level="ok", margin=80000
++    )
++
++
++# --- R2 / D6: 並び ---
++
++
++def test_sort_by_level_then_slack_then_name():
++    limits = {
++        "ov_big": 100,
++        "ov_small": 100,
++        "fc": 100,
++        "warn_b": 100,
++        "warn_a": 100,
++        "ok": 100,
++    }
++    actuals = {
++        "ov_big": 300,
++        "ov_small": 120,
++        "fc": 10,
++        "warn_b": 85,
++        "warn_a": 85,
++        "ok": 0,
++    }
++    result = evaluate_month(actuals, limits, projected={"fc": 150})
++    assert [s.category for s in result] == [
++        "ov_small",  # over, 超過額 20
++        "ov_big",  # over, 超過額 200
++        "fc",  # forecast
++        "warn_a",  # warn, 余裕 15, 同点は名前順
++        "warn_b",
++        "ok",
++    ]
++
++
++# --- R4 / 基本 ---
++
++
++def test_empty_limits_returns_empty_list():
++    assert evaluate_month({"食費": 5000}, {}) == []
++
++
++def test_inputs_are_not_mutated():
++    actuals = {"食費": 100}
++    limits = {"食費": 1000, "交通": 500}
++    projected = {"食費": 2000}
++    evaluate_month(actuals, limits, projected=projected)
++    assert actuals == {"食費": 100}
++    assert limits == {"食費": 1000, "交通": 500}
++    assert projected == {"食費": 2000}

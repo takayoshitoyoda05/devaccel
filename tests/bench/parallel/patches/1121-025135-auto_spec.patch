@@ -1,0 +1,464 @@
+diff --git a/docs/design/20261121-recurring.md b/docs/design/20261121-recurring.md
+new file mode 100644
+index 0000000..6b12a3e
+--- /dev/null
++++ b/docs/design/20261121-recurring.md
+@@ -0,0 +1,37 @@
++# recurring
++目的: 明細から毎月決まって出る支出(サブスク・家賃)を見つけ、次の支払予定日を出す純粋関数群 / やらないこと: CLI・既存ファイルの変更、毎月以外(週・年)の周期、I/O
++共通前提: 標準ライブラリのみ・既存ファイル不変・使う型 `kakeibo.core.Expense`(day: date, category: str, amount: int, memo: str)。件どうしは import しない。
++判断一覧(依頼から決められない点の既定):
++- D1 周期は毎月のみ。日付は 1 か月 1 回、連続した月(欠けた月・同月 2 回は毎月ではない)。
++- D2 基準日は系列の日の最大値(31・31・28 の次は、31 を翌月の月末にクランプした日)。
++- D3 同一とみなす単位は カテゴリ + 正規化メモ + 金額の揺れ(既定 ±10%)。値上げは揺れ内なら同じ系列、超えたら別系列。
++- D4 返金・負の金額と 0 円は系列に混ぜない(無視)。
++- D5 毎月とみなす最小件数は 3(下限の検査あり。2 以下は ValueError)。
++- D6 同じ月に 2 回ある同一系列(5 日と 20 日の同額)は 1 つの系列にまとめるが、毎月ではないと判定する(分割しない)。
++
++1. `src/kakeibo/cadence.py` + `tests/test_cadence.py` — `def is_monthly(days: Sequence[date], min_count: int = 3, jitter_days: int = 3) -> bool` / `def next_due(days: Sequence[date]) -> date`
++規則:
++- R1 受け付ける入力: `datetime.date`(`datetime.datetime` は date の仲間だが TypeError)。順不同でもよく、内部で昇順に並べる。`str`・`None` を含むと TypeError。
++- R2 `is_monthly`: 昇順にした日付の (年*12+月) が 1 ずつ増え続けるなら真候補(欠け月・同月重複は偽)。件数が min_count 未満は偽。各日の日は、系列の最大の日を当月末でクランプした日から jitter_days 日以内(月末をまたぐ差は日付の差で測る)。min_count < 3 や jitter_days < 0 や bool は ValueError / TypeError(引数名をメッセージに含める)。
++- R3 `next_due`: 2 件以上必須(未満は ValueError)。昇順の最後の日の翌月で、日 = 系列の最大の日を翌月末でクランプ。12 月の次は翌年 1 月。2024-02-29 の翌月は 3 月、最大日 29 なら 3/29。毎月かどうかは検査しない(呼び出し側が is_monthly を使う)。
++- R4 同日が重複していても月が重複していれば `next_due` は最後の日で計算して返す(例外にしない)。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E1-1 | next_due([1/31, 2/28, 3/31]) (2026) | 2026-04-30 | R3 |
++| E1-2 | next_due([2025-11-05, 2025-12-05]) | 2026-01-05 | R3 |
++| E1-3 | is_monthly([1/5, 3/5, 4/5]) | False | R2 |
++
++2. `src/kakeibo/series.py` + `tests/test_series.py` — `def group_candidates(expenses: Sequence[Expense], tolerance_pct: int = 10) -> list[list[Expense]]`
++規則:
++- R1 受け付ける入力: `Expense` の列(空なら `[]`)。`Expense` 以外を含むと TypeError。tolerance_pct は 0〜100 の int(bool・float は TypeError、範囲外は ValueError、引数名をメッセージに含める)。
++- R2 同一キー = カテゴリ(前後空白除去)+ 正規化メモ。メモの正規化: NFKC → casefold → 空白(全角含む)をすべて除去 → 末尾の `#12` `No.3` `3月` 形でない単純な末尾数字列(例 `netflix2`)は除去しない(数字は残す)。メモが空なら空文字をキーに使う。
++- R3 amount <= 0(返金・0 円)は無視する。
++- R4 同一キーの中を日付昇順(同日は amount 昇順)に並べ、貪欲に分ける: 直前に入れた amount との差が `直前 amount * tolerance_pct / 100` 以下なら同じ系列、超えたら新しい系列(整数同士の比較で、端を含む)。
++- R5 戻り値の各系列は日付昇順。系列の並びは先頭の日付昇順、同じなら (カテゴリ, 正規化メモ, 先頭 amount) の昇順。1 件だけの系列も含める(件数の判断は呼び出し側)。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E2-1 | 同カテゴリ・メモ `Netflix` / `ＮＥＴＦＬＩＸ ` の 1490 円 2 件 | 1 系列 2 件 | R2 |
++| E2-2 | 1000 円 → 1100 円 → 1300 円(10%) | [[1000, 1100], [1300]] | R4 |
++| E2-3 | 返金 -500 と 0 円のみ | [] | R3 |
++
++<!-- end -->
+diff --git a/src/kakeibo/cadence.py b/src/kakeibo/cadence.py
+new file mode 100644
+index 0000000..dd1b218
+--- /dev/null
++++ b/src/kakeibo/cadence.py
+@@ -0,0 +1,68 @@
++"""Monthly cadence detection and next due date for a series of dates.
++
++Pure functions only: no I/O, standard library only.
++"""
++
++from __future__ import annotations
++
++import calendar
++from collections.abc import Sequence
++from datetime import date, datetime
++from itertools import pairwise
++
++
++def _checked_sorted(days: Sequence[date]) -> list[date]:
++    out: list[date] = []
++    for d in days:
++        if not isinstance(d, date) or isinstance(d, datetime):
++            raise TypeError(f"date が必要です: {d!r}")
++        out.append(d)
++    return sorted(out)
++
++
++def _clamped(year: int, month: int, day: int) -> date:
++    last = calendar.monthrange(year, month)[1]
++    return date(year, month, min(day, last))
++
++
++def _is_int(value: object) -> bool:
++    return isinstance(value, int) and not isinstance(value, bool)
++
++
++def is_monthly(days: Sequence[date], min_count: int = 3, jitter_days: int = 3) -> bool:
++    """True if the dates recur once per consecutive calendar month, within jitter."""
++    if not _is_int(min_count):
++        raise TypeError("min_count は int である必要があります")
++    if min_count < 3:
++        raise ValueError("min_count は 3 以上である必要があります")
++    if not _is_int(jitter_days):
++        raise TypeError("jitter_days は int である必要があります")
++    if jitter_days < 0:
++        raise ValueError("jitter_days は 0 以上である必要があります")
++
++    ordered = _checked_sorted(days)
++    if len(ordered) < min_count:
++        return False
++    for prev, cur in pairwise(ordered):
++        if (cur.year * 12 + cur.month) - (prev.year * 12 + prev.month) != 1:
++            return False
++    top = max(d.day for d in ordered)
++    for d in ordered:
++        reference = _clamped(d.year, d.month, top)
++        if abs((d - reference).days) > jitter_days:
++            return False
++    return True
++
++
++def next_due(days: Sequence[date]) -> date:
++    """Next expected date: month after the last date, day = max day clamped to that month."""
++    ordered = _checked_sorted(days)
++    if len(ordered) < 2:
++        raise ValueError("2 件以上の日付が必要です")
++    last = ordered[-1]
++    top = max(d.day for d in ordered)
++    if last.month == 12:
++        year, month = last.year + 1, 1
++    else:
++        year, month = last.year, last.month + 1
++    return _clamped(year, month, top)
+diff --git a/src/kakeibo/series.py b/src/kakeibo/series.py
+new file mode 100644
+index 0000000..26e024e
+--- /dev/null
++++ b/src/kakeibo/series.py
+@@ -0,0 +1,63 @@
++"""Group expenses into candidate series for recurring-payment detection (pure functions)."""
++
++from __future__ import annotations
++
++import re
++import unicodedata
++from collections.abc import Sequence
++
++from kakeibo.core import Expense
++
++# 末尾の「#12」「No.3」「3月」形だけを除去する。素の末尾数字(netflix2)は残す。
++_SUFFIX_RE = re.compile(r"(#\d+|no\.\d+|\d+月)$")
++_SPACE_RE = re.compile(r"\s+")
++
++
++def _normalize_memo(memo: str) -> str:
++    text = unicodedata.normalize("NFKC", memo).casefold()
++    text = _SPACE_RE.sub("", text)
++    return _SUFFIX_RE.sub("", text)
++
++
++def group_candidates(
++    expenses: Sequence[Expense], tolerance_pct: int = 10
++) -> list[list[Expense]]:
++    """Split expenses into candidate series by (category, normalized memo, amount drift).
++
++    Refunds and zero-yen rows (amount <= 0) are ignored. Each returned series is
++    sorted by date; series are ordered by (first date, category, normalized memo,
++    first amount). Single-item series are included.
++    """
++    if isinstance(tolerance_pct, bool) or not isinstance(tolerance_pct, int):
++        raise TypeError("tolerance_pct は int である必要があります")
++    if not 0 <= tolerance_pct <= 100:
++        raise ValueError("tolerance_pct は 0〜100 の範囲である必要があります")
++
++    items = list(expenses)
++    for e in items:
++        if not isinstance(e, Expense):
++            raise TypeError(f"Expense 以外が含まれています: {type(e).__name__}")
++
++    by_key: dict[tuple[str, str], list[Expense]] = {}
++    for e in items:
++        if e.amount <= 0:
++            continue
++        key = (e.category.strip(), _normalize_memo(e.memo))
++        by_key.setdefault(key, []).append(e)
++
++    series: list[tuple[tuple[str, str], list[Expense]]] = []
++    for key, rows in by_key.items():
++        rows.sort(key=lambda e: (e.day, e.amount))
++        current = [rows[0]]
++        for e in rows[1:]:
++            prev = current[-1].amount
++            # 差 <= 直前 amount * tolerance_pct / 100 を整数同士で判定する(端を含む)
++            if abs(e.amount - prev) * 100 <= prev * tolerance_pct:
++                current.append(e)
++            else:
++                series.append((key, current))
++                current = [e]
++        series.append((key, current))
++
++    series.sort(key=lambda s: (s[1][0].day, s[0][0], s[0][1], s[1][0].amount))
++    return [rows for _, rows in series]
+diff --git a/tests/test_cadence.py b/tests/test_cadence.py
+new file mode 100644
+index 0000000..44ca32c
+--- /dev/null
++++ b/tests/test_cadence.py
+@@ -0,0 +1,145 @@
++"""Tests for kakeibo.cadence (monthly detection and next due date)."""
++
++from __future__ import annotations
++
++from datetime import date, datetime
++
++import pytest
++
++from kakeibo.cadence import is_monthly, next_due
++
++# --- 仕様の例の表 (E1-*) ---------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("days", "expected"),
++    [
++        pytest.param(
++            [date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 31)],
++            date(2026, 4, 30),
++            id="E1-1",
++        ),
++        pytest.param(
++            [date(2025, 11, 5), date(2025, 12, 5)],
++            date(2026, 1, 5),
++            id="E1-2",
++        ),
++    ],
++)
++def test_next_due_examples(days: list[date], expected: date) -> None:
++    assert next_due(days) == expected
++
++
++@pytest.mark.parametrize(
++    ("days", "expected"),
++    [
++        pytest.param(
++            [date(2026, 1, 5), date(2026, 3, 5), date(2026, 4, 5)],
++            False,
++            id="E1-3",
++        ),
++    ],
++)
++def test_is_monthly_examples(days: list[date], expected: bool) -> None:
++    assert is_monthly(days) is expected
++
++
++# --- 端のケース (仕様文面から) ------------------------------------------------
++
++
++def test_is_monthly_accepts_unsorted_input() -> None:
++    assert is_monthly([date(2026, 3, 5), date(2026, 1, 5), date(2026, 2, 5)])
++
++
++def test_is_monthly_month_end_clamp() -> None:
++    # 最大日 31 を 2 月末 (28) にクランプして比較する
++    assert is_monthly([date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 31)])
++
++
++def test_is_monthly_jitter_boundary_inside() -> None:
++    # 2/8 は基準 2/5 から 3 日差 (jitter 3 以内)
++    assert is_monthly(
++        [date(2026, 1, 5), date(2026, 2, 8), date(2026, 3, 5)], jitter_days=3
++    )
++
++
++def test_is_monthly_jitter_boundary_outside() -> None:
++    # 2/9 は基準 2/5 から 4 日差 (jitter 3 を超える)
++    assert not is_monthly(
++        [date(2026, 1, 5), date(2026, 2, 9), date(2026, 3, 5)], jitter_days=3
++    )
++
++
++def test_is_monthly_false_when_fewer_than_min_count() -> None:
++    assert not is_monthly([date(2026, 1, 5), date(2026, 2, 5)])
++
++
++def test_is_monthly_false_for_same_month_twice() -> None:
++    assert not is_monthly(
++        [date(2026, 1, 5), date(2026, 1, 20), date(2026, 2, 5), date(2026, 3, 5)]
++    )
++
++
++def test_is_monthly_false_for_empty() -> None:
++    assert not is_monthly([])
++
++
++@pytest.mark.parametrize(
++    "bad",
++    [
++        pytest.param("2026-01-05", id="str"),
++        pytest.param(None, id="none"),
++        pytest.param(datetime(2026, 1, 5), id="datetime"),
++    ],
++)
++def test_is_monthly_rejects_non_date_items(bad: object) -> None:
++    days = [date(2026, 1, 5), bad, date(2026, 3, 5)]
++    with pytest.raises(TypeError):
++        is_monthly(days)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize("min_count", [2, 0, -1])
++def test_is_monthly_min_count_below_three_is_value_error(min_count: int) -> None:
++    with pytest.raises(ValueError, match="min_count"):
++        is_monthly([date(2026, 1, 5)], min_count=min_count)
++
++
++def test_is_monthly_min_count_bool_is_type_error() -> None:
++    with pytest.raises(TypeError, match="min_count"):
++        is_monthly([date(2026, 1, 5)], min_count=True)  # type: ignore[arg-type]
++
++
++def test_is_monthly_negative_jitter_is_value_error() -> None:
++    with pytest.raises(ValueError, match="jitter_days"):
++        is_monthly([date(2026, 1, 5)], jitter_days=-1)
++
++
++def test_is_monthly_jitter_bool_is_type_error() -> None:
++    with pytest.raises(TypeError, match="jitter_days"):
++        is_monthly([date(2026, 1, 5)], jitter_days=False)  # type: ignore[arg-type]
++
++
++def test_next_due_requires_two_items() -> None:
++    with pytest.raises(ValueError):
++        next_due([date(2026, 1, 5)])
++
++
++def test_next_due_leap_day_series() -> None:
++    # 最大日 29 → 翌月 (3 月) の 29 日
++    assert next_due([date(2024, 1, 29), date(2024, 2, 29)]) == date(2024, 3, 29)
++
++
++def test_next_due_wraps_year() -> None:
++    assert next_due([date(2025, 10, 5), date(2025, 12, 5)]) == date(2026, 1, 5)
++
++
++def test_next_due_uses_last_day_for_duplicate_month() -> None:
++    # 同月重複でも例外にせず、最後の日の翌月で計算する
++    assert next_due([date(2026, 1, 5), date(2026, 2, 5), date(2026, 2, 5)]) == date(
++        2026, 3, 5
++    )
++
++
++def test_next_due_rejects_non_date_items() -> None:
++    with pytest.raises(TypeError):
++        next_due([date(2026, 1, 5), "2026-02-05"])  # type: ignore[list-item]
+diff --git a/tests/test_series.py b/tests/test_series.py
+new file mode 100644
+index 0000000..959bef8
+--- /dev/null
++++ b/tests/test_series.py
+@@ -0,0 +1,121 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.series import group_candidates
++
++
++def E(day: str, amount: int, category: str = "通信", memo: str = "Netflix") -> Expense:
++    return Expense(
++        day=date.fromisoformat(day), category=category, amount=amount, memo=memo
++    )
++
++
++@pytest.mark.parametrize(
++    ("expenses", "expected"),
++    [
++        pytest.param(
++            [
++                E("2026-01-05", 1490, memo="Netflix"),
++                E("2026-02-05", 1490, memo="ＮＥＴＦＬＩＸ "),
++            ],
++            [
++                [
++                    E("2026-01-05", 1490, memo="Netflix"),
++                    E("2026-02-05", 1490, memo="ＮＥＴＦＬＩＸ "),
++                ]
++            ],
++            id="E2-1",
++        ),
++        pytest.param(
++            [E("2026-01-01", 1000), E("2026-02-01", 1100), E("2026-03-01", 1300)],
++            [[E("2026-01-01", 1000), E("2026-02-01", 1100)], [E("2026-03-01", 1300)]],
++            id="E2-2",
++        ),
++        pytest.param(
++            [E("2026-01-01", -500), E("2026-02-01", 0)],
++            [],
++            id="E2-3",
++        ),
++    ],
++)
++def test_spec_examples(expenses: list[Expense], expected: list[list[Expense]]) -> None:
++    assert group_candidates(expenses) == expected
++
++
++def test_empty_input_returns_empty_list() -> None:
++    assert group_candidates([]) == []
++
++
++def test_non_expense_item_raises_type_error() -> None:
++    with pytest.raises(TypeError):
++        group_candidates([E("2026-01-01", 100), "x"])  # type: ignore[list-item]
++
++
++@pytest.mark.parametrize("bad", [True, 10.0, "10"])
++def test_tolerance_must_be_int_not_bool_or_float(bad: object) -> None:
++    with pytest.raises(TypeError, match="tolerance_pct"):
++        group_candidates([], tolerance_pct=bad)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize("bad", [-1, 101])
++def test_tolerance_out_of_range_raises_value_error(bad: int) -> None:
++    with pytest.raises(ValueError, match="tolerance_pct"):
++        group_candidates([], tolerance_pct=bad)
++
++
++def test_memo_trailing_number_forms_are_stripped_but_plain_digits_kept() -> None:
++    same = group_candidates(
++        [E("2026-01-01", 100, memo="Netflix#2"), E("2026-02-01", 100, memo="netflix")]
++    )
++    assert len(same) == 1
++    kept = group_candidates(
++        [E("2026-01-01", 100, memo="netflix2"), E("2026-02-01", 100, memo="netflix")]
++    )
++    assert len(kept) == 2
++
++
++def test_refund_and_zero_are_ignored_while_positive_rows_remain() -> None:
++    rows = [E("2026-01-01", -500), E("2026-01-02", 0), E("2026-01-03", 700)]
++    assert group_candidates(rows) == [[E("2026-01-03", 700)]]
++
++
++def test_drift_boundary_is_inclusive_at_tolerance() -> None:
++    # 1000 -> 1100 is exactly 10% (included); 1100 -> 1210 is exactly 10% of 1100 (included)
++    inside = group_candidates(
++        [E("2026-01-01", 1000), E("2026-02-01", 1100), E("2026-03-01", 1210)]
++    )
++    assert len(inside) == 1
++    # 1000 -> 1101 exceeds 10% (new series)
++    outside = group_candidates([E("2026-01-01", 1000), E("2026-02-01", 1101)])
++    assert len(outside) == 2
++
++
++def test_zero_tolerance_requires_exact_amount() -> None:
++    rows = [E("2026-01-01", 1000), E("2026-02-01", 1000), E("2026-03-01", 1001)]
++    result = group_candidates(rows, tolerance_pct=0)
++    # 先頭日の順: 1000 の 2 件(同額)が 1 系列、1001 は別系列
++    assert [len(s) for s in result] == [2, 1]
++
++
++def test_different_category_is_separate_series() -> None:
++    rows = [
++        E("2026-01-01", 500, category="食費", memo="x"),
++        E("2026-02-01", 500, category="通信", memo="x"),
++    ]
++    assert len(group_candidates(rows)) == 2
++
++
++def test_series_sorted_by_first_date_then_within_series_by_date() -> None:
++    rows = [
++        E("2026-03-01", 300, memo="B"),
++        E("2026-02-01", 105, memo="A"),
++        E("2026-01-01", 100, memo="A"),
++    ]
++    result = group_candidates(rows)
++    # A(100, 105) は 1 系列(日付昇順)、B は 3 月の 1 件。先頭日の昇順で並ぶ。
++    assert [[e.day for e in s] for s in result] == [
++        [date(2026, 1, 1), date(2026, 2, 1)],
++        [date(2026, 3, 1)],
++    ]

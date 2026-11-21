@@ -1,0 +1,275 @@
+diff --git a/src/kakeibo/budget_alerts.py b/src/kakeibo/budget_alerts.py
+new file mode 100644
+index 0000000..415806c
+--- /dev/null
++++ b/src/kakeibo/budget_alerts.py
+@@ -0,0 +1,135 @@
++"""Budget alerts: flag categories that are over budget or about to be.
++
++Pure functions over `monthly_totals` output and the existing `Budget`
++(`kakeibo.core`); nothing is read from disk and no existing file changes.
++
++D1: 予算の型・読込は core の `Budget` / `load_budget` を再利用する。月ごとの
++    上限は `Budget.for_month(month)`(default に月別の上書きを重ねたもの)。
++D2: 判定は 3 段階。`over` = 実績 > 上限、`near` = 実績 >= 上限 * threshold かつ
++    実績 <= 上限、`ok` = それ以外。実績がちょうど上限なら `near`(超えてはいない。
++    core.find_overruns の「actual > limit」と同じ境界)。
++D3: threshold は 0 < threshold <= 1 の `int`/`float`。bool・非数値は TypeError、
++    nan・範囲外は ValueError。既定 0.8。1.0 なら「ちょうど上限」だけが near。
++    境界は浮動小数の誤差を出さないよう Fraction で厳密に比べる。
++D4: 上限 0 の予算は「使わない」の意味。実績 > 0 なら `over`、実績 0 は `ok`
++    (near は実績が正のときだけ)。
++D5: 実績が負(返金が多い月)は `ok`。残額(remaining)は上限 - 実績で、超過時は負。
++D6: 予算の無いカテゴリは報告しない。予算があるが支出の無いカテゴリは
++    `budget_status` では実績 0 の `ok` として返し、`budget_alerts` では出ない。
++    データに無い月は何も報告しない。
++D7: 金額・上限は `int`(bool は弾く)。float・str・None は TypeError、
++    負の上限は ValueError(どの引数・カテゴリかをメッセージに書く)。
++D8: 並び順は月の昇順 → over が near より先 → 超過額(near は使用率)の大きい順
++    → カテゴリ名。同点は安定。
++"""
++
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from fractions import Fraction
++from typing import Literal
++
++from kakeibo.core import Budget
++
++Level = Literal["over", "near", "ok"]
++
++DEFAULT_THRESHOLD = 0.8
++
++
++@dataclass(frozen=True)
++class BudgetStatus:
++    month: str
++    category: str
++    limit: int
++    actual: int
++    level: Level
++
++    @property
++    def remaining(self) -> int:
++        """limit - actual; negative when over budget."""
++        return self.limit - self.actual
++
++
++def _check_yen(value: object, where: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise TypeError(f"{where} は int である必要があります: {value!r}")
++    return value
++
++
++def _check_threshold(threshold: object) -> Fraction:
++    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
++        raise TypeError(f"threshold は数値である必要があります: {threshold!r}")
++    if isinstance(threshold, float) and math.isnan(threshold):
++        raise ValueError("threshold は nan にできません")
++    if not 0 < threshold <= 1:
++        raise ValueError(
++            f"threshold は 0 より大きく 1 以下である必要があります: {threshold!r}"
++        )
++    # repr で丸めた十進表記を使う(0.7 を 0.7 として扱う)。
++    return Fraction(repr(threshold))
++
++
++def classify(actual: int, limit: int, threshold: float = DEFAULT_THRESHOLD) -> Level:
++    """over / near / ok for one category (see D2–D5, D7)."""
++    ratio = _check_threshold(threshold)
++    actual = _check_yen(actual, "actual")
++    limit = _check_yen(limit, "limit")
++    if limit < 0:
++        raise ValueError(f"limit は 0 以上である必要があります: {limit}")
++    return _classify(actual, limit, ratio)
++
++
++def _classify(actual: int, limit: int, ratio: Fraction) -> Level:
++    if actual > limit:
++        return "over"
++    if actual > 0 and actual >= limit * ratio:
++        return "near"
++    return "ok"
++
++
++def budget_status(
++    month: str,
++    totals: dict[str, int],
++    limits: dict[str, int],
++    threshold: float = DEFAULT_THRESHOLD,
++) -> list[BudgetStatus]:
++    """Status of every budgeted category for one month (ordered per D8)."""
++    ratio = _check_threshold(threshold)
++    out: list[BudgetStatus] = []
++    for cat, limit in limits.items():
++        limit = _check_yen(limit, f"limits[{cat!r}]")
++        if limit < 0:
++            raise ValueError(f"limits[{cat!r}] は 0 以上である必要があります: {limit}")
++        actual = _check_yen(totals.get(cat, 0), f"totals[{cat!r}]")
++        out.append(
++            BudgetStatus(month, cat, limit, actual, _classify(actual, limit, ratio))
++        )
++    return sorted(out, key=_sort_key)
++
++
++def _sort_key(s: BudgetStatus) -> tuple[str, int, Fraction, str]:
++    rank = {"over": 0, "near": 1, "ok": 2}[s.level]
++    if s.level == "over":
++        weight = Fraction(s.actual - s.limit)
++    elif s.limit > 0:
++        weight = Fraction(s.actual, s.limit)
++    else:
++        weight = Fraction(0)
++    return (s.month, rank, -weight, s.category)
++
++
++def budget_alerts(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    threshold: float = DEFAULT_THRESHOLD,
++) -> list[BudgetStatus]:
++    """`over` / `near` entries across all months in `totals` (ordered per D8)."""
++    ratio = _check_threshold(threshold)
++    out: list[BudgetStatus] = []
++    for month, cats in totals.items():
++        limits = budget.for_month(month)
++        for s in budget_status(month, cats, limits, float(ratio)):
++            if s.level != "ok":
++                out.append(s)
++    return sorted(out, key=_sort_key)
+diff --git a/tests/test_budget_alerts.py b/tests/test_budget_alerts.py
+new file mode 100644
+index 0000000..5433435
+--- /dev/null
++++ b/tests/test_budget_alerts.py
+@@ -0,0 +1,128 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.budget_alerts import BudgetStatus, budget_alerts, budget_status, classify
++from kakeibo.core import Budget, Expense, monthly_totals
++
++
++# D2 / D4 / D5: 境界
++@pytest.mark.parametrize(
++    "actual,limit,level",
++    [
++        (1001, 1000, "over"),
++        (1000, 1000, "near"),  # ちょうど上限は超過ではない
++        (800, 1000, "near"),  # しきい値ちょうど
++        (799, 1000, "ok"),
++        (0, 1000, "ok"),
++        (1, 0, "over"),  # 上限 0
++        (0, 0, "ok"),
++        (-500, 1000, "ok"),  # 返金
++    ],
++)
++def test_classify(actual, limit, level):
++    assert classify(actual, limit) == level
++
++
++# D3: 浮動小数の誤差が出ない(0.29 * 100 == 28.999999999999996)
++def test_threshold_exact_decimal():
++    assert classify(29, 100, 0.29) == "near"
++    assert classify(70, 100, 0.7) == "near"
++
++
++def test_threshold_one_means_only_exact_limit():
++    assert classify(999, 1000, 1.0) == "ok"
++    assert classify(1000, 1000, 1) == "near"
++
++
++@pytest.mark.parametrize("bad", [0, 0.0, -0.1, 1.01, float("nan"), float("inf")])
++def test_threshold_value_error(bad):
++    with pytest.raises(ValueError, match="threshold"):
++        classify(1, 1, bad)
++
++
++@pytest.mark.parametrize("bad", [True, "0.8", None])
++def test_threshold_type_error(bad):
++    with pytest.raises(TypeError, match="threshold"):
++        classify(1, 1, bad)  # type: ignore[arg-type]
++
++
++# D7
++@pytest.mark.parametrize("bad", [True, 1.0, "1", None])
++def test_amount_type_error(bad):
++    with pytest.raises(TypeError, match="actual"):
++        classify(bad, 100)  # type: ignore[arg-type]
++    with pytest.raises(TypeError, match="limit"):
++        classify(1, bad)  # type: ignore[arg-type]
++
++
++def test_negative_limit_value_error():
++    with pytest.raises(ValueError, match="limit"):
++        classify(1, -1)
++    with pytest.raises(ValueError, match="food"):
++        budget_status("2026-11", {}, {"food": -1})
++
++
++def test_status_type_error_names_category():
++    with pytest.raises(TypeError, match="food"):
++        budget_status("2026-11", {"food": 1.5}, {"food": 100})  # type: ignore[dict-item]
++
++
++# D6 / D8
++def test_status_includes_unspent_and_skips_unbudgeted():
++    out = budget_status(
++        "2026-11", {"food": 900, "game": 5000}, {"food": 1000, "rent": 80000}
++    )
++    assert out == [
++        BudgetStatus("2026-11", "food", 1000, 900, "near"),
++        BudgetStatus("2026-11", "rent", 80000, 0, "ok"),
++    ]
++
++
++def test_remaining_negative_when_over():
++    s = budget_status("2026-11", {"food": 1300}, {"food": 1000})[0]
++    assert s.level == "over"
++    assert s.remaining == -300
++
++
++def test_status_order_over_then_near_by_size_then_name():
++    limits = {"a": 1000, "b": 1000, "c": 1000, "d": 1000, "e": 1000}
++    totals = {"a": 900, "b": 1500, "c": 1100, "d": 950, "e": 10}
++    got = [(s.category, s.level) for s in budget_status("2026-11", totals, limits)]
++    assert got == [
++        ("b", "over"),
++        ("c", "over"),
++        ("d", "near"),
++        ("a", "near"),
++        ("e", "ok"),
++    ]
++
++
++def test_alerts_across_months_with_monthly_override():
++    rows = [
++        Expense(date(2026, 10, 31), "food", 500),
++        Expense(date(2026, 11, 1), "food", 1200),
++        Expense(date(2026, 11, 2), "rent", 80000),
++        Expense(date(2026, 11, 3), "food", 800),
++    ]
++    budget = Budget({"food": 2500, "rent": 80000}, {"2026-11": {"food": 2000}})
++    got = budget_alerts(monthly_totals(rows), budget)
++    # 10 月: food 500/2500 は ok。11 月: food 2000/2000 は near、rent 80000/80000 も near。
++    # 使用率が同点(100%)なのでカテゴリ名順。
++    assert [(s.month, s.category, s.level) for s in got] == [
++        ("2026-11", "food", "near"),
++        ("2026-11", "rent", "near"),
++    ]
++
++
++def test_alerts_months_ascending_and_empty_cases():
++    budget = Budget({"food": 100}, {})
++    totals = {"2026-12": {"food": 200}, "2026-11": {"food": 150}}
++    assert [s.month for s in budget_alerts(totals, budget)] == ["2026-11", "2026-12"]
++    assert budget_alerts({}, budget) == []
++    assert budget_alerts({"2026-11": {"food": 1}}, Budget({}, {})) == []
++
++
++def test_alerts_validates_threshold_even_when_empty():
++    with pytest.raises(ValueError, match="threshold"):
++        budget_alerts({}, Budget({}, {}), 2)
