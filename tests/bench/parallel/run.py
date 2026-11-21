@@ -90,7 +90,7 @@ def grade(trial: Path, branches: list[str], heldout: Path, patch: Path | None = 
             patch.write_text(sh(["git", "diff", "origin/main", "HEAD"], wt).stdout, encoding="utf-8")
         shutil.copy(heldout, wt / "tests" / heldout.name)
         sh(["uv", "sync", "-q"], wt)
-        r = sh(["uv", "run", "pytest", "-q", f"tests/{heldout.name}"], wt)
+        r = sh([*PYTEST, "-q", f"tests/{heldout.name}"], wt)
         last = (r.stdout.strip().splitlines() or [""])[-1]
         return {"heldout": last, "heldout_ok": r.returncode == 0, "merge_conflicts": conflicts}
     finally:
@@ -145,6 +145,7 @@ def run_fanout(trial: Path, extra: list[str] | None = None) -> tuple[dict, float
 
 
 VANILLA = Path.home() / "programming/python/devaccel-vanilla"  # the trial without devaccel (same personal trimming)
+PYTEST = ["uv", "run", "pytest"]  # --pytest overrides (e.g. "uv run --group tests pytest")
 
 
 def run_vanilla(arm: str, tasks: str, heldout: Path, effort: str = "") -> dict:
@@ -165,7 +166,7 @@ def run_vanilla(arm: str, tasks: str, heldout: Path, effort: str = "") -> dict:
     sh(["git", "worktree", "add", "-q", "--detach", str(wt), "HEAD"], VANILLA)
     shutil.copy(heldout, wt / "tests" / heldout.name)
     sh(["uv", "sync", "-q"], wt)
-    r = sh(["uv", "run", "pytest", "-q", f"tests/{heldout.name}"], wt)
+    r = sh([*PYTEST, "-q", f"tests/{heldout.name}"], wt)
     sh(["git", "worktree", "remove", "--force", str(wt)], VANILLA)
     sh(["git", "reset", "-q", "--hard", base], VANILLA)
     sh(["git", "clean", "-q", "-fdx", "-e", ".claude/settings.local.json", "-e", ".venv"], VANILLA)
@@ -283,6 +284,8 @@ def main() -> int:
     ap.add_argument("--trial", type=Path, required=True)
     ap.add_argument("--tasks", type=Path, default=HERE / "tasks.md")
     ap.add_argument("--heldout", type=Path, default=HERE / "heldout" / "test_par_heldout.py")
+    ap.add_argument("--vanilla", type=Path, default=None, help="the vanilla clone (default: devaccel-vanilla)")
+    ap.add_argument("--pytest", default=None, help='how to run pytest, e.g. "uv run --group tests pytest"')
     ap.add_argument("--arms", default="seq_old,seq_ship,par")
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--model", default="claude-sonnet-5-5")
@@ -292,9 +295,13 @@ def main() -> int:
                     help="a patch applied (and committed) to both the trial's main and the vanilla clone before the "
                          "runs, removed afterwards: a planted bug, a precondition")
     a = ap.parse_args()
-    global CAP, FOLLOWUP
+    global CAP, FOLLOWUP, VANILLA, PYTEST
     CAP = a.cap
     FOLLOWUP = a.followup
+    if a.vanilla:
+        VANILLA = a.vanilla.expanduser().resolve()
+    if a.pytest:
+        PYTEST = a.pytest.split()
     trial = a.trial.expanduser().resolve()
     tasks = a.tasks.read_text(encoding="utf-8")
     global TASKS_PATH

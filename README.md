@@ -28,7 +28,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.3   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.4   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
@@ -85,7 +85,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 | `scripts/check.sh` | project | `fast`(ゲート・自動整形あり)/ `full`(CI)。段を並べるだけ |
 | `.claude/project.json` | project | 挙動の調整点はすべてここ |
 | `.claude/settings.json` | project | permissions・サンドボックス・フック(PreToolUse / Stop / SubagentStop。install 時に 1 回だけ書く) |
-| `.github/workflows/check.yml` | project | CI で `check.sh full` |
+| `.github/workflows/check.yml` | project | CI で `check.sh full`(PR・push のたびに動く。非公開リポジトリでは GitHub Actions の無料枠の分数を使うので、たくさん PR を作るなら止めるか削除する) |
 
 **core は編集しない層**(update で置き換わる)。変えたい挙動は `project.json` か project 層で。
 
