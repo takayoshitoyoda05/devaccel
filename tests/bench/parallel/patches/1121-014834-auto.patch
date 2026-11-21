@@ -1,0 +1,639 @@
+diff --git a/README.md b/README.md
+index c1dc8c6..a6ff655 100644
+--- a/README.md
++++ b/README.md
+@@ -128,6 +128,30 @@ food,2000
+ TOTAL,82000
+ ```
+ 
++## 口座
++
++CSV に任意の列 `account`(口座名)と `transfer_to`(振替先)を足せる(無くても従来どおり読める。口座の無い行は `(未指定)` という 1 つの口座)。`transfer_to` がある行は `account` から `transfer_to` への振替で、支出には数えない(金額は正、同じ口座へは不可)。金額が正なら口座から出る支出、負なら返金・収入。
++
++```
++date,category,amount,memo,account,transfer_to
++2026-11-02,rent,80000,,bank,
++2026-11-05,transfer,30000,ATM,bank,cash
++```
++
++- `--account NAME`: その口座の明細だけ集計(`--report`・`--budget`・`--memo` と併用可)。`(未指定)` で口座の無い行。存在しない名前は stderr に通知して終了コード 0。
++- `--balance`: 口座ごとの残高の推移を `日付<TAB>口座<TAB>残高` で表示(動きのあった日の日末残高)。
++- `--account-report`: 月次の口座別レポートを `月<TAB>口座<TAB>支出<TAB>振替入<TAB>振替出<TAB>月末残高` で表示(欠けた月も出す)。
++- `--opening NAME=YEN`: 期首残高(繰り返し可、省略した口座は 0、負も可)。`--balance`・`--account-report` 用。
++- `--report` / `--balance` / `--account-report` は同時に指定できない。`--balance`・`--account-report` は全明細から計算し、`--memo`・`--category` は無視(stderr に通知)。
++
++```
++$ uv run kakeibo data/sample_accounts.csv --account-report --account cash
++2026-10	cash	1500	0	0	-1500
++2026-11	cash	800	30000	0	27700
++2026-12	cash	0	0	0	27700
++2027-01	cash	0	0	0	27700
++```
++
+ ### --version
+ 
+ バージョンを表示して終わる。
+diff --git a/data/sample_accounts.csv b/data/sample_accounts.csv
+new file mode 100644
+index 0000000..700dff2
+--- /dev/null
++++ b/data/sample_accounts.csv
+@@ -0,0 +1,7 @@
++date,category,amount,memo,account,transfer_to
++2026-10-31,food,1500,lunch,cash,
++2026-11-01,food,1200,lunch,card,
++2026-11-02,rent,80000,,bank,
++2026-11-05,transfer,30000,ATM,bank,cash
++2026-11-10,food,800,coffee,cash,
++2027-01-15,card payment,1200,,bank,card
+diff --git a/src/kakeibo/__init__.py b/src/kakeibo/__init__.py
+index d8ec261..c6cecd3 100644
+--- a/src/kakeibo/__init__.py
++++ b/src/kakeibo/__init__.py
+@@ -6,6 +6,14 @@ import importlib.metadata
+ import sys
+ from pathlib import Path
+ 
++from kakeibo.accounts import (
++    UNASSIGNED,
++    account_label,
++    account_name,
++    balance_history,
++    known_accounts,
++    monthly_account_report,
++)
+ from kakeibo.core import (
+     BudgetError,
+     CsvError,
+@@ -24,11 +32,50 @@ def _version() -> str:
+         return "unknown"
+ 
+ 
++def _opening_arg(text: str) -> tuple[str, int]:
++    name, sep, yen = text.rpartition("=")
++    if not sep:
++        raise argparse.ArgumentTypeError(f"NAME=YEN の形式で指定してください: {text!r}")
++    try:
++        return account_name(name.strip()), int(yen)
++    except ValueError:
++        raise argparse.ArgumentTypeError(
++            f"期首残高が整数ではありません: {yen!r}"
++        ) from None
++
++
+ def main() -> None:
+     p = argparse.ArgumentParser(prog="kakeibo")
+     p.add_argument("--version", action="version", version=f"kakeibo {_version()}")
+     p.add_argument("csv", type=Path)
+-    p.add_argument("--report", action="store_true", help="月別・カテゴリ別に表示")
++    mode = p.add_mutually_exclusive_group()
++    mode.add_argument("--report", action="store_true", help="月別・カテゴリ別に表示")
++    mode.add_argument(
++        "--balance",
++        action="store_true",
++        help="口座ごとの残高の推移(動きのあった日ごと)を `日付 口座 残高` で表示",
++    )
++    mode.add_argument(
++        "--account-report",
++        action="store_true",
++        help="月次の口座別レポートを `月 口座 支出 振替入 振替出 月末残高` で表示"
++        "(欠けた月も出す)",
++    )
++    p.add_argument(
++        "--account",
++        metavar="NAME",
++        help=f"指定口座の明細だけ集計({UNASSIGNED} は口座列が無い・空の行)。"
++        "--balance / --account-report ではその口座だけ表示。"
++        "存在しない名前は stderr に通知し、終了コード 0",
++    )
++    p.add_argument(
++        "--opening",
++        metavar="NAME=YEN",
++        type=_opening_arg,
++        action="append",
++        default=[],
++        help="口座の期首残高(繰り返し可。省略した口座は 0。--balance / --account-report のみ)",
++    )
+     p.add_argument("--total", action="store_true", help="合計行を出す")
+     p.add_argument(
+         "--category",
+@@ -68,6 +115,42 @@ def main() -> None:
+         for line, reason in e.errors:
+             print(f"{line}: {reason}", file=sys.stderr)
+         sys.exit(1)
++    opening: dict[str, int] = {}
++    for name, yen in args.opening:
++        if name in opening:
++            p.error(f"--opening の口座が重複しています: {account_label(name)}")
++        opening[name] = yen
++    wanted = None
++    if args.account is not None:
++        wanted = account_name(args.account.strip())
++        if wanted not in known_accounts(rows, opening):
++            print(f"口座が見つかりません: {args.account}", file=sys.stderr)
++    if args.balance or args.account_report:
++        # 残高は全明細から出す(--memo / --category は無視)
++        if args.memo is not None or args.category is not None:
++            print(
++                "--memo / --category は --balance・--account-report では無視されます",
++                file=sys.stderr,
++            )
++        if args.balance:
++            lines = [
++                (day, acc, bal)
++                for acc, hist in balance_history(rows, opening).items()
++                if wanted is None or acc == wanted
++                for day, bal in hist
++            ]
++            for day, acc, bal in sorted(lines, key=lambda t: (t[0], t[1])):
++                print(f"{day.isoformat()}\t{account_label(acc)}\t{bal}")
++        else:
++            for r in monthly_account_report(rows, opening):
++                if wanted is None or r.account == wanted:
++                    print(
++                        f"{r.month}\t{account_label(r.account)}\t{r.spent}\t"
++                        f"{r.transfer_in}\t{r.transfer_out}\t{r.balance}"
++                    )
++        return
++    if wanted is not None:
++        rows = [r for r in rows if r.account == wanted]
+     if args.memo is not None:
+         had_rows = bool(rows)
+         rows = [r for r in rows if args.memo in r.memo]
+diff --git a/src/kakeibo/accounts.py b/src/kakeibo/accounts.py
+new file mode 100644
+index 0000000..134fde9
+--- /dev/null
++++ b/src/kakeibo/accounts.py
+@@ -0,0 +1,145 @@
++"""口座(現金・銀行・クレジットカードなど)ごとの残高と月次レポート。
++
++Expense(core.py)が account / transfer_to を持つ。ここは集計だけを担う(再利用: Expense・日付は core のまま)。
++
++規則と判断:
++D1: 口座名は前後の空白を除いた文字列で、完全一致で区別する(大文字小文字・全角半角は別物)。
++D2: 口座列の無い従来の CSV・空欄の行は口座 "" (未指定)。表示名は UNASSIGNED。未指定も 1 つの口座として残高を持つ。
++D3: 金額は正が支出(口座から出る)、負が返金・収入(口座に入る)。残高 = 期首残高 - 支出 + 返金。
++D4: 振替は account → transfer_to。金額は正のみ(core が拒否)。振替元から減り、振替先に増える。支出には数えない。
++D5: 期首残高は最初の明細より前の残高。省略した口座は 0。負も可(クレジットカードの未払いなど)。
++    bool・int 以外は TypeError。明細に無い口座でも期首残高があれば口座として存在する。
++D6: 残高の推移は、その口座に動きがあった日ごとの日末残高(同じ日の複数明細は 1 点にまとめる)。
++D7: 月次レポートは最初の月〜最後の月を欠けた月も含めて並べる(動きの無い月は 0 で、残高は前月末のまま)。
++    既知の全口座を各月に出す(月昇順、月内は口座名昇順)。空の入力は空のリスト。
++D8: 月次の spent は振替を除いた支出(返金は引く)、transfer_in / transfer_out は振替の合計。
++D9: 同じ日の明細は入力順に関係なく日末残高に合算される。
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass
++from datetime import date
++from itertools import groupby
++
++from kakeibo.core import Expense
++
++UNASSIGNED = "(未指定)"
++
++
++def account_label(name: str) -> str:
++    return name or UNASSIGNED
++
++
++def account_name(label: str) -> str:
++    """表示名 → 内部名(UNASSIGNED は "")。"""
++    return "" if label == UNASSIGNED else label
++
++
++def _check_opening(opening: Mapping[str, int] | None) -> dict[str, int]:
++    if opening is None:
++        return {}
++    out: dict[str, int] = {}
++    for name, yen in opening.items():
++        if not isinstance(name, str):
++            raise TypeError(f"opening の口座名は文字列である必要があります: {name!r}")
++        if isinstance(yen, bool) or not isinstance(yen, int):
++            raise TypeError(f"opening[{name!r}] は整数である必要があります: {yen!r}")
++        out[name] = yen
++    return out
++
++
++def _effects(e: Expense) -> list[tuple[str, int]]:
++    if e.transfer_to:
++        return [(e.account, -e.amount), (e.transfer_to, e.amount)]
++    return [(e.account, -e.amount)]
++
++
++def known_accounts(
++    rows: list[Expense], opening: Mapping[str, int] | None = None
++) -> list[str]:
++    """明細・振替先・期首残高に現れる口座(名前昇順。"" が先頭)。"""
++    names = set(_check_opening(opening))
++    for e in rows:
++        names.add(e.account)
++        if e.transfer_to:
++            names.add(e.transfer_to)
++    return sorted(names)
++
++
++def final_balances(
++    rows: list[Expense], opening: Mapping[str, int] | None = None
++) -> dict[str, int]:
++    bal = {a: 0 for a in known_accounts(rows, opening)}
++    bal.update(_check_opening(opening))
++    for e in rows:
++        for acc, delta in _effects(e):
++            bal[acc] += delta
++    return bal
++
++
++def balance_history(
++    rows: list[Expense], opening: Mapping[str, int] | None = None
++) -> dict[str, list[tuple[date, int]]]:
++    """{口座: [(日, 日末残高)]}。動きのあった日だけ、日昇順。動きの無い口座は []。"""
++    bal = {a: 0 for a in known_accounts(rows, opening)}
++    bal.update(_check_opening(opening))
++    hist: dict[str, list[tuple[date, int]]] = {a: [] for a in bal}
++    for day, group in groupby(sorted(rows, key=lambda e: e.day), key=lambda e: e.day):
++        touched: set[str] = set()
++        for e in group:
++            for acc, delta in _effects(e):
++                bal[acc] += delta
++                touched.add(acc)
++        for acc in sorted(touched):
++            hist[acc].append((day, bal[acc]))
++    return hist
++
++
++@dataclass(frozen=True)
++class AccountMonth:
++    month: str  # "YYYY-MM"
++    account: str
++    spent: int  # 振替を除く支出(返金は引く)
++    transfer_in: int
++    transfer_out: int
++    balance: int  # 月末残高
++
++
++def _month_key(d: date) -> tuple[int, int]:
++    return (d.year, d.month)
++
++
++def monthly_account_report(
++    rows: list[Expense], opening: Mapping[str, int] | None = None
++) -> list[AccountMonth]:
++    if not rows:
++        return []
++    bal = {a: 0 for a in known_accounts(rows, opening)}
++    bal.update(_check_opening(opening))
++    by_month: dict[tuple[int, int], list[Expense]] = {}
++    for e in rows:
++        by_month.setdefault(_month_key(e.day), []).append(e)
++    (y, m), last = min(by_month), max(by_month)
++    out: list[AccountMonth] = []
++    while (y, m) <= last:
++        spent = {a: 0 for a in bal}
++        t_in = {a: 0 for a in bal}
++        t_out = {a: 0 for a in bal}
++        for e in by_month.get((y, m), []):
++            if e.transfer_to:
++                t_out[e.account] += e.amount
++                t_in[e.transfer_to] += e.amount
++            else:
++                spent[e.account] += e.amount
++            for acc, delta in _effects(e):
++                bal[acc] += delta
++        for acc in sorted(bal):
++            out.append(
++                AccountMonth(
++                    f"{y:04d}-{m:02d}", acc, spent[acc], t_in[acc], t_out[acc], bal[acc]
++                )
++            )
++        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
++    return out
+diff --git a/src/kakeibo/core.py b/src/kakeibo/core.py
+index 8c3cbab..b5a000c 100644
+--- a/src/kakeibo/core.py
++++ b/src/kakeibo/core.py
+@@ -16,6 +16,10 @@ class Expense:
+     category: str
+     amount: int  # yen
+     memo: str = ""
++    account: str = ""  # "" = 口座未指定(口座列の無い従来の CSV)
++    transfer_to: str = (
++        ""  # 空でなければ account から transfer_to への振替(支出ではない)
++    )
+ 
+ 
+ class CsvError(ValueError):
+@@ -38,11 +42,22 @@ def _parse_row(r: dict[str, str | None]) -> Expense:
+         amount = int(r["amount"])  # type: ignore[arg-type]
+     except ValueError:
+         raise ValueError(f"金額が整数ではありません: {r['amount']!r}") from None
++    account = (r.get("account") or "").strip()
++    transfer_to = (r.get("transfer_to") or "").strip()
++    if transfer_to:
++        if not account:
++            raise ValueError("振替には振替元の口座(account)が必要です")
++        if transfer_to == account:
++            raise ValueError(f"振替元と振替先が同じ口座です: {account!r}")
++        if amount <= 0:
++            raise ValueError(f"振替の金額は正の整数である必要があります: {amount}")
+     return Expense(
+         day=day,
+         category=r["category"].strip(),  # type: ignore[union-attr]
+         amount=amount,
+         memo=r.get("memo") or "",
++        account=account,
++        transfer_to=transfer_to,
+     )
+ 
+ 
+@@ -64,6 +79,8 @@ def load_csv(path: Path) -> list[Expense]:
+ def total_by_category(rows: list[Expense]) -> dict[str, int]:
+     out: dict[str, int] = {}
+     for e in rows:
++        if e.transfer_to:  # 口座間の振替は支出ではない
++            continue
+         out[e.category] = out.get(e.category, 0) + e.amount
+     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+ 
+diff --git a/tests/test_accounts.py b/tests/test_accounts.py
+new file mode 100644
+index 0000000..58559f3
+--- /dev/null
++++ b/tests/test_accounts.py
+@@ -0,0 +1,273 @@
++import sys
++from datetime import date
++
++import pytest
++
++from kakeibo import main
++from kakeibo.accounts import (
++    UNASSIGNED,
++    AccountMonth,
++    balance_history,
++    final_balances,
++    known_accounts,
++    monthly_account_report,
++)
++from kakeibo.core import CsvError, Expense, load_csv, monthly_totals, total_by_category
++
++HEADER = "date,category,amount,memo,account,transfer_to\n"
++BODY = (
++    "2026-10-31,food,1500,lunch,cash,\n"
++    "2026-11-01,food,1200,lunch,card,\n"
++    "2026-11-02,rent,80000,,bank,\n"
++    "2026-11-05,transfer,30000,ATM,bank,cash\n"
++    "2026-11-10,food,800,coffee,cash,\n"
++    "2027-01-15,pay,1200,,bank,card\n"
++)
++
++
++def E(day, amount, account="", to="", cat="x", memo=""):
++    return Expense(date.fromisoformat(day), cat, amount, memo, account, to)
++
++
++# ---- 読み込み ----
++
++
++def test_legacy_csv_without_account_column(tmp_path):
++    p = tmp_path / "a.csv"
++    p.write_text("date,category,amount,memo\n2026-11-01,food,100,x\n", encoding="utf-8")
++    (e,) = load_csv(p)
++    assert e.account == "" and e.transfer_to == ""
++
++
++def test_account_columns_are_stripped(tmp_path):
++    p = tmp_path / "a.csv"
++    p.write_text(HEADER + "2026-11-01,t,5, ,  bank , cash \n", encoding="utf-8")
++    (e,) = load_csv(p)
++    assert (e.account, e.transfer_to) == ("bank", "cash")
++
++
++@pytest.mark.parametrize(
++    "line",
++    [
++        "2026-11-01,t,5,,,cash",  # 振替元なし
++        "2026-11-01,t,5,,bank,bank",  # 同一口座
++        "2026-11-01,t,-5,,bank,cash",  # 負の振替
++        "2026-11-01,t,0,,bank,cash",  # 0 の振替
++    ],
++)
++def test_invalid_transfer_rejected(tmp_path, line):
++    p = tmp_path / "a.csv"
++    p.write_text(HEADER + line + "\n", encoding="utf-8")
++    with pytest.raises(CsvError) as ei:
++        load_csv(p)
++    assert ei.value.errors[0][0] == 2
++
++
++# ---- 振替は支出ではない ----
++
++
++def test_transfer_not_counted_as_expense():
++    rows = [
++        E("2026-11-01", 100, "bank", cat="food"),
++        E("2026-11-02", 5000, "bank", "cash", cat="t"),
++    ]
++    assert total_by_category(rows) == {"food": 100}
++    assert monthly_totals(rows) == {"2026-11": {"food": 100}}
++
++
++# ---- 残高 ----
++
++
++def test_final_balances_with_opening_and_transfer():
++    rows = [
++        E("2026-11-01", 300, "cash"),
++        E("2026-11-02", 1000, "bank", "cash"),
++        E("2026-11-03", -200, "bank"),  # 返金・収入
++    ]
++    got = final_balances(rows, {"bank": 5000, "card": -100})
++    assert got == {"bank": 5000 - 1000 + 200, "card": -100, "cash": -300 + 1000}
++
++
++def test_opening_only_account_exists():
++    assert known_accounts([], {"wallet": 10}) == ["wallet"]
++    assert final_balances([], {"wallet": 10}) == {"wallet": 10}
++    assert balance_history([], {"wallet": 10}) == {"wallet": []}
++
++
++@pytest.mark.parametrize("bad", [True, 1.5, "100", None])
++def test_opening_type_rejected(bad):
++    with pytest.raises(TypeError, match="bank"):
++        final_balances([], {"bank": bad})  # type: ignore[dict-item]
++
++
++def test_history_daily_points_input_order_independent():
++    rows = [
++        E("2026-11-03", 50, "cash"),
++        E("2026-11-01", 100, "cash"),
++        E("2026-11-01", 20, "cash"),
++    ]
++    assert balance_history(rows, {"cash": 1000})["cash"] == [
++        (date(2026, 11, 1), 880),
++        (date(2026, 11, 3), 830),
++    ]
++
++
++def test_history_transfer_touches_both_accounts():
++    h = balance_history([E("2026-11-01", 100, "bank", "cash")])
++    assert h["bank"] == [(date(2026, 11, 1), -100)]
++    assert h["cash"] == [(date(2026, 11, 1), 100)]
++
++
++def test_legacy_rows_form_unassigned_account():
++    assert final_balances([E("2026-11-01", 100)]) == {"": -100}
++
++
++# ---- 月次レポート ----
++
++
++def test_monthly_report_fills_gap_months_and_carries_balance():
++    rows = [
++        E("2026-11-01", 100, "cash"),
++        E("2027-01-10", 30, "cash"),
++        E("2027-01-11", 500, "bank", "cash"),
++    ]
++    rep = monthly_account_report(rows, {"bank": 1000})
++    assert [r.month for r in rep] == ["2026-11"] * 2 + ["2026-12"] * 2 + ["2027-01"] * 2
++    assert rep[0] == AccountMonth("2026-11", "bank", 0, 0, 0, 1000)
++    assert rep[1] == AccountMonth("2026-11", "cash", 100, 0, 0, -100)
++    assert rep[3] == AccountMonth("2026-12", "cash", 0, 0, 0, -100)  # 動き無し
++    assert rep[4] == AccountMonth("2027-01", "bank", 0, 0, 500, 500)
++    assert rep[5] == AccountMonth("2027-01", "cash", 30, 500, 0, -100 - 30 + 500)
++
++
++def test_monthly_report_year_boundary_and_empty():
++    rows = [E("2026-12-31", 1, "a"), E("2027-01-01", 2, "a")]
++    assert [r.month for r in monthly_account_report(rows)] == ["2026-12", "2027-01"]
++    assert monthly_account_report([]) == []
++
++
++def test_monthly_report_refund_reduces_spent():
++    rows = [E("2026-11-01", 300, "a"), E("2026-11-02", -100, "a")]
++    (r,) = monthly_account_report(rows)
++    assert r.spent == 200 and r.balance == -200
++
++
++# ---- CLI ----
++
++
++def _run(tmp_path, monkeypatch, capsys, *args, body=BODY, header=HEADER):
++    p = tmp_path / "in.csv"
++    p.write_text(header + body, encoding="utf-8")
++    monkeypatch.setattr(sys, "argv", ["kakeibo", str(p), *args])
++    main()
++    return capsys.readouterr()
++
++
++def test_cli_default_excludes_transfers(tmp_path, monkeypatch, capsys):
++    out = _run(tmp_path, monkeypatch, capsys, "--total")
++    # 振替(transfer 30000 と pay 1200)は含まれない
++    assert out.out == "rent\t80,000\nfood\t3,500\nTOTAL\t83,500\n"
++
++
++def test_cli_account_filter(tmp_path, monkeypatch, capsys):
++    out = _run(tmp_path, monkeypatch, capsys, "--account", "cash", "--total")
++    assert out.out == "food\t2,300\nTOTAL\t2,300\n"
++    assert out.err == ""
++
++
++def test_cli_account_filter_with_report_and_memo(tmp_path, monkeypatch, capsys):
++    out = _run(
++        tmp_path,
++        monkeypatch,
++        capsys,
++        "--report",
++        "--account",
++        "cash",
++        "--memo",
++        "coffee",
++    )
++    assert out.out == "2026-11\tfood\t800\n"
++
++
++def test_cli_unknown_account(tmp_path, monkeypatch, capsys):
++    out = _run(tmp_path, monkeypatch, capsys, "--account", "nope", "--total")
++    assert out.out == "TOTAL\t0\n"
++    assert "nope" in out.err
++
++
++def test_cli_balance_history(tmp_path, monkeypatch, capsys):
++    out = _run(tmp_path, monkeypatch, capsys, "--balance", "--opening", "cash=10000")
++    lines = out.out.splitlines()
++    assert lines[0] == "2026-10-31\tcash\t8500"
++    assert "2026-11-05\tbank\t-110000" in lines
++    assert "2026-11-05\tcash\t38500" in lines
++    assert lines[-1] == "2027-01-15\tcard\t0"
++    assert lines == sorted(lines, key=lambda s: tuple(s.split("\t")[:2]))
++
++
++def test_cli_balance_single_account(tmp_path, monkeypatch, capsys):
++    out = _run(tmp_path, monkeypatch, capsys, "--balance", "--account", "card")
++    assert out.out == "2026-11-01\tcard\t-1200\n2027-01-15\tcard\t0\n"
++
++
++def test_cli_account_report(tmp_path, monkeypatch, capsys):
++    out = _run(tmp_path, monkeypatch, capsys, "--account-report", "--account", "bank")
++    lines = out.out.splitlines()
++    assert lines[0] == "2026-10\tbank\t0\t0\t0\t0"
++    assert lines[1] == "2026-11\tbank\t80000\t0\t30000\t-110000"
++    assert lines[2] == "2026-12\tbank\t0\t0\t0\t-110000"  # 欠けた月
++    assert lines[3] == "2027-01\tbank\t0\t0\t1200\t-111200"
++    assert len(lines) == 4
++
++
++def test_cli_account_report_ignores_memo_with_notice(tmp_path, monkeypatch, capsys):
++    out = _run(
++        tmp_path,
++        monkeypatch,
++        capsys,
++        "--account-report",
++        "--memo",
++        "zzz",
++        "--account",
++        "card",
++    )
++    assert "2026-11\tcard\t1200\t0\t0\t-1200" in out.out
++    assert "--memo" in out.err
++
++
++def test_cli_legacy_csv_report_and_unassigned_filter(tmp_path, monkeypatch, capsys):
++    legacy = "2026-11-01,food,100,x\n2026-11-02,food,50,\n"
++    h = "date,category,amount,memo\n"
++    out = _run(tmp_path, monkeypatch, capsys, "--account-report", body=legacy, header=h)
++    assert out.out == f"2026-11\t{UNASSIGNED}\t150\t0\t0\t-150\n"
++    out = _run(
++        tmp_path, monkeypatch, capsys, "--account", UNASSIGNED, body=legacy, header=h
++    )
++    assert out.out == "food\t150\n"
++
++
++@pytest.mark.parametrize(
++    "opening",
++    [["cash"], ["cash=1.5"], ["cash=1", "--opening", "cash=2"]],
++)
++def test_cli_opening_errors(tmp_path, monkeypatch, capsys, opening):
++    with pytest.raises(SystemExit) as ei:
++        _run(tmp_path, monkeypatch, capsys, "--balance", "--opening", *opening)
++    assert ei.value.code == 2
++
++
++def test_cli_modes_mutually_exclusive(tmp_path, monkeypatch, capsys):
++    with pytest.raises(SystemExit) as ei:
++        _run(tmp_path, monkeypatch, capsys, "--balance", "--report")
++    assert ei.value.code == 2
++
++
++def test_cli_budget_uses_account_filtered_totals(tmp_path, monkeypatch, capsys):
++    b = tmp_path / "b.json"
++    b.write_text('{"default": {"food": 1000}}', encoding="utf-8")
++    out = _run(tmp_path, monkeypatch, capsys, "--account", "cash", "--budget", str(b))
++    assert "2026-11" not in out.err  # 現金の 11 月の food は 800 で予算内
++    assert "2026-10 food 500円超過" in out.err
++    b.write_text('{"default": {"food": 100}}', encoding="utf-8")
++    out = _run(tmp_path, monkeypatch, capsys, "--account", "card", "--budget", str(b))
++    assert "2026-11 food 1,100円超過" in out.err

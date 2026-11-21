@@ -188,7 +188,7 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
     # be plain reads, so `FOO=1 python3 …`/export/source cannot appear; a "x=y" inside a title is just text)
     if runs and (len(runs) > 1 or any(not READERS.search(s) for s in segs_flat if s not in runs)):
         # allowlist, not a denylist: the script runs alone (only plain reads may share the command)
-        return "deny", "devaccel のスクリプトは単独のコマンドで実行してください(環境変数・cd・関数定義などと並べない)。スクリプトを読むだけなら Read ツールを使う。"
+        return "deny", "devaccel のスクリプトは単独のコマンドで実行してください(環境変数・cd・関数定義・`git switch` などと `&&` や `;` で並べない。作業ブランチは ship の `--branch <名前>` が作る)。スクリプトを読むだけなら Read ツールを使う。"
     if PR_SCRIPT.search(flat) and PIPE.search(flat) and not all(READERS.search(s) for s in segs_flat):
         return "deny", ("devaccel のスクリプトを名指しするコマンドで、他のコマンドへのパイプは使えません"
                         "(出力は短いのでそのまま実行する)。")
@@ -287,6 +287,27 @@ def capture_prompt(data: dict, root: Path) -> None:
     write_nofollow(out, best or None)
 
 
+_TAIL = re.compile(r"\s*2>&1\s*(?:\|\s*(?:tail|head)(?:\s+-n)?(?:\s+-?\d+)?\s*)?$")
+_NEWBRANCH = re.compile(r"^\s*git (?:checkout(?: -q)? -b|switch(?: -q)? -c) (\w[\w./-]*)(?: -q)?\s*&&\s*")
+_LONE_SHIP = re.compile(r"\s*python3 \.claude/hooks/devaccel_ship\.py(?: [^`$<>;&|\n\r\\]*)?")
+
+
+def ship_fix(command: str, cfg: dict, cwd: Path, project: Path) -> str | None:
+    """The two shapes that made the ship call bounce (16 of 30 runs, a turn each): a trailing `2>&1 | tail -N`
+    and a leading `git checkout -b X &&`. Rewritten to the plain form the model was told to use (`--branch X`
+    makes the branch), and only if that form is a lone ship call the guard itself has no objection to."""
+    fixed, m = command, _NEWBRANCH.match(command)
+    if m:
+        fixed = fixed[m.end():]
+    fixed = _TAIL.sub("", fixed)
+    if m and " --branch " not in f" {fixed} ":
+        fixed += f" --branch {m.group(1)}"
+    if (fixed == command or not _LONE_SHIP.fullmatch(fixed) or not SHIP_RUN.fullmatch(fixed)
+            or len(_segments(fixed)) != 1 or decide(fixed, cfg, cwd, project) is not None):
+        return None
+    return fixed
+
+
 def main() -> int:
     data = read_stdin_json()
     command = (data.get("tool_input") or {}).get("command", "")
@@ -298,6 +319,11 @@ def main() -> int:
     if verdict is None and BATCH_RUN.search(command) and f" {PROMPT_FILE} " in f" {command.strip()} ":
         top = git(cwd, "rev-parse", "--show-toplevel").strip()
         capture_prompt(data, Path(top) if top else cwd)
+    if verdict and verdict[0] == "deny" and (fixed := ship_fix(command, load_config(project), cwd, project)):
+        emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                     "permissionDecisionReason": "[devaccel guard] ran as: " + fixed,
+                                     "updatedInput": {**(data.get("tool_input") or {}), "command": fixed}}})
+        return 0
     if verdict:
         decision, why = verdict
         emit(

@@ -1,0 +1,225 @@
+diff --git a/src/kakeibo/trend.py b/src/kakeibo/trend.py
+new file mode 100644
+index 0000000..266e6e8
+--- /dev/null
++++ b/src/kakeibo/trend.py
+@@ -0,0 +1,104 @@
++"""月ごとのカテゴリ別支出の前月比(純粋関数のみ)。
++
++入力は core.monthly_totals の戻り値 ``{"YYYY-MM": {category: yen}}`` をそのまま受け取る
++(集計の型・関数は core のものを再利用し、ここでは二重に持たない)。
++
++D1: 月キーは ``YYYY-MM`` のみ受け付ける。それ以外は ValueError(どの月かをメッセージに含める)。
++D2: 金額は int のみ。bool・float・str・None は TypeError。負の金額(返金)と 0 は受け付ける。
++D3: 空の入力は空の結果({})を返す。
++D4: 途中の月がデータに無い場合は空の月(全カテゴリなし)として比べる。
++    1 月にあって 2 月に無ければ 2 月に「なくなった」、結果にも空の月として含める。
++D5: 最初の月は何とも比べられないので、前月を空の月として扱い、全カテゴリが「新しく出てきた」になる。
++D6: 判定はキーの有無で行う。前月だけにある=gone、今月だけにある=new、
++    両方にあれば差の符号で up / down / same。金額 0 でもキーがあれば「ある」とみなす。
++D7: 増減率(pct)は 前月が 0 または前月にキーが無いとき None(0 での割り算をしない)。
++    それ以外は ``差 / |前月| * 100``(負の前月でも符号が差の向きと一致する)。
++D8: 各月の並びは 差の絶対値の降順、同点はカテゴリ名の昇順(常に決定的)。月は昇順。
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Literal
++
++Status = Literal["up", "down", "same", "new", "gone"]
++
++_MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
++
++
++@dataclass(frozen=True)
++class CategoryChange:
++    month: str
++    category: str
++    previous: int  # 前月の金額(前月に無ければ 0)
++    current: int  # 今月の金額(今月に無ければ 0)
++    delta: int  # current - previous
++    pct: float | None  # 増減率(%)。前月が 0 / 無いときは None
++    status: Status
++
++
++def _validate(totals: dict[str, dict[str, int]]) -> None:
++    for month, cats in totals.items():
++        if not isinstance(month, str) or not _MONTH_RE.fullmatch(month):  # pyright: ignore[reportUnnecessaryIsInstance]
++            raise ValueError(f"月の形式が不正です(YYYY-MM): {month!r}")
++        for cat, yen in cats.items():
++            if isinstance(yen, bool) or not isinstance(yen, int):  # pyright: ignore[reportUnnecessaryIsInstance]
++                raise TypeError(
++                    f"{month}.{cat} の金額は int である必要があります: {yen!r}"
++                )
++
++
++def _next_month(month: str) -> str:
++    y, m = int(month[:4]), int(month[5:])
++    return f"{y + 1:04d}-01" if m == 12 else f"{y:04d}-{m + 1:02d}"
++
++
++def _month_range(first: str, last: str) -> list[str]:
++    out = [first]
++    while out[-1] != last:
++        out.append(_next_month(out[-1]))
++    return out
++
++
++def compare_months(
++    prev: dict[str, int], cur: dict[str, int], month: str
++) -> list[CategoryChange]:
++    """前月 prev と今月 cur のカテゴリ別金額を比べる。"""
++    changes: list[CategoryChange] = []
++    for cat in prev.keys() | cur.keys():
++        p = prev.get(cat, 0)
++        c = cur.get(cat, 0)
++        delta = c - p
++        status: Status
++        if cat not in prev:
++            status = "new"
++        elif cat not in cur:
++            status = "gone"
++        elif delta > 0:
++            status = "up"
++        elif delta < 0:
++            status = "down"
++        else:
++            status = "same"
++        pct = None if cat not in prev or p == 0 else delta / abs(p) * 100
++        changes.append(CategoryChange(month, cat, p, c, delta, pct, status))
++    changes.sort(key=lambda ch: (-abs(ch.delta), ch.category))
++    return changes
++
++
++def month_over_month(
++    totals: dict[str, dict[str, int]],
++) -> dict[str, list[CategoryChange]]:
++    """{月: [CategoryChange, ...]}。月は昇順で、途中の欠けた月も空の月として含む。"""
++    _validate(totals)
++    if not totals:
++        return {}
++    months = _month_range(min(totals), max(totals))
++    out: dict[str, list[CategoryChange]] = {}
++    prev: dict[str, int] = {}
++    for m in months:
++        cur = totals.get(m, {})
++        out[m] = compare_months(prev, cur, m)
++        prev = cur
++    return out
+diff --git a/tests/test_trend.py b/tests/test_trend.py
+new file mode 100644
+index 0000000..0e33c3a
+--- /dev/null
++++ b/tests/test_trend.py
+@@ -0,0 +1,109 @@
++from __future__ import annotations
++
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense, monthly_totals
++from kakeibo.trend import month_over_month
++
++
++def _by_cat(changes):
++    return {c.category: c for c in changes}
++
++
++def test_empty_input_gives_empty_result():
++    assert month_over_month({}) == {}
++
++
++def test_up_down_same_new_gone():
++    totals = {
++        "2026-01": {"food": 1000, "rent": 5000, "fun": 800, "tax": 300},
++        "2026-02": {"food": 1500, "rent": 5000, "fun": 200, "gym": 400},
++    }
++    feb = _by_cat(month_over_month(totals)["2026-02"])
++    assert (feb["food"].status, feb["food"].delta, feb["food"].pct) == ("up", 500, 50.0)
++    assert (feb["fun"].status, feb["fun"].delta, feb["fun"].pct) == (
++        "down",
++        -600,
++        -75.0,
++    )
++    assert feb["rent"].status == "same" and feb["rent"].delta == 0
++    assert (feb["gym"].status, feb["gym"].previous, feb["gym"].pct) == ("new", 0, None)
++    assert (feb["tax"].status, feb["tax"].current, feb["tax"].pct) == (
++        "gone",
++        0,
++        -100.0,
++    )
++
++
++def test_first_month_is_all_new():
++    res = month_over_month({"2026-01": {"food": 100}})
++    assert [c.status for c in res["2026-01"]] == ["new"]
++
++
++def test_gap_month_is_empty_month():
++    totals = {"2026-01": {"food": 100}, "2026-03": {"food": 100}}
++    res = month_over_month(totals)
++    assert list(res) == ["2026-01", "2026-02", "2026-03"]
++    assert [c.status for c in res["2026-02"]] == ["gone"]
++    assert [c.status for c in res["2026-03"]] == ["new"]
++
++
++def test_year_rollover():
++    res = month_over_month({"2025-12": {"a": 1}, "2026-02": {"a": 1}})
++    assert list(res) == ["2025-12", "2026-01", "2026-02"]
++
++
++def test_previous_zero_has_no_pct_but_is_up():
++    res = month_over_month({"2026-01": {"a": 0}, "2026-02": {"a": 300}})
++    c = res["2026-02"][0]
++    assert (c.status, c.delta, c.pct) == ("up", 300, None)
++
++
++def test_zero_amount_key_counts_as_present():
++    res = month_over_month({"2026-01": {"a": 100}, "2026-02": {"a": 0}})
++    assert res["2026-02"][0].status == "down"
++
++
++def test_negative_amounts_refund():
++    res = month_over_month({"2026-01": {"a": -100}, "2026-02": {"a": -50}})
++    c = res["2026-02"][0]
++    assert (c.status, c.delta, c.pct) == ("up", 50, 50.0)
++
++
++def test_ordering_abs_delta_desc_then_name():
++    totals = {
++        "2026-01": {"b": 100, "a": 100, "c": 100},
++        "2026-02": {"b": 200, "a": 200, "c": 0},
++    }
++    res = month_over_month(totals)["2026-02"]
++    assert [c.category for c in res] == ["a", "b", "c"]
++
++
++def test_months_ascending_regardless_of_input_order():
++    res = month_over_month({"2026-03": {"a": 1}, "2026-01": {"a": 1}})
++    assert list(res) == ["2026-01", "2026-02", "2026-03"]
++
++
++@pytest.mark.parametrize("bad", ["2026-13", "2026-1", "2026/01", "202601", ""])
++def test_bad_month_key_rejected(bad):
++    with pytest.raises(ValueError, match="月の形式"):
++        month_over_month({bad: {"a": 1}})
++
++
++@pytest.mark.parametrize("bad", [True, 1.0, "100", None])
++def test_bad_amount_type_rejected(bad):
++    with pytest.raises(TypeError):
++        month_over_month({"2026-01": {"a": bad}})  # type: ignore[dict-item]
++
++
++def test_works_with_core_monthly_totals():
++    rows = [
++        Expense(date(2026, 1, 5), "food", 1000),
++        Expense(date(2026, 1, 9), "food", 500),
++        Expense(date(2026, 2, 1), "food", 900),
++    ]
++    res = month_over_month(monthly_totals(rows))
++    c = res["2026-02"][0]
++    assert (c.previous, c.current, c.status) == (1500, 900, "down")

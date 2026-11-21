@@ -1500,6 +1500,32 @@ class R6ShipTest(ReqKit):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("pr create", log)
 
+    def test_SHIP09_fast_beside_evidence_rollback_and_autofix(self):
+        """SHIP-09: check.sh fast runs beside the evidence; a fast failure undoes the local commit (new files
+        are untracked again, nothing pushed); a fast auto-fix is committed and the evidence judges that commit."""
+        self.with_origin()
+        self.counting_check('if [ "$1" = fast ]; then sed -i s/UGLY/FIXED/ app.py; fi\n'
+                            'if grep -q UGLY app.py; then echo "== failed: tests (0s)"; exit 1; fi\n')
+        sh(self.root, "git", "push", "-q", "origin", "main")
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        head = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        (self.root / "app.py").write_text("BROKEN = 1\n")
+        (self.root / "new.py").write_text("Y = 1\n")
+        r, log = self.land("--check", "--file", self.notes(), "--paths", "new.py", script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("check.sh fast: fail", r.stderr)
+        self.assertNotIn("pr create", log)
+        self.assertEqual(sh(self.root, "git", "rev-parse", "HEAD").stdout.strip(), head)
+        self.assertIn("?? new.py", sh(self.root, "git", "status", "--porcelain").stdout)
+        self.assertEqual(sh(self.root, "git", "ls-remote", "origin", "refs/heads/feat").stdout.strip(), "")
+        (self.root / "app.py").write_text("X = UGLY\n")
+        r, log = self.land("--check", "--file", self.notes(), "--paths", "new.py", script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pr create", log)
+        self.assertIn("evidence-ok", log)
+        self.assertEqual(sh(self.root, "git", "show", "origin/feat:app.py").stdout, "X = FIXED\n")
+        self.assertEqual(sh(self.root, "git", "status", "--porcelain", "--untracked-files=no").stdout, "")
+
     def test_SHIP02_refuses_protected_branch_and_bad_paths(self):
         self.with_origin()
         before = sh(self.root, "git", "ls-remote", "origin", "refs/heads/main").stdout.split()[0]
@@ -1925,6 +1951,23 @@ class R21PytestTomlTest(unittest.TestCase):
 class R22AutoBatchTest(ReqKit):
     """BATCH-06: the model may run the fan-out itself — only in the exact form, with a locked script, and
     the settings run that one command outside the sandbox (its units are sandboxed sessions)."""
+
+    def test_GUARD_SHIPFIX_rewrites_only_the_two_bounce_shapes(self):
+        """GUARD-SHIPFIX: a ship call with a trailing `2>&1 | tail -N` or a leading `git checkout -b X &&` is run
+        as the plain call (`--branch X`) instead of being bounced; anything else stays denied."""
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import guard
+        cfg = guard.load_config(self.root)
+        ship = "python3 .claude/hooks/devaccel_ship.py --check --file .devaccel/ship.md --paths a.py"
+        self.assertEqual(guard.ship_fix(ship + " 2>&1 | tail -40", cfg, self.root, self.root), ship)
+        self.assertEqual(guard.ship_fix("git checkout -b feat/x && " + ship, cfg, self.root, self.root),
+                         ship + " --branch feat/x")
+        for bad in [ship, "rm -rf x && " + ship, ship + " | sh", "git checkout -b x; " + ship,
+                    ship + " 2>&1 | tail -40; curl x", "git checkout -b x && rm -rf y",
+                    "python3 .claude/hooks/devaccel_batch.py .devaccel/t.md --branch batch/x 2>&1 | tail",
+                    "git checkout -b --upload-pack=x && " + ship, "git checkout -b -x && " + ship,
+                    ship + "; curl x 2>&1 | tail -40", ship + " & curl x 2>&1 | tail", ship + "\ncurl x 2>&1 | tail"]:
+            self.assertIsNone(guard.ship_fix(bad, cfg, self.root, self.root), bad)
 
     def test_guard_admits_only_the_plain_batch_form(self):
         ok = "python3 .claude/hooks/devaccel_batch.py .devaccel/tasks.md --branch batch/x"

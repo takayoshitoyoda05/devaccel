@@ -1,0 +1,318 @@
+diff --git a/src/kakeibo/trend.py b/src/kakeibo/trend.py
+new file mode 100644
+index 0000000..9fc3872
+--- /dev/null
++++ b/src/kakeibo/trend.py
+@@ -0,0 +1,126 @@
++"""Month-over-month comparison of per-category spending (pure functions).
++
++Input is the return value of ``kakeibo.core.monthly_totals``.
++
++Decisions:
++D1: Months run contiguously from the first to the last month, ascending, 1 month
++    apart. A month missing from the data is an empty month. Example: 2026-01 and
++    2026-03 with 食費 100 each -> 3 results; 02 is 食費 gone, 03 is 食費 new.
++    2025-12 is followed by 2026-01.
++D2: The first month has previous_month=None and changes=() (nothing to compare).
++D3: "present" = key exists and value != 0. absent->present = "new";
++    present->absent = "gone"; both present: "increased" / "decreased" /
++    "unchanged" (included, delta=0, rate=0.0). Categories absent from both
++    months are not listed.
++D4: rate = delta / abs(previous), unrounded. 100->150 = 0.5, 200->100 = -0.5,
++    gone = -1.0, new = None.
++D5: Categories with negative totals (refunds) count as present and compare
++    numerically: -100->-50 is previous=-100, current=-50, delta=50, "increased",
++    rate=0.5.
++D6: changes are sorted by abs(delta) descending, ties by category ascending.
++D7: Empty input -> []. A single month -> one result with no changes.
++D8: The input is not mutated; unsorted input months still give ascending output.
++D9: Mixed categories (in both months / in one only) are handled together.
++Invalid input: non-dict totals, non-dict month values, non-int amounts
++(including bool/float/str/None) -> TypeError; month keys not YYYY-MM (01-12) or
++non-str categories -> ValueError naming the bad key.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Literal
++
++Kind = Literal["increased", "decreased", "new", "gone", "unchanged"]
++
++_MONTH_RE = re.compile(r"([0-9]{4})-(0[1-9]|1[0-2])")
++
++
++@dataclass(frozen=True)
++class CategoryChange:
++    category: str
++    kind: Kind
++    previous: int
++    current: int
++    delta: int
++    rate: float | None
++
++
++@dataclass(frozen=True)
++class MonthComparison:
++    month: str
++    previous_month: str | None
++    changes: tuple[CategoryChange, ...]
++
++
++def _validate(totals: object) -> dict[str, dict[str, int]]:
++    if not isinstance(totals, dict):
++        raise TypeError(f"totals は dict である必要があります: {type(totals).__name__}")
++    for month, cats in totals.items():
++        if not isinstance(month, str) or not _MONTH_RE.fullmatch(month):
++            raise ValueError(f"月の形式が不正です(YYYY-MM): {month!r}")
++        if not isinstance(cats, dict):
++            raise TypeError(
++                f"{month} の値は dict である必要があります: {type(cats).__name__}"
++            )
++        for cat, yen in cats.items():
++            if not isinstance(cat, str):
++                # spec: a bad category key is a ValueError (like a bad month key)
++                raise ValueError(  # noqa: TRY004
++                    f"{month} のカテゴリは str である必要があります: {cat!r}"
++                )
++            if isinstance(yen, bool) or not isinstance(yen, int):
++                raise TypeError(
++                    f"{month}.{cat} の金額は int である必要があります: {yen!r}"
++                )
++    return totals
++
++
++def _index(month: str) -> int:
++    return int(month[:4]) * 12 + int(month[5:]) - 1
++
++
++def _label(index: int) -> str:
++    return f"{index // 12:04d}-{index % 12 + 1:02d}"
++
++
++def _change(category: str, previous: int, current: int) -> CategoryChange:
++    delta = current - previous
++    if previous == 0:
++        kind: Kind = "new"
++    elif current == 0:
++        kind = "gone"
++    elif delta > 0:
++        kind = "increased"
++    elif delta < 0:
++        kind = "decreased"
++    else:
++        kind = "unchanged"
++    rate = None if previous == 0 else delta / abs(previous)
++    return CategoryChange(category, kind, previous, current, delta, rate)
++
++
++def month_over_month(totals: dict[str, dict[str, int]]) -> list[MonthComparison]:
++    data = _validate(totals)
++    if not data:
++        return []
++    indexes = [_index(m) for m in data]
++    first, last = min(indexes), max(indexes)
++    out: list[MonthComparison] = []
++    prev_cats: dict[str, int] | None = None
++    prev_label: str | None = None
++    for i in range(first, last + 1):
++        label = _label(i)
++        cats = data.get(label, {})
++        changes: list[CategoryChange] = []
++        if prev_cats is not None:
++            for cat in set(prev_cats) | set(cats):
++                p, c = prev_cats.get(cat, 0), cats.get(cat, 0)
++                if p == 0 and c == 0:
++                    continue
++                changes.append(_change(cat, p, c))
++            changes.sort(key=lambda ch: (-abs(ch.delta), ch.category))
++        out.append(MonthComparison(label, prev_label, tuple(changes)))
++        prev_cats, prev_label = cats, label
++    return out
+diff --git a/tests/test_trend.py b/tests/test_trend.py
+new file mode 100644
+index 0000000..fd1d4eb
+--- /dev/null
++++ b/tests/test_trend.py
+@@ -0,0 +1,180 @@
++import copy
++import re
++
++import pytest
++
++from kakeibo.trend import CategoryChange, MonthComparison, month_over_month
++
++
++def _by_cat(mc):
++    return {c.category: c for c in mc.changes}
++
++
++def test_d1_fills_missing_months_in_order():
++    """D1: months between first and last are filled in ascending order; missing month is empty."""
++    totals = {"2026-01": {"食費": 100}, "2026-04": {"食費": 100}}
++    res = month_over_month(totals)
++    assert [m.month for m in res] == ["2026-01", "2026-02", "2026-03", "2026-04"]
++    assert [m.previous_month for m in res] == [None, "2026-01", "2026-02", "2026-03"]
++    assert res[1].changes == (CategoryChange("食費", "gone", 100, 0, -100, -1.0),)
++    assert res[2].changes == ()
++    assert res[3].changes == (CategoryChange("食費", "new", 0, 100, 100, None),)
++
++
++def test_d1_year_boundary_is_continuous():
++    """D1: 2025-12 is followed by 2026-01."""
++    res = month_over_month({"2025-12": {"食費": 1}, "2026-01": {"食費": 2}})
++    assert [m.month for m in res] == ["2025-12", "2026-01"]
++    assert res[1].previous_month == "2025-12"
++    assert res[1].changes == (CategoryChange("食費", "increased", 1, 2, 1, 1.0),)
++
++
++def test_d2_first_month_has_no_comparison():
++    """D2: the first month has previous_month None and no changes (not new)."""
++    res = month_over_month(
++        {"2026-01": {"食費": 100, "家賃": 80000}, "2026-02": {"食費": 100}}
++    )
++    assert res[0].month == "2026-01"
++    assert res[0].previous_month is None
++    assert res[0].changes == ()
++
++
++def test_d3_new_when_previous_absent_or_zero():
++    """D3: absent or zero in previous month and non-zero now -> new (rate None)."""
++    res = month_over_month({"2026-01": {"食費": 0}, "2026-02": {"食費": 50}})
++    assert res[1].changes == (CategoryChange("食費", "new", 0, 50, 50, None),)
++    res = month_over_month({"2026-01": {"家賃": 1}, "2026-02": {"家賃": 1, "食費": 50}})
++    assert _by_cat(res[1])["食費"].kind == "new"
++
++
++def test_d3_gone_when_current_absent_or_zero():
++    """D3: non-zero previous and absent or zero now -> gone."""
++    res = month_over_month({"2026-01": {"食費": 100}, "2026-02": {"食費": 0}})
++    assert res[1].changes == (CategoryChange("食費", "gone", 100, 0, -100, -1.0),)
++    res = month_over_month(
++        {"2026-01": {"食費": 100, "家賃": 1}, "2026-02": {"家賃": 1}}
++    )
++    assert _by_cat(res[1])["食費"].kind == "gone"
++
++
++def test_d3_increased_decreased_unchanged():
++    """D3: both present -> increased / decreased / unchanged (unchanged is listed with delta 0)."""
++    res = month_over_month(
++        {
++            "2026-01": {"a": 100, "b": 200, "c": 100},
++            "2026-02": {"a": 150, "b": 100, "c": 100},
++        }
++    )
++    got = _by_cat(res[1])
++    assert got["a"].kind == "increased"
++    assert got["b"].kind == "decreased"
++    assert got["c"] == CategoryChange("c", "unchanged", 100, 100, 0, 0.0)
++
++
++def test_d4_rate_is_not_rounded():
++    """D4: rate = delta / abs(previous), no rounding; new has rate None."""
++    res = month_over_month(
++        {
++            "2026-01": {"a": 100, "b": 200, "c": 3},
++            "2026-02": {"a": 150, "b": 100, "c": 4},
++        }
++    )
++    got = _by_cat(res[1])
++    assert got["a"].rate == 0.5
++    assert got["b"].rate == -0.5
++    assert got["c"].rate == pytest.approx(1 / 3, rel=1e-12)
++    assert got["c"].delta == 1
++
++
++def test_d5_negative_totals_compared_numerically():
++    """D5: refunds (negative totals) count as present and are compared by value, rate uses abs(previous)."""
++    res = month_over_month({"2026-01": {"食費": -100}, "2026-02": {"食費": -50}})
++    assert res[1].changes == (CategoryChange("食費", "increased", -100, -50, 50, 0.5),)
++
++
++def test_d6_sorted_by_abs_delta_then_name():
++    """D6: order by abs(delta) descending, ties by category name ascending."""
++    res = month_over_month(
++        {
++            "2026-01": {"x": 100, "y": 100, "z": 500},
++            "2026-02": {"x": 200, "y": 0, "z": 510},
++        }
++    )
++    assert [c.category for c in res[1].changes] == ["x", "y", "z"]
++    assert [c.delta for c in res[1].changes] == [100, -100, 10]
++
++
++def test_d7_empty_input_returns_empty_list():
++    """D7: {} -> []."""
++    assert month_over_month({}) == []
++
++
++def test_d7_single_month_returns_one_item():
++    """D7: a single month gives one item with previous_month None and no changes."""
++    res = month_over_month({"2026-05": {"食費": 300, "家賃": 80000}})
++    assert res == [MonthComparison("2026-05", None, ())]
++    assert month_over_month({"2026-05": {}}) == [MonthComparison("2026-05", None, ())]
++
++
++def test_d8_input_not_mutated():
++    """D8: the input dict is not changed by the call."""
++    totals = {"2026-02": {"食費": 50, "家賃": 0}, "2026-01": {"食費": 100}}
++    before = copy.deepcopy(totals)
++    month_over_month(totals)
++    assert totals == before
++
++
++def test_d8_unordered_input_gives_ascending_result():
++    """D8: input months out of order still give ascending results."""
++    res = month_over_month({"2026-03": {"食費": 1}, "2026-01": {"食費": 1}})
++    assert [m.month for m in res] == ["2026-01", "2026-02", "2026-03"]
++    assert res[2].previous_month == "2026-02"
++
++
++def test_d9_mixed_categories_and_both_absent_omitted():
++    """D9: categories present in both, only one side, and absent in both (omitted) together."""
++    res = month_over_month(
++        {
++            "2026-01": {"a": 10, "b": 20, "n": 0},
++            "2026-02": {"b": 25, "c": 7, "m": 0},
++        }
++    )
++    got = _by_cat(res[1])
++    assert set(got) == {"a", "b", "c"}
++    assert got["a"].kind == "gone"
++    assert got["b"].kind == "increased"
++    assert got["c"].kind == "new"
++
++
++@pytest.mark.parametrize("totals", [[], None, "2026-01"])
++def test_errors_totals_not_dict(totals):
++    """Errors: totals that is not a dict -> TypeError."""
++    with pytest.raises(TypeError):
++        month_over_month(totals)
++
++
++@pytest.mark.parametrize("value", [[("食費", 1)], None])
++def test_errors_month_value_not_dict(value):
++    """Errors: a month value that is not a dict -> TypeError."""
++    with pytest.raises(TypeError):
++        month_over_month({"2026-01": value})
++
++
++@pytest.mark.parametrize("amount", [True, 1.5, "100", None])
++def test_errors_amount_not_int(amount):
++    """Errors: amount that is not an int (bool, float, str, None included) -> TypeError."""
++    with pytest.raises(TypeError):
++        month_over_month({"2026-01": {"食費": amount}})
++
++
++@pytest.mark.parametrize("bad", ["2026-13", "2026-1", "202601"])
++def test_errors_bad_month_key(bad):
++    """Errors: month key not YYYY-MM (01-12) -> ValueError containing the bad key."""
++    with pytest.raises(ValueError, match=re.escape(bad)):
++        month_over_month({bad: {"食費": 1}})
++
++
++def test_errors_category_not_str():
++    """Errors: category that is not a str -> ValueError."""
++    with pytest.raises(ValueError):
++        month_over_month({"2026-01": {1: 100}})  # type: ignore[arg-type]

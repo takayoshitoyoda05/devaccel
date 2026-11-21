@@ -1,0 +1,259 @@
+diff --git a/src/kakeibo/budget_alerts.py b/src/kakeibo/budget_alerts.py
+new file mode 100644
+index 0000000..e59983f
+--- /dev/null
++++ b/src/kakeibo/budget_alerts.py
+@@ -0,0 +1,96 @@
++"""Budget alerts: flag categories that went over (or are close to) a monthly budget.
++
++Pure functions only. Reuses ``Budget`` from ``kakeibo.core`` and takes the
++``monthly_totals`` shape ``{"YYYY-MM": {category: yen}}``.
++
++Decisions:
++D1: actual > limit -> level="over". e.g. limit 1000, actual 1001 -> over, remaining=-1.
++D2: actual == limit is "warning", not "over". e.g. limit 1000, actual 1000 -> warning, remaining=0, ratio=1.0.
++D3: warning when limit*warn_ratio <= actual <= limit, compared exactly via Decimal(str(warn_ratio)).
++    e.g. limit 1000, ratio 0.8: 800 -> warning, 799 -> none. limit 10, ratio 0.7: 7 -> warning.
++D4: warn_ratio defaults to 0.8; 1.0 and int 1 are valid; bool/str/None -> TypeError;
++    nan/inf/0/negative/>1 -> ValueError (message names ``warn_ratio``).
++D5: limit == 0: actual > 0 -> over (ratio=None, remaining=-actual); actual == 0 -> no alert.
++D6: actual <= 0 (refunds netting to 0 or negative) -> no alert.
++D7: categories without a limit, budgeted categories absent from the month, and months absent
++    from totals are not evaluated (no alert).
++D8: limits come from ``budget.for_month(month)`` (monthly override beats default).
++D9: order: month asc -> "over" before "warning" -> remaining asc -> category asc.
++D10: inputs are never mutated; empty totals or empty budget -> [].
++D11: a non-int (or bool) amount in totals -> TypeError naming the month and category.
++"""
++
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from decimal import Decimal
++from typing import Literal
++
++from kakeibo.core import Budget
++
++AlertLevel = Literal["over", "warning"]
++
++DEFAULT_WARN_RATIO = 0.8
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    month: str
++    category: str
++    level: AlertLevel
++    limit: int  # yen
++    actual: int  # yen
++    remaining: int  # limit - actual (negative when over)
++    ratio: float | None  # actual / limit; None when limit == 0
++
++
++def _validate_ratio(warn_ratio: object) -> Decimal:
++    if isinstance(warn_ratio, bool) or not isinstance(warn_ratio, (int, float)):
++        raise TypeError(f"warn_ratio は数値である必要があります: {warn_ratio!r}")
++    if isinstance(warn_ratio, float) and not math.isfinite(warn_ratio):
++        raise ValueError(f"warn_ratio は有限の数である必要があります: {warn_ratio!r}")
++    if not 0 < warn_ratio <= 1:
++        raise ValueError(
++            f"warn_ratio は 0 より大きく 1 以下である必要があります: {warn_ratio!r}"
++        )
++    return Decimal(str(warn_ratio))
++
++
++def check_budget(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    warn_ratio: float = DEFAULT_WARN_RATIO,
++) -> list[BudgetAlert]:
++    """Return alerts for categories over budget or at/above ``warn_ratio`` of it."""
++    threshold = _validate_ratio(warn_ratio)
++    alerts: list[BudgetAlert] = []
++    for month, cats in totals.items():
++        limits = budget.for_month(month)
++        for cat, actual in cats.items():
++            if isinstance(actual, bool) or not isinstance(actual, int):
++                raise TypeError(
++                    f"{month} {cat} の金額は整数である必要があります: {actual!r}"
++                )
++            if cat not in limits or actual <= 0:
++                continue
++            limit = limits[cat]
++            if actual > limit:
++                level: AlertLevel = "over"
++            elif Decimal(actual) >= Decimal(limit) * threshold:
++                level = "warning"
++            else:
++                continue
++            alerts.append(
++                BudgetAlert(
++                    month=month,
++                    category=cat,
++                    level=level,
++                    limit=limit,
++                    actual=actual,
++                    remaining=limit - actual,
++                    ratio=actual / limit if limit else None,
++                )
++            )
++    alerts.sort(key=lambda a: (a.month, a.level != "over", a.remaining, a.category))
++    return alerts
+diff --git a/tests/test_budget_alerts.py b/tests/test_budget_alerts.py
+new file mode 100644
+index 0000000..c0de5d5
+--- /dev/null
++++ b/tests/test_budget_alerts.py
+@@ -0,0 +1,151 @@
++import copy
++import math
++from dataclasses import FrozenInstanceError
++
++import pytest
++
++from kakeibo.budget_alerts import BudgetAlert, check_budget
++from kakeibo.core import Budget
++
++
++def _b(default, months=None):
++    return Budget(default=dict(default), months=dict(months or {}))
++
++
++def test_d1_over_by_one_yen():
++    alerts = check_budget({"2026-11": {"food": 1001}}, _b({"food": 1000}))
++    assert len(alerts) == 1
++    a = alerts[0]
++    assert (a.month, a.category, a.level) == ("2026-11", "food", "over")
++    assert (a.limit, a.actual, a.remaining) == (1000, 1001, -1)
++    assert a.ratio == pytest.approx(1.001)
++
++
++def test_d2_equal_to_limit_is_warning_not_over():
++    alerts = check_budget({"2026-11": {"food": 1000}}, _b({"food": 1000}))
++    assert len(alerts) == 1
++    a = alerts[0]
++    assert a.level == "warning"
++    assert a.remaining == 0
++    assert a.ratio == 1.0
++
++
++@pytest.mark.parametrize(
++    ("actual", "expected"),
++    [(799, []), (800, "warning")],
++)
++def test_d3_warning_boundary_at_80_percent(actual, expected):
++    alerts = check_budget({"2026-11": {"food": actual}}, _b({"food": 1000}), 0.8)
++    if expected == []:
++        assert alerts == []
++    else:
++        assert [a.level for a in alerts] == [expected]
++
++
++def test_d3_warning_exact_decimal_boundary_70_percent():
++    # 0.7 * 10 == 7 must hold without float error (7.000000000000001 trap)
++    alerts = check_budget({"2026-11": {"food": 7}}, _b({"food": 10}), 0.7)
++    assert [a.level for a in alerts] == ["warning"]
++
++
++def test_d4_warn_ratio_one_and_int_one_are_valid():
++    totals = {"2026-11": {"food": 999}}
++    assert check_budget(totals, _b({"food": 1000}), 1.0) == []
++    alerts = check_budget({"2026-11": {"food": 1000}}, _b({"food": 1000}), 1)
++    assert [a.level for a in alerts] == ["warning"]
++    alerts = check_budget({"2026-11": {"food": 1001}}, _b({"food": 1000}), 1.0)
++    assert [a.level for a in alerts] == ["over"]
++
++
++@pytest.mark.parametrize("bad", [True, "0.8", None])
++def test_d4_warn_ratio_wrong_type_raises_type_error(bad):
++    with pytest.raises(TypeError):
++        check_budget({"2026-11": {"food": 1}}, _b({"food": 1000}), bad)
++
++
++@pytest.mark.parametrize("bad", [math.nan, math.inf, 0, -0.1, 1.01])
++def test_d4_warn_ratio_out_of_range_raises_value_error(bad):
++    with pytest.raises(ValueError, match="warn_ratio"):
++        check_budget({"2026-11": {"food": 1}}, _b({"food": 1000}), bad)
++
++
++def test_d5_zero_limit_with_spend_is_over_with_no_ratio():
++    alerts = check_budget({"2026-11": {"food": 5}}, _b({"food": 0}))
++    assert len(alerts) == 1
++    a = alerts[0]
++    assert (a.level, a.limit, a.actual, a.remaining) == ("over", 0, 5, -5)
++    assert a.ratio is None
++
++
++def test_d5_zero_limit_with_zero_spend_has_no_alert():
++    assert check_budget({"2026-11": {"food": 0}}, _b({"food": 0})) == []
++
++
++@pytest.mark.parametrize("actual", [0, -300])
++def test_d6_non_positive_actual_has_no_alert(actual):
++    assert check_budget({"2026-11": {"food": actual}}, _b({"food": 1000})) == []
++
++
++def test_d7_categories_and_months_outside_scope_have_no_alert():
++    budget = _b({"food": 1000, "rent": 80000})
++    totals = {"2026-11": {"misc": 99999, "food": 0}}
++    # rent is in budget but absent from totals (actual 0) -> no alert
++    # misc has no limit -> no alert; food actual 0 -> no alert
++    assert check_budget(totals, budget) == []
++    # 2026-10 is not in totals, so it is never evaluated
++    assert check_budget({}, budget) == []
++
++
++def test_d8_month_override_beats_default():
++    budget = _b({"food": 50000}, {"2026-02": {"food": 30000}})
++    alerts = check_budget(
++        {"2026-02": {"food": 35000}, "2026-01": {"food": 35000}}, budget
++    )
++    assert [(a.month, a.level, a.limit) for a in alerts] == [("2026-02", "over", 30000)]
++
++
++def test_d9_sort_order_month_level_remaining_category():
++    cats = {"a": 1500, "b": 1100, "c": 800, "d": 900, "e": 900}
++    totals = {"2026-11": cats, "2026-10": {"c": 1000}}
++    budget = _b({k: 1000 for k in "abcde"})
++    got = [(a.month, a.category, a.level) for a in check_budget(totals, budget)]
++    assert got == [
++        ("2026-10", "c", "warning"),
++        ("2026-11", "a", "over"),
++        ("2026-11", "b", "over"),
++        ("2026-11", "d", "warning"),
++        ("2026-11", "e", "warning"),
++        ("2026-11", "c", "warning"),
++    ]
++
++
++def test_d10_inputs_are_not_mutated():
++    totals = {"2026-11": {"food": 1200, "rent": 10}}
++    budget = _b({"food": 1000, "rent": 80000}, {"2026-11": {"food": 1100}})
++    totals_before = copy.deepcopy(totals)
++    default_before = dict(budget.default)
++    months_before = copy.deepcopy(budget.months)
++    check_budget(totals, budget)
++    assert totals == totals_before
++    assert budget.default == default_before
++    assert budget.months == months_before
++
++
++def test_d10_empty_totals_or_empty_budget_gives_empty_list():
++    assert check_budget({}, _b({"food": 1000})) == []
++    assert check_budget({"2026-11": {"food": 5000}}, Budget({}, {})) == []
++
++
++@pytest.mark.parametrize("bad", [True, 1000.0, "1000"])
++def test_d11_non_int_amount_raises_type_error_with_month_and_category(bad):
++    with pytest.raises(TypeError) as excinfo:
++        check_budget({"2026-11": {"food": bad}}, _b({"food": 1000}))
++    assert "2026-11" in str(excinfo.value)
++    assert "food" in str(excinfo.value)
++
++
++def test_budget_alert_is_frozen():
++    (alert,) = check_budget({"2026-11": {"food": 1000}}, _b({"food": 1000}))
++    assert isinstance(alert, BudgetAlert)
++    with pytest.raises(FrozenInstanceError):
++        alert.level = "over"  # type: ignore[misc]

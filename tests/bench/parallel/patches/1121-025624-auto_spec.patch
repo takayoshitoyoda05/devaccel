@@ -1,0 +1,511 @@
+diff --git a/docs/design/20261121-monthly-change.md b/docs/design/20261121-monthly-change.md
+new file mode 100644
+index 0000000..f6c47f6
+--- /dev/null
++++ b/docs/design/20261121-monthly-change.md
+@@ -0,0 +1,28 @@
++# monthly-change
++目的: 月ごとのカテゴリ別支出の前月比(増えた・減った・新しく出てきた・なくなった)を出す純粋関数。 / やらないこと: CLI・既存ファイルの変更、CSV 読込、表示整形、件どうしの import。
++共通前提: 標準ライブラリのみ・既存ファイル不変・月別カテゴリ合計は既存の `kakeibo.core.monthly_totals`(`dict[str, dict[str, int]]`、`"YYYY-MM"` → `{category: yen}`)をそのまま使い、新しく作らない。件のコードは `kakeibo.core` も他の件も import しない(型は組み込みの dict・int・str のみ)。
++判断一覧:
++- D1 状態は有無で決める: 前月にキーが無く今月にある=`new`、前月にあり今月に無い=`gone`、両方にある=差が正で `increased`・負で `decreased`・0 で `unchanged`。金額 0 のキーも「ある」とみなす。
++- D2 `delta = cur - prev`(キーが無い側は 0)。負の金額(返金)も受ける。
++- D3 `pct` は前月が 0 以下またはキー無しなら `None`、それ以外は `(cur - prev) / prev * 100`(float、丸めない)。
++- D4 並びは `abs(delta)` の降順、同点はカテゴリ名の昇順。`unchanged` も結果に含める(絞るのは呼び出し側)。
++- D5 引数: dict 以外は `TypeError`、値が `bool`・`float`・`str`・`None` なら `TypeError`(引数名とカテゴリを文に入れる)。`int` なら負も 0 も受ける。
++- D6 月の系列: 途中の月がデータに無ければ空の月(カテゴリ無し)として埋める(1 月にあって 2 月に無ければ 2 月に `gone`)。最初の月は比べる相手が無いので前月比に含めない。
++
++1. `src/kakeibo/category_change.py` + `tests/test_category_change.py` — `@dataclass(frozen=True) class CategoryChange: category: str; prev: int; cur: int; delta: int; pct: float | None; status: str` と `def compare_categories(prev: dict[str, int], cur: dict[str, int]) -> list[CategoryChange]`
++規則: R1 受け付ける書き方: `{}`(空の月)・`{"食費": 0}`・`{"返金": -500}`。`prev`・`cur` は呼び出し側の dict を変更しない。 / R2 並びは `abs(delta)` 降順、同点はカテゴリ名昇順。 / R3 もし dict でない・値が int でない(bool 含む)なら `TypeError`。 / R4 キーが無い側の `prev`・`cur` は 0 として `CategoryChange` に入れる。`status` は `"new" "gone" "increased" "decreased" "unchanged"` のいずれか。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E1-1 | prev={"食費":100}, cur={} | [CategoryChange("食費",100,0,-100,-100.0,"gone")] | R4 |
++| E1-2 | prev={}, cur={"食費":0} | [CategoryChange("食費",0,0,0,None,"new")] | R4 |
++| E1-3 | prev={"a":1}, cur={"a":True} | TypeError | R3 |
++
++2. `src/kakeibo/month_series.py` + `tests/test_month_series.py` — `def previous_month(month: str) -> str` と `def month_pairs(totals: dict[str, dict[str, int]]) -> list[tuple[str, dict[str, int], dict[str, int]]]`
++規則: R1 受け付ける月の書き方: `"2026-01"` `"2026-12"` のみ(`"2026-1"`・`"2026/01"`・`"２０２６-０１"`・前後の空白は `ValueError`、月名を文に入れる)。 / R2 `previous_month("2026-01")` は `"2025-12"`。 / R3 `month_pairs` は `(month, 前月の dict, その月の dict)` を月の昇順で返し、最小の月は含めない。最小〜最大の間に無い月は `{}` として埋めて 1 か月ずつ並べる(D6)。入力の dict は変更しない(コピーを返す)。 / R4 空の入力・月が 1 つだけなら `[]`。dict でない・月が `str` でないなら `TypeError`。
++例:
++| ID | 入力 | 出力 / 例外 | 規則 |
++| E2-1 | {"2026-01":{"a":1},"2026-03":{"a":2}} | [("2026-02",{"a":1},{}),("2026-03",{},{"a":2})] | R3 |
++| E2-2 | previous_month("2026-1") | ValueError | R1 |
++| E2-3 | {"2026-01":{"a":1}} | [] | R4 |
++
++<!-- end -->
+diff --git a/src/kakeibo/category_change.py b/src/kakeibo/category_change.py
+new file mode 100644
+index 0000000..0a17c06
+--- /dev/null
++++ b/src/kakeibo/category_change.py
+@@ -0,0 +1,62 @@
++"""前月比のカテゴリ別増減を求める純粋関数。"""
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class CategoryChange:
++    category: str
++    prev: int
++    cur: int
++    delta: int
++    pct: float | None
++    status: str
++
++
++def _check_month(name: str, month: object) -> None:
++    if not isinstance(month, dict):
++        raise TypeError(f"{name} must be a dict, got {type(month).__name__}")
++    for category, amount in month.items():
++        if isinstance(amount, bool) or not isinstance(amount, int):
++            raise TypeError(
++                f"{name}[{category!r}] must be int, got {type(amount).__name__}"
++            )
++
++
++def compare_categories(
++    prev: dict[str, int], cur: dict[str, int]
++) -> list[CategoryChange]:
++    """前月 (prev) と今月 (cur) のカテゴリ別金額を比べる。
++
++    キーが無い側は 0 として扱う。状態はキーの有無と差の符号で決める。
++    結果は abs(delta) の降順、同点はカテゴリ名の昇順。
++    """
++    _check_month("prev", prev)
++    _check_month("cur", cur)
++
++    result: list[CategoryChange] = []
++    for category in set(prev) | set(cur):
++        in_prev = category in prev
++        in_cur = category in cur
++        p = prev.get(category, 0)
++        c = cur.get(category, 0)
++        delta = c - p
++
++        if in_prev and in_cur:
++            if delta > 0:
++                status = "increased"
++            elif delta < 0:
++                status = "decreased"
++            else:
++                status = "unchanged"
++        elif in_cur:
++            status = "new"
++        else:
++            status = "gone"
++
++        pct = None if (not in_prev or p <= 0) else delta / p * 100
++
++        result.append(CategoryChange(category, p, c, delta, pct, status))
++
++    result.sort(key=lambda item: (-abs(item.delta), item.category))
++    return result
+diff --git a/src/kakeibo/month_series.py b/src/kakeibo/month_series.py
+new file mode 100644
+index 0000000..03bb7d8
+--- /dev/null
++++ b/src/kakeibo/month_series.py
+@@ -0,0 +1,67 @@
++"""月の系列を前月と組にする純粋関数。
++
++標準ライブラリのみ。`kakeibo.core` や他の件は import しない。
++"""
++
++import re
++
++_MONTH_RE = re.compile(r"([0-9]{4})-(0[1-9]|1[0-2])")
++
++
++def _parse(month: object) -> tuple[int, int]:
++    """`"YYYY-MM"` を (年, 月) に変換する。形式が違えば ValueError。"""
++    if not isinstance(month, str):
++        raise TypeError(f"month は str である必要があります: {month!r}")
++    m = _MONTH_RE.fullmatch(month)
++    if m is None:
++        raise ValueError(f"月の書き方が不正です(YYYY-MM のみ): {month!r}")
++    return int(m.group(1)), int(m.group(2))
++
++
++def _format(year: int, month: int) -> str:
++    return f"{year:04d}-{month:02d}"
++
++
++def previous_month(month: str) -> str:
++    """`"YYYY-MM"` の前月を `"YYYY-MM"` で返す。"""
++    year, mon = _parse(month)
++    if mon > 1:
++        return _format(year, mon - 1)
++    if year <= 1:
++        raise ValueError(f"前月が存在しません: {month!r}")
++    return _format(year - 1, 12)
++
++
++def _next_month(year: int, mon: int) -> tuple[int, int]:
++    if mon < 12:
++        return year, mon + 1
++    return year + 1, 1
++
++
++def month_pairs(
++    totals: dict[str, dict[str, int]],
++) -> list[tuple[str, dict[str, int], dict[str, int]]]:
++    """月別合計を `(月, 前月の dict, その月の dict)` の組にして月の昇順で返す。
++
++    最小の月は前月が無いので含めない。最小〜最大の間に無い月は `{}` として埋める。
++    入力は変更せず、返す dict はコピーにする。
++    """
++    if not isinstance(totals, dict):
++        raise TypeError(f"totals は dict である必要があります: {type(totals).__name__}")
++    parsed = {_parse(k): v for k, v in totals.items()}
++    if len(parsed) < 2:
++        return []
++
++    keys = sorted(parsed)
++    first, last = keys[0], keys[-1]
++
++    series: list[tuple[str, dict[str, int]]] = []
++    year, mon = first
++    while (year, mon) <= last:
++        data = parsed.get((year, mon), {})
++        series.append((_format(year, mon), dict(data)))
++        year, mon = _next_month(year, mon)
++
++    return [
++        (series[i][0], series[i - 1][1], series[i][1]) for i in range(1, len(series))
++    ]
+diff --git a/tests/test_category_change.py b/tests/test_category_change.py
+new file mode 100644
+index 0000000..ef2522d
+--- /dev/null
++++ b/tests/test_category_change.py
+@@ -0,0 +1,142 @@
++import dataclasses
++
++import pytest
++
++from kakeibo.category_change import CategoryChange, compare_categories
++
++
++# 例の表 E1-*
++@pytest.mark.parametrize(
++    ("prev", "cur", "expected"),
++    [
++        pytest.param(
++            {"食費": 100},
++            {},
++            [CategoryChange("食費", 100, 0, -100, -100.0, "gone")],
++            id="E1-1",
++        ),
++        pytest.param(
++            {},
++            {"食費": 0},
++            [CategoryChange("食費", 0, 0, 0, None, "new")],
++            id="E1-2",
++        ),
++    ],
++)
++def test_example_table(prev, cur, expected):
++    assert compare_categories(prev, cur) == expected
++
++
++@pytest.mark.parametrize(
++    ("prev", "cur"),
++    [
++        pytest.param({"a": 1}, {"a": True}, id="E1-3"),
++    ],
++)
++def test_example_error_table(prev, cur):
++    with pytest.raises(TypeError):
++        compare_categories(prev, cur)
++
++
++# 端のケース(仕様の文面から)
++
++
++def test_empty_months_give_empty_list():
++    assert compare_categories({}, {}) == []
++
++
++def test_increased():
++    assert compare_categories({"食費": 100}, {"食費": 150}) == [
++        CategoryChange("食費", 100, 150, 50, 50.0, "increased")
++    ]
++
++
++def test_decreased():
++    assert compare_categories({"食費": 200}, {"食費": 150}) == [
++        CategoryChange("食費", 200, 150, -50, -25.0, "decreased")
++    ]
++
++
++def test_unchanged_is_included():
++    assert compare_categories({"食費": 100}, {"食費": 100}) == [
++        CategoryChange("食費", 100, 100, 0, 0.0, "unchanged")
++    ]
++
++
++def test_zero_on_both_sides_is_unchanged_not_new_or_gone():
++    assert compare_categories({"食費": 0}, {"食費": 0}) == [
++        CategoryChange("食費", 0, 0, 0, None, "unchanged")
++    ]
++
++
++def test_zero_prev_with_positive_cur_is_new_with_pct_none():
++    assert compare_categories({"食費": 0}, {"食費": 300}) == [
++        CategoryChange("食費", 0, 300, 300, None, "increased")
++    ]
++
++
++def test_negative_prev_pct_is_none():
++    assert compare_categories({"返金": -500}, {"返金": -200}) == [
++        CategoryChange("返金", -500, -200, 300, None, "increased")
++    ]
++
++
++def test_negative_amount_is_accepted():
++    assert compare_categories({}, {"返金": -500}) == [
++        CategoryChange("返金", 0, -500, -500, None, "new")
++    ]
++
++
++def test_pct_is_not_rounded():
++    result = compare_categories({"食費": 3}, {"食費": 4})
++    assert result[0].pct == pytest.approx(100 / 3)
++    assert result[0].pct != round(100 / 3)
++
++
++def test_sorted_by_abs_delta_desc_then_category_asc():
++    prev = {"b": 100, "a": 100, "c": 0, "d": 500}
++    cur = {"b": 200, "a": 0, "c": 100, "d": 500}
++    # |delta|: a=100, b=100, c=100, d=0 -> 同点はカテゴリ名昇順
++    result = compare_categories(prev, cur)
++    assert [c.category for c in result] == ["a", "b", "c", "d"]
++
++
++def test_sort_uses_absolute_delta():
++    prev = {"x": 1000, "y": 0}
++    cur = {"x": 0, "y": 150}
++    # |delta| x=1000, y=150
++    result = compare_categories(prev, cur)
++    assert [c.category for c in result] == ["x", "y"]
++
++
++def test_inputs_are_not_mutated():
++    prev = {"食費": 100}
++    cur = {"食費": 50, "交通": 10}
++    compare_categories(prev, cur)
++    assert prev == {"食費": 100}
++    assert cur == {"食費": 50, "交通": 10}
++
++
++def test_result_is_frozen_dataclass():
++    item = compare_categories({"食費": 1}, {"食費": 2})[0]
++    with pytest.raises(dataclasses.FrozenInstanceError):
++        item.delta = 99  # type: ignore[misc]
++
++
++# エラー (R3 / D5)
++
++
++@pytest.mark.parametrize("bad", [None, [], 1.5, "x"])
++def test_non_dict_argument_raises_type_error(bad):
++    with pytest.raises(TypeError):
++        compare_categories(bad, {})  # type: ignore[arg-type]
++    with pytest.raises(TypeError):
++        compare_categories({}, bad)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize("bad", [1.0, "100", None, True, False])
++def test_non_int_value_raises_type_error(bad):
++    with pytest.raises(TypeError):
++        compare_categories({"食費": bad}, {})  # type: ignore[dict-item]
++    with pytest.raises(TypeError):
++        compare_categories({}, {"食費": bad})  # type: ignore[dict-item]
+diff --git a/tests/test_month_series.py b/tests/test_month_series.py
+new file mode 100644
+index 0000000..0cb3869
+--- /dev/null
++++ b/tests/test_month_series.py
+@@ -0,0 +1,182 @@
++from typing import Any
++
++import pytest
++
++from kakeibo.month_series import month_pairs, previous_month
++
++# --- 例の表 (E2-*) ---------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("totals", "expected"),
++    [
++        pytest.param(
++            {"2026-01": {"a": 1}, "2026-03": {"a": 2}},
++            [("2026-02", {"a": 1}, {}), ("2026-03", {}, {"a": 2})],
++            id="E2-1",
++        ),
++    ],
++)
++def test_e2_gap_filled_with_empty_month(totals, expected):
++    assert month_pairs(totals) == expected
++
++
++@pytest.mark.parametrize(
++    "month",
++    [pytest.param("2026-1", id="E2-2")],
++)
++def test_e2_non_padded_month_rejected(month):
++    with pytest.raises(ValueError):
++        previous_month(month)
++
++
++@pytest.mark.parametrize(
++    "totals",
++    [pytest.param({"2026-01": {"a": 1}}, id="E2-3")],
++)
++def test_e2_single_month_gives_empty(totals):
++    assert month_pairs(totals) == []
++
++
++# --- R1: 月の書き方 --------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "month",
++    [
++        pytest.param("2026/01", id="R1-slash"),
++        pytest.param("２０２６-０１", id="R1-fullwidth"),
++        pytest.param(" 2026-01", id="R1-leading-space"),
++        pytest.param("2026-01 ", id="R1-trailing-space"),
++        pytest.param("2026-01\n", id="R1-trailing-newline"),
++        pytest.param("2026-13", id="R1-month-13"),
++        pytest.param("2026-00", id="R1-month-00"),
++        pytest.param("", id="R1-empty"),
++    ],
++)
++def test_r1_invalid_month_format_rejected(month):
++    with pytest.raises(ValueError, match="不正"):
++        previous_month(month)
++
++
++def test_r1_error_message_contains_month():
++    with pytest.raises(ValueError, match="2026/01"):
++        previous_month("2026/01")
++
++
++@pytest.mark.parametrize(
++    "month",
++    [pytest.param(2026, id="R1-int")],
++)
++def test_r1_non_str_month_is_type_error(month):
++    with pytest.raises(TypeError):
++        previous_month(month)
++
++
++# --- R2: previous_month ----------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("month", "expected"),
++    [
++        pytest.param("2026-01", "2025-12", id="R2-year-boundary"),
++        pytest.param("2026-12", "2026-11", id="R2-december"),
++        pytest.param("2026-02", "2026-01", id="R2-normal"),
++        pytest.param("0002-01", "0001-12", id="R2-year-1"),
++    ],
++)
++def test_r2_previous_month(month, expected):
++    assert previous_month(month) == expected
++
++
++def test_r2_no_month_before_year_1():
++    with pytest.raises(ValueError):
++        previous_month("0001-01")
++
++
++# --- R3: month_pairs -------------------------------------------------------
++
++
++def test_r3_returns_copies_and_does_not_mutate_input():
++    totals = {"2026-01": {"a": 1}, "2026-02": {"a": 2}}
++    snapshot = {"2026-01": {"a": 1}, "2026-02": {"a": 2}}
++    pairs = month_pairs(totals)
++    assert totals == snapshot
++    assert pairs == [("2026-02", {"a": 1}, {"a": 2})]
++    pairs[0][1]["a"] = 999
++    pairs[0][2]["a"] = 999
++    assert totals == snapshot
++
++
++def test_r3_consecutive_months_in_ascending_order():
++    totals = {
++        "2026-11": {"x": 1},
++        "2026-12": {"x": 2},
++        "2027-01": {"x": 3},
++    }
++    assert month_pairs(totals) == [
++        ("2026-12", {"x": 1}, {"x": 2}),
++        ("2027-01", {"x": 2}, {"x": 3}),
++    ]
++
++
++def test_r3_input_order_does_not_matter():
++    totals = {"2026-03": {"a": 2}, "2026-01": {"a": 1}}
++    assert month_pairs(totals) == [
++        ("2026-02", {"a": 1}, {}),
++        ("2026-03", {}, {"a": 2}),
++    ]
++
++
++def test_r3_minimum_month_not_included_as_current():
++    pairs = month_pairs({"2026-05": {}, "2026-06": {}})
++    assert [m for m, _, _ in pairs] == ["2026-06"]
++
++
++def test_r3_gap_across_year_boundary():
++    totals = {"2025-11": {"a": 1}, "2026-02": {"a": 4}}
++    assert month_pairs(totals) == [
++        ("2025-12", {"a": 1}, {}),
++        ("2026-01", {}, {}),
++        ("2026-02", {}, {"a": 4}),
++    ]
++
++
++def test_r3_zero_and_negative_amounts_kept():
++    totals = {"2026-01": {"a": 0}, "2026-02": {"a": -5}}
++    assert month_pairs(totals) == [("2026-02", {"a": 0}, {"a": -5})]
++
++
++def test_r3_invalid_key_rejected():
++    with pytest.raises(ValueError):
++        month_pairs({"2026-1": {}, "2026-02": {}})
++
++
++# --- R4: 空・1 か月・型 ----------------------------------------------------
++
++
++def test_r4_empty_input_gives_empty_list():
++    assert month_pairs({}) == []
++
++
++def test_r4_single_month_with_empty_value_gives_empty_list():
++    assert month_pairs({"2026-01": {}}) == []
++
++
++@pytest.mark.parametrize(
++    "totals",
++    [
++        pytest.param([("2026-01", {})], id="R4-list"),
++        pytest.param(None, id="R4-none"),
++        pytest.param("2026-01", id="R4-str"),
++    ],
++)
++def test_r4_non_dict_is_type_error(totals):
++    with pytest.raises(TypeError):
++        month_pairs(totals)
++
++
++def test_r4_non_str_month_key_is_type_error():
++    bad: Any = {202601: {"a": 1}, 202602: {"a": 2}}
++    with pytest.raises(TypeError):
++        month_pairs(bad)

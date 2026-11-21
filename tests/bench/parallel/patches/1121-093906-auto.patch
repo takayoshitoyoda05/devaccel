@@ -1,0 +1,292 @@
+diff --git a/src/kakeibo/budget.py b/src/kakeibo/budget.py
+new file mode 100644
+index 0000000..705060d
+--- /dev/null
++++ b/src/kakeibo/budget.py
+@@ -0,0 +1,92 @@
++"""Budget alerts: flag categories that exceeded or are about to exceed a monthly budget.
++
++Pure functions only. Reuses ``Budget`` (and the ``monthly_totals`` shape) from
++``kakeibo.core``.
++
++Decisions:
++D1: 月ごとの予算は ``budget.for_month(month)``(月別指定が default を上書き)。
++    例: default 食費=30000, months["2026-02"] 食費=20000 → 2026-02 の上限は 20000。
++D2: over = actual > limit。例: limit 10000, actual 10001 → over, remaining=-1。
++D3: near = limit*warn_ratio <= actual <= limit(ちょうど上限は near)。
++    例: limit 10000, actual 10000 → near, remaining=0 / 8000 → near / 7999 → なし。
++D4: 境界は有理数で厳密に比べる。例: warn_ratio=0.7, limit=10, actual=7 → near。
++D5: actual <= 0 はアラートなし。limit=0 で actual>0 は over、actual=0 はなし。
++D6: 予算の無いカテゴリは無視。totals に無い月・カテゴリは評価しない。
++D7: 並びは month 昇順 → over が先 → actual/limit 比が大きい順(limit=0 は最大)
++    → category 昇順。
++D8: warn_ratio は bool / 数値以外 → TypeError、nan・0 以下・1 超 → ValueError。
++    1 は有効。入力は変更しない。
++D9: 空の totals / 空の予算は []。
++"""
++
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from fractions import Fraction
++
++from kakeibo.core import Budget
++
++
++@dataclass(frozen=True)
++class BudgetAlert:
++    month: str  # "YYYY-MM"
++    category: str
++    status: str  # "over" | "near"
++    limit: int  # yen
++    actual: int  # yen
++    remaining: int  # limit - actual (negative when over)
++
++
++def _check_ratio(warn_ratio: object) -> Fraction:
++    if isinstance(warn_ratio, bool) or not isinstance(warn_ratio, (int, float)):
++        raise TypeError(f"warn_ratio は数値である必要があります: {warn_ratio!r}")
++    if isinstance(warn_ratio, float) and math.isnan(warn_ratio):
++        raise ValueError("warn_ratio は nan にできません")
++    if not 0 < warn_ratio <= 1:
++        raise ValueError(f"warn_ratio は 0 より大きく 1 以下です: {warn_ratio!r}")
++    # str() gives the shortest decimal form (0.7 -> 7/10), avoiding float error.
++    return Fraction(str(warn_ratio))
++
++
++def check_budgets(
++    totals: dict[str, dict[str, int]],
++    budget: Budget,
++    *,
++    warn_ratio: float = 0.8,
++) -> list[BudgetAlert]:
++    """Return alerts for over-budget and nearly-over-budget (month, category)s."""
++    ratio = _check_ratio(warn_ratio)
++    found: list[tuple[Fraction | None, BudgetAlert]] = []
++    for month, cats in totals.items():
++        limits = budget.for_month(month)
++        for cat, actual in cats.items():
++            if cat not in limits or actual <= 0:
++                continue
++            limit = limits[cat]
++            if actual > limit:
++                status = "over"
++            elif actual >= limit * ratio:
++                status = "near"
++            else:
++                continue
++            used = Fraction(actual, limit) if limit else None
++            found.append(
++                (used, BudgetAlert(month, cat, status, limit, actual, limit - actual))
++            )
++
++    def key(
++        item: tuple[Fraction | None, BudgetAlert],
++    ) -> tuple[str, int, int, Fraction, str]:
++        used, a = item
++        big = used is None  # limit == 0 sorts first within its status
++        return (
++            a.month,
++            a.status != "over",
++            not big,
++            -(used or Fraction(0)),
++            a.category,
++        )
++
++    found.sort(key=key)
++    return [a for _, a in found]
+diff --git a/tests/test_budget_alerts.py b/tests/test_budget_alerts.py
+new file mode 100644
+index 0000000..b91058e
+--- /dev/null
++++ b/tests/test_budget_alerts.py
+@@ -0,0 +1,188 @@
++import copy
++
++import pytest
++
++from kakeibo.budget import BudgetAlert, check_budgets
++from kakeibo.core import Budget
++
++
++def _b(default, months=None):
++    return Budget(default, months or {})
++
++
++# D1: 月別の指定が default を上書きする
++def test_d1_month_override_applies_per_month():
++    budget = _b({"食費": 30000}, {"2026-02": {"食費": 20000}})
++    totals = {
++        "2026-01": {"食費": 25000},
++        "2026-02": {"食費": 20001},
++    }
++    assert (
++        check_budgets(totals, budget)
++        == [
++            BudgetAlert("2026-02", "食費", "over", 20000, 20001, -1),
++            BudgetAlert("2026-01", "食費", "near", 30000, 25000, 5000),
++        ][::-1]
++    )
++    alerts = {(a.month, a.category): a for a in check_budgets(totals, budget)}
++    assert alerts[("2026-02", "食費")].limit == 20000
++    assert alerts[("2026-01", "食費")].limit == 30000
++
++
++def test_d1_month_override_not_applied_to_other_month():
++    budget = _b({"食費": 30000}, {"2026-02": {"食費": 20000}})
++    totals = {"2026-01": {"食費": 30001}}
++    assert check_budgets(totals, budget) == [
++        BudgetAlert("2026-01", "食費", "over", 30000, 30001, -1),
++    ]
++
++
++# D2: over = actual > limit
++def test_d2_over_when_actual_exceeds_limit():
++    totals = {"2026-11": {"食費": 10001}}
++    assert check_budgets(totals, _b({"食費": 10000})) == [
++        BudgetAlert("2026-11", "食費", "over", 10000, 10001, -1),
++    ]
++
++
++# D3: near = limit*warn_ratio <= actual <= limit
++def test_d3_exact_limit_is_near_not_over():
++    totals = {"2026-11": {"食費": 10000}}
++    assert check_budgets(totals, _b({"食費": 10000})) == [
++        BudgetAlert("2026-11", "食費", "near", 10000, 10000, 0),
++    ]
++
++
++def test_d3_default_ratio_boundary():
++    budget = _b({"食費": 10000})
++    assert check_budgets({"2026-11": {"食費": 8000}}, budget) == [
++        BudgetAlert("2026-11", "食費", "near", 10000, 8000, 2000),
++    ]
++    assert check_budgets({"2026-11": {"食費": 7999}}, budget) == []
++
++
++# D4: 境界は有理数で厳密に比べる
++def test_d4_ratio_boundary_exact_for_float_ratio():
++    budget = _b({"食費": 10})
++    assert check_budgets({"2026-11": {"食費": 7}}, budget, warn_ratio=0.7) == [
++        BudgetAlert("2026-11", "食費", "near", 10, 7, 3),
++    ]
++    assert check_budgets({"2026-11": {"食費": 6}}, budget, warn_ratio=0.7) == []
++
++
++# D5: actual <= 0 はアラートなし、limit=0 の扱い
++def test_d5_zero_or_negative_actual_gives_no_alert():
++    budget = _b({"食費": 1000})
++    assert check_budgets({"2026-11": {"食費": 0}}, budget) == []
++    assert check_budgets({"2026-11": {"食費": -500}}, budget) == []
++
++
++def test_d5_zero_limit_positive_actual_is_over():
++    budget = _b({"食費": 0})
++    assert check_budgets({"2026-11": {"食費": 1}}, budget) == [
++        BudgetAlert("2026-11", "食費", "over", 0, 1, -1),
++    ]
++
++
++def test_d5_zero_limit_zero_actual_no_alert():
++    budget = _b({"食費": 0})
++    assert check_budgets({"2026-11": {"食費": 0}}, budget) == []
++
++
++# D6: 予算外カテゴリ・カテゴリ欠落・totals に無い月は評価しない
++def test_d6_category_without_budget_is_ignored():
++    totals = {"2026-11": {"交通費": 50000}}
++    assert check_budgets(totals, _b({"食費": 10000})) == []
++
++
++def test_d6_budget_category_missing_from_month_is_ignored():
++    totals = {"2026-11": {"交通費": 50000}}
++    assert check_budgets(totals, _b({"交通費": 10000, "食費": 10000})) == [
++        BudgetAlert("2026-11", "交通費", "over", 10000, 50000, -40000),
++    ]
++
++
++def test_d6_month_absent_from_totals_is_not_evaluated():
++    totals = {"2026-11": {"食費": 100}}
++    alerts = check_budgets(totals, _b({"食費": 10000}))
++    assert [a.month for a in alerts] == []
++
++
++# D7: 並び順 month 昇順 → over 先 → 比の大きい順 → category 昇順
++def test_d7_over_before_near_within_month():
++    totals = {"2026-11": {"食費": 9500, "日用品": 11000}}
++    budget = _b({"食費": 10000, "日用品": 10000})
++    assert [a.category for a in check_budgets(totals, budget)] == ["日用品", "食費"]
++
++
++def test_d7_month_ascending_first():
++    totals = {
++        "2026-12": {"食費": 20000},
++        "2026-10": {"食費": 9000},
++    }
++    budget = _b({"食費": 10000})
++    assert [a.month for a in check_budgets(totals, budget)] == ["2026-10", "2026-12"]
++
++
++def test_d7_higher_ratio_first_within_status():
++    totals = {"2026-11": {"A": 12000, "B": 20000}}
++    budget = _b({"A": 10000, "B": 10000})
++    assert [a.category for a in check_budgets(totals, budget)] == ["B", "A"]
++
++
++def test_d7_category_ascending_on_ratio_tie():
++    totals = {"2026-11": {"food": 9000, "bus": 900}}
++    budget = _b({"food": 10000, "bus": 1000})
++    assert [a.category for a in check_budgets(totals, budget)] == ["bus", "food"]
++
++
++def test_d7_zero_limit_treated_as_largest_ratio():
++    totals = {"2026-11": {"A": 50000, "B": 1}}
++    budget = _b({"A": 10000, "B": 0})
++    assert [a.category for a in check_budgets(totals, budget)] == ["B", "A"]
++
++
++# D8: warn_ratio の境界と例外
++def test_d8_warn_ratio_one_only_exact_limit_is_near():
++    budget = _b({"食費": 10000})
++    assert check_budgets({"2026-11": {"食費": 10000}}, budget, warn_ratio=1) == [
++        BudgetAlert("2026-11", "食費", "near", 10000, 10000, 0),
++    ]
++    assert check_budgets({"2026-11": {"食費": 9999}}, budget, warn_ratio=1) == []
++    assert check_budgets({"2026-11": {"食費": 10001}}, budget, warn_ratio=1) == [
++        BudgetAlert("2026-11", "食費", "over", 10000, 10001, -1),
++    ]
++
++
++@pytest.mark.parametrize("ratio", [0, 1.01, float("nan")])
++def test_d8_invalid_warn_ratio_value_error(ratio):
++    with pytest.raises(ValueError, match="warn_ratio"):
++        check_budgets({"2026-11": {"食費": 1}}, _b({"食費": 10}), warn_ratio=ratio)
++
++
++@pytest.mark.parametrize("ratio", [True, "0.8", None])
++def test_d8_invalid_warn_ratio_type_error(ratio):
++    with pytest.raises(TypeError):
++        check_budgets({"2026-11": {"食費": 1}}, _b({"食費": 10}), warn_ratio=ratio)
++
++
++def test_d8_inputs_not_mutated():
++    totals = {"2026-11": {"食費": 9500, "日用品": 11000}}
++    budget = _b({"食費": 10000, "日用品": 10000}, {"2026-11": {"食費": 9000}})
++    totals_before = copy.deepcopy(totals)
++    default_before = copy.deepcopy(budget.default)
++    months_before = copy.deepcopy(budget.months)
++    check_budgets(totals, budget)
++    assert totals == totals_before
++    assert budget.default == default_before
++    assert budget.months == months_before
++
++
++# D9: 空の totals / 空の予算は []
++def test_d9_empty_totals_gives_empty_list():
++    assert check_budgets({}, _b({"食費": 10000})) == []
++
++
++def test_d9_empty_budget_gives_empty_list():
++    totals = {"2026-11": {"食費": 99999}}
++    assert check_budgets(totals, Budget({}, {})) == []

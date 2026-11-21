@@ -1,0 +1,425 @@
+diff --git a/src/kakeibo/importer.py b/src/kakeibo/importer.py
+new file mode 100644
+index 0000000..a15e48d
+--- /dev/null
++++ b/src/kakeibo/importer.py
+@@ -0,0 +1,241 @@
++"""銀行・カード会社の CSV(列名・金額の書き方が会社ごとに違う)を Expense にする純粋関数。
++
++公開: `parse_statement(text, category=...)` と `parse_amount(raw)`。
++ファイルは読まない。呼び出し側が文字列にして渡す。誤りは既存の `CsvError`
++(errors: list[(行番号, 理由)])で、全部の誤り行をまとめて報告する。
++
++判断:
++D1: 入力は str のみ。str 以外(bytes・None)は TypeError。category が空・空白だけは ValueError。
++D2: 先頭の BOM は無視。区切りはヘッダー行の `,` とタブの多い方(同数なら `,`)。
++D3: 最初の空でない行がヘッダー。空入力・ヘッダーだけは空リスト。空行は飛ばす。
++D4: 列名は NFKC・前後空白除去・小文字化して別名と照合する。
++    日付: 日付/利用日/ご利用日/取引日/年月日/date
++    金額: 金額/利用金額/ご利用金額/amount
++    出金: 出金額/出金/お支払金額/支払金額/支払/引出/引出額
++    入金: 入金額/入金/預入/預入額/お預入れ
++    摘要: 摘要/メモ/利用店名/ご利用店名/内容/description/memo
++    カテゴリ: カテゴリ/カテゴリー/category(無ければ引数 category の既定 "未分類")
++D5: 日付と、金額(または出金)の列が無いとヘッダー(1 行目)の誤り。同じ項目に当たる列が
++    2 つあるのもヘッダーの誤り。摘要・カテゴリ・入金は無くてよい。
++D6: 日付は `2026-01-05` `2026/1/5` `2026.1.5` `2026年1月5日` `20260105`(全角可・区切り混在可)。
++    時刻付き(`2026/01/05 12:30`・`2026-01-05T12:30`)は日付部分だけ使う。
++    存在しない日付(2/30)は誤り。和暦は未対応(誤り)。
++D7: 金額は NFKC 後、`¥` `円` `JPY` `,` と空白を除く。負は `-` `−` `▲` `△` 先頭、`500-` 末尾、
++    `(500)`。負の金額は返金として負のまま受ける。`1234.0` `1234.00` は整数として受け、
++    `12.5` は誤り。0 は受ける。数字以外が残ったら誤り。
++D8: 金額が 1 列の形式は、正が支出。空・`-`・`—` は誤り(「金額が空です」)。
++D9: 出金/入金の 2 列形式は、出金が入っていれば支出。入金だけの行は収入なので結果に入れず飛ばす。
++    両方入っている・両方空は誤り。入っている値が数値でなければ、入金側でも誤り。
++D10: 行の列数がヘッダーと違えば、その行は列数の誤り 1 件だけ報告(`1,234円` を引用せず書いた
++     場合もここ)。それ以外は 1 行内の誤りを全部 `; ` でつなぐ。
++D11: 誤りの理由には列名(CSV 上の元の表記)と元の値を入れる。行番号は引用符内の改行があっても
++     そのレコードの開始行(ヘッダーが 1 行目)。
++D12: 引数の型の検査: category が str でなければ TypeError。bool などの数値は parse_amount が
++     str 以外を TypeError にする。
++"""
++
++from __future__ import annotations
++
++import csv
++import io
++import re
++import unicodedata
++from datetime import date
++
++from .core import CsvError, Expense
++
++_ALIASES: dict[str, frozenset[str]] = {
++    "date": frozenset({"日付", "利用日", "ご利用日", "取引日", "年月日", "date"}),
++    "amount": frozenset({"金額", "利用金額", "ご利用金額", "amount"}),
++    "out": frozenset(
++        {"出金額", "出金", "お支払金額", "支払金額", "支払", "引出", "引出額"}
++    ),
++    "in": frozenset({"入金額", "入金", "預入", "預入額", "お預入れ"}),
++    "memo": frozenset(
++        {"摘要", "メモ", "利用店名", "ご利用店名", "内容", "description", "memo"}
++    ),
++    "category": frozenset({"カテゴリ", "カテゴリー", "category"}),
++}
++
++_BLANK_AMOUNTS = frozenset({"", "-", "—"})
++_DATE_RE = re.compile(r"([0-9]{4})[/\-.年]([0-9]{1,2})[/\-.月]([0-9]{1,2})日?")
++_DATE8_RE = re.compile(r"([0-9]{4})([0-9]{2})([0-9]{2})")
++_NEG_PREFIX = "-−▲△"
++
++
++def _norm(s: str) -> str:
++    return unicodedata.normalize("NFKC", s).strip()
++
++
++def _is_blank_amount(raw: str) -> bool:
++    return _norm(raw) in _BLANK_AMOUNTS
++
++
++def parse_amount(raw: str) -> int:
++    """金額の文字列を円の整数にする(書き方は D7)。不正なら ValueError。"""
++    if not isinstance(raw, str):
++        raise TypeError(f"raw は str である必要があります: {type(raw).__name__}")
++    s = _norm(raw)
++    for token in ("JPY", "jpy", "円", "¥", ",", " "):
++        s = s.replace(token, "")
++    s = "".join(s.split())
++    neg = False
++    if len(s) >= 2 and s[0] == "(" and s[-1] == ")":
++        neg, s = True, s[1:-1]
++    if s and s[0] in _NEG_PREFIX:
++        neg, s = True, s[1:]
++    elif s.endswith("-"):
++        neg, s = True, s[:-1]
++    m = re.fullmatch(r"([0-9]+)(\.0+)?", s)
++    if m is None:
++        raise ValueError(f"金額が整数ではありません: {raw!r}")
++    n = int(m.group(1))
++    return -n if neg else n
++
++
++def _parse_date(raw: str) -> date:
++    s = _norm(raw)
++    s = re.split(r"[\sT]", s, maxsplit=1)[0]
++    m = _DATE_RE.fullmatch(s) or _DATE8_RE.fullmatch(s)
++    if m is None:
++        raise ValueError(f"日付が不正です: {raw!r}")
++    try:
++        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
++    except ValueError:
++        raise ValueError(f"存在しない日付です: {raw!r}") from None
++
++
++def _map_header(header: list[str]) -> dict[str, int]:
++    found: dict[str, int] = {}
++    errors: list[str] = []
++    for i, name in enumerate(header):
++        key = _norm(name).lower()
++        for field, names in _ALIASES.items():
++            if key in {n.lower() for n in names}:
++                if field in found:
++                    errors.append(
++                        f"列 {header[found[field]]!r} と {name!r} が同じ項目です"
++                    )
++                else:
++                    found[field] = i
++    if "date" not in found:
++        errors.append("日付の列がありません")
++    if "amount" not in found and "out" not in found:
++        errors.append("金額(または出金)の列がありません")
++    if errors:
++        raise CsvError([(1, "; ".join(errors))])
++    return found
++
++
++def _row_to_expense(
++    row: list[str], header: list[str], cols: dict[str, int], default_category: str
++) -> Expense | None:
++    errors: list[str] = []
++
++    def cell(field: str) -> str:
++        return row[cols[field]]
++
++    def name(field: str) -> str:
++        return header[cols[field]]
++
++    day: date | None = None
++    try:
++        day = _parse_date(cell("date"))
++    except ValueError as e:
++        errors.append(f"{name('date')}: {e}")
++
++    amount: int | None = None
++    skip = False
++    if "amount" in cols:
++        if _is_blank_amount(cell("amount")):
++            errors.append(f"{name('amount')}: 金額が空です: {cell('amount')!r}")
++        else:
++            try:
++                amount = parse_amount(cell("amount"))
++            except ValueError as e:
++                errors.append(f"{name('amount')}: {e}")
++    else:
++        parsed: dict[str, int] = {}
++        bad = False
++        for f in ("out", "in"):
++            if f in cols and not _is_blank_amount(cell(f)):
++                try:
++                    parsed[f] = parse_amount(cell(f))
++                except ValueError as e:
++                    bad = True
++                    errors.append(f"{name(f)}: {e}")
++        if not bad:
++            if "out" in parsed and "in" in parsed:
++                errors.append(
++                    f"{name('out')}/{name('in')}: 出金と入金が両方入っています"
++                )
++            elif "out" in parsed:
++                amount = parsed["out"]
++            elif "in" in parsed:
++                skip = True
++            else:
++                errors.append(f"{name('out')}: 出金も入金も空です")
++
++    if errors:
++        raise ValueError("; ".join(errors))
++    if skip or day is None or amount is None:
++        return None
++    category = default_category
++    if "category" in cols and cell("category").strip():
++        category = cell("category").strip()
++    memo = cell("memo").strip() if "memo" in cols else ""
++    return Expense(day=day, category=category, amount=amount, memo=memo)
++
++
++def parse_statement(text: str, category: str = "未分類") -> list[Expense]:
++    """明細 CSV の文字列を Expense のリストにする。誤り行があれば CsvError。"""
++    if not isinstance(text, str):
++        raise TypeError(f"text は str である必要があります: {type(text).__name__}")
++    if not isinstance(category, str):
++        raise TypeError(
++            f"category は str である必要があります: {type(category).__name__}"
++        )
++    if not category.strip():
++        raise ValueError("category は空にできません")
++    category = category.strip()
++
++    text = text.lstrip("﻿")
++    first = next((ln for ln in text.splitlines() if ln.strip()), "")
++    delimiter = "\t" if first.count("\t") > first.count(",") else ","
++
++    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
++    header: list[str] | None = None
++    cols: dict[str, int] = {}
++    out: list[Expense] = []
++    errors: list[tuple[int, str]] = []
++    prev_end = 0
++    try:
++        for row in reader:
++            start = prev_end + 1
++            prev_end = reader.line_num
++            if not any(c.strip() for c in row):
++                continue
++            if header is None:
++                header = row
++                cols = _map_header(header)
++                continue
++            if len(row) != len(header):
++                errors.append(
++                    (
++                        start,
++                        f"列数が違います(ヘッダー {len(header)} 列、この行 {len(row)} 列)",
++                    )
++                )
++                continue
++            try:
++                e = _row_to_expense(row, header, cols, category)
++            except ValueError as err:
++                errors.append((start, str(err)))
++                continue
++            if e is not None:
++                out.append(e)
++    except csv.Error as err:
++        errors.append((prev_end + 1, f"CSV として読めません: {err}"))
++    if errors:
++        raise CsvError(errors)
++    return out
+diff --git a/tests/test_importer.py b/tests/test_importer.py
+new file mode 100644
+index 0000000..2cb47dc
+--- /dev/null
++++ b/tests/test_importer.py
+@@ -0,0 +1,172 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.core import CsvError, Expense
++from kakeibo.importer import parse_amount, parse_statement
++
++
++@pytest.mark.parametrize(
++    ("raw", "want"),
++    [
++        ("1234", 1234),
++        ("1,234", 1234),
++        ("１，２３４", 1234),
++        ("¥1,234", 1234),
++        ("￥1234", 1234),
++        ("1,234円", 1234),
++        ("JPY 500", 500),
++        ("-300", -300),
++        ("−300", -300),
++        ("△500", -500),
++        ("▲500", -500),
++        ("(500)", -500),
++        ("500-", -500),
++        ("¥-300", -300),
++        ("1234.0", 1234),
++        ("1234.00", 1234),
++        ("0", 0),
++        ("　700　", 700),
++    ],
++)
++def test_parse_amount_accepts(raw: str, want: int) -> None:
++    assert parse_amount(raw) == want
++
++
++@pytest.mark.parametrize("raw", ["", "-", "abc", "12.5", "1 2x", "--5", "()"])
++def test_parse_amount_rejects(raw: str) -> None:
++    with pytest.raises(ValueError):
++        parse_amount(raw)
++
++
++@pytest.mark.parametrize("raw", [None, 5, 1.5, True])
++def test_parse_amount_type_error(raw: object) -> None:
++    with pytest.raises(TypeError):
++        parse_amount(raw)  # type: ignore[arg-type]
++
++
++def test_single_amount_column_and_aliases() -> None:
++    text = 'ご利用日,ご利用店名,ご利用金額\n2026/1/5,コンビニ,"1,234"\n2026/01/06,スーパー,500円\n'
++    assert parse_statement(text) == [
++        Expense(date(2026, 1, 5), "未分類", 1234, "コンビニ"),
++        Expense(date(2026, 1, 6), "未分類", 500, "スーパー"),
++    ]
++
++
++def test_header_case_space_and_fullwidth() -> None:
++    text = " Date , Amount ,Description\n2026-01-05,100,x\n"
++    assert parse_statement(text) == [Expense(date(2026, 1, 5), "未分類", 100, "x")]
++
++
++def test_refund_kept_negative() -> None:
++    text = "日付,金額\n2026-01-05,△500\n"
++    assert parse_statement(text)[0].amount == -500
++
++
++@pytest.mark.parametrize(
++    "raw",
++    [
++        "2026-01-05",
++        "2026/1/5",
++        "2026.1.5",
++        "2026年1月5日",
++        "20260105",
++        "２０２６/１/５",
++        "2026/01/05 12:30",
++        "2026-01-05T12:30:00",
++        "2026-01/05",
++    ],
++)
++def test_date_formats(raw: str) -> None:
++    assert parse_statement(f"日付,金額\n{raw},1\n")[0].day == date(2026, 1, 5)
++
++
++def test_leap_day_ok_and_nonexistent_date_error() -> None:
++    assert parse_statement("日付,金額\n2024-02-29,1\n")[0].day == date(2024, 2, 29)
++    with pytest.raises(CsvError) as ei:
++        parse_statement("日付,金額\n2026-02-30,1\n")
++    assert ei.value.errors == [(2, "日付: 存在しない日付です: '2026-02-30'")]
++
++
++def test_withdrawal_deposit_skips_income() -> None:
++    text = (
++        "取引日,摘要,出金額,入金額\n2026/01/05,家賃,80000,\n2026/01/25,給与,,300000\n"
++    )
++    assert parse_statement(text) == [Expense(date(2026, 1, 5), "未分類", 80000, "家賃")]
++
++
++def test_withdrawal_deposit_errors() -> None:
++    text = "日付,出金額,入金額\n2026-01-05,1,2\n2026-01-06,,\n2026-01-07,,abc\n"
++    with pytest.raises(CsvError) as ei:
++        parse_statement(text)
++    assert [n for n, _ in ei.value.errors] == [2, 3, 4]
++    assert "両方" in ei.value.errors[0][1]
++    assert "空" in ei.value.errors[1][1]
++    assert "入金額" in ei.value.errors[2][1] and "'abc'" in ei.value.errors[2][1]
++
++
++def test_all_errors_reported_with_line_column_value() -> None:
++    text = "日付,金額\n2026-01-05,100\nxx,yy\n2026-01-07,-\n"
++    with pytest.raises(CsvError) as ei:
++        parse_statement(text)
++    errs = ei.value.errors
++    assert [n for n, _ in errs] == [3, 4]
++    assert "日付" in errs[0][1] and "'xx'" in errs[0][1]
++    assert "金額" in errs[0][1] and "'yy'" in errs[0][1]
++    assert "空" in errs[1][1]
++
++
++def test_unquoted_comma_is_column_count_error() -> None:
++    with pytest.raises(CsvError) as ei:
++        parse_statement("日付,金額\n2026-01-05,1,234円\n")
++    assert ei.value.errors[0][0] == 2
++    assert "列数" in ei.value.errors[0][1]
++
++
++def test_line_number_with_quoted_newline() -> None:
++    text = '日付,メモ,金額\n2026-01-05,"a\nb",1\nbad,x,1\n'
++    with pytest.raises(CsvError) as ei:
++        parse_statement(text)
++    assert [n for n, _ in ei.value.errors] == [4]
++
++
++def test_missing_required_columns() -> None:
++    with pytest.raises(CsvError) as ei:
++        parse_statement("店,メモ\nx,y\n")
++    assert ei.value.errors[0][0] == 1
++    assert "日付" in ei.value.errors[0][1] and "金額" in ei.value.errors[0][1]
++
++
++def test_duplicate_column_is_header_error() -> None:
++    with pytest.raises(CsvError) as ei:
++        parse_statement("日付,利用日,金額\n2026-01-05,2026-01-05,1\n")
++    assert ei.value.errors[0][0] == 1
++
++
++def test_bom_tab_blank_lines() -> None:
++    text = "﻿日付\t金額\n\n2026-01-05\t100\n\n"
++    assert parse_statement(text) == [Expense(date(2026, 1, 5), "未分類", 100, "")]
++
++
++def test_crlf() -> None:
++    assert len(parse_statement("日付,金額\r\n2026-01-05,1\r\n2026-01-06,2\r\n")) == 2
++
++
++@pytest.mark.parametrize("text", ["", "\n\n", "日付,金額\n", "﻿日付,金額"])
++def test_empty_and_header_only(text: str) -> None:
++    assert parse_statement(text) == []
++
++
++def test_category_default_and_column() -> None:
++    text = "日付,金額,カテゴリ\n2026-01-05,1,食費\n2026-01-06,2,\n"
++    got = parse_statement(text, category="カード")
++    assert [e.category for e in got] == ["食費", "カード"]
++
++
++def test_argument_validation() -> None:
++    with pytest.raises(TypeError):
++        parse_statement(b"x")  # type: ignore[arg-type]
++    with pytest.raises(TypeError):
++        parse_statement("日付,金額\n", category=None)  # type: ignore[arg-type]
++    with pytest.raises(ValueError, match="category"):
++        parse_statement("日付,金額\n", category="  ")

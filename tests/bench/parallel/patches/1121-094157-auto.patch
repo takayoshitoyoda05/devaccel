@@ -1,0 +1,606 @@
+diff --git a/src/kakeibo/recurring.py b/src/kakeibo/recurring.py
+new file mode 100644
+index 0000000..c10b22f
+--- /dev/null
++++ b/src/kakeibo/recurring.py
+@@ -0,0 +1,129 @@
++"""Detect monthly recurring expenses (subscriptions, rent, ...) and predict the next date.
++
++Pure functions only; no I/O.
++
++Decisions:
++D1: 同一とみなす鍵 = (正規化した category, 正規化した memo)。正規化 = NFKC → casefold →
++    空白(全角含む)の連続を半角空白 1 つに → strip → 末尾の「空白+数字」を除去。
++    例: "Netflix" / "ＮＥＴＦＬＩＸ" / "netflix 2" は同じ鍵。memo が空なら category だけで決まる。金額は鍵に含めない。
++D2: 金額 <= 0 の行(0 と返金の負数)は無視する。
++D3: 同じ鍵が同じ月に複数ある場合、その月は日付が最も新しい 1 件だけを使う(完全な重複も 1 か月)。
++D4: 系列 = 鍵ごとの「最新の月で終わる、暦月が連続した末尾の連なり」。月が抜けたらそこで切れ、古い側は無視する。
++D5: 系列の月数が min_months(既定 3)以上で繰り返しとみなす。入力の並び順は結果に影響しない。空入力は []。
++D6: 日の一貫性: anchor_day = 系列内の day の最大値。各日付の day が
++    min(anchor_day, その月の末日) から 3 日以内(差の絶対値 <= 3)であること。
++    例: 27,27,25 日 → OK / 5,5,20 日 → 不可 / 1/31, 2/28, 3/31 → OK。
++D7: 系列の全金額が最新の金額の ±20% 以内(abs(a - latest) * 100 <= latest * 20、境界を含む)。
++D8: next_date = last_date の翌月の anchor_day 日。翌月の末日を超えるなら末日に丸める。
++    例: 2026-01-31(anchor 31) → 2026-02-28 / 2024-01-31 → 2024-02-29 / 2026-12-05(anchor 5) → 2027-01-05。
++D9: next_monthly_date(last, anchor_day) が D8 の計算そのもの。anchor_day は last の day と違ってもよい。
++D10: 同じカテゴリ・金額でも memo が違えば別の系列。
++D11: 結果の並び = next_date 昇順、同じなら category、さらに memo の昇順。
++D12: today を取らない。最新が古い系列でも返し、next_date が過去でもそのまま返す。
++D13: Recurring.amount は系列の最新の行の金額、months は系列の月数、last_date は系列の最新の日付。
++引数: min_months は bool / int 以外 → TypeError、2 未満 → ValueError。
++      anchor_day は bool / int 以外 → TypeError、1..31 の外 → ValueError。
++"""
++
++from __future__ import annotations
++
++import calendar
++import re
++import unicodedata
++from collections.abc import Sequence
++from dataclasses import dataclass
++from datetime import date
++
++from kakeibo.core import Expense
++
++_DAY_TOLERANCE = 3
++_AMOUNT_TOLERANCE_PCT = 20
++
++
++@dataclass(frozen=True)
++class Recurring:
++    category: str
++    memo: str
++    amount: int  # yen, latest in the series
++    anchor_day: int
++    months: int
++    last_date: date
++    next_date: date
++
++
++def _check_int(value: object, name: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise TypeError(f"{name} は int である必要があります: {value!r}")
++    return value
++
++
++def _normalize(text: str) -> str:
++    s = unicodedata.normalize("NFKC", text).casefold()
++    s = re.sub(r"\s+", " ", s).strip()
++    return re.sub(r"\s+[0-9]+$", "", s)
++
++
++def _month_index(d: date) -> int:
++    return d.year * 12 + d.month - 1
++
++
++def next_monthly_date(last: date, anchor_day: int) -> date:
++    _check_int(anchor_day, "anchor_day")
++    if not 1 <= anchor_day <= 31:
++        raise ValueError(f"anchor_day は 1〜31 である必要があります: {anchor_day}")
++    year, month0 = divmod(_month_index(last) + 1, 12)
++    month = month0 + 1
++    return date(year, month, min(anchor_day, calendar.monthrange(year, month)[1]))
++
++
++def _is_series(run: list[Expense]) -> bool:
++    anchor = max(e.day.day for e in run)
++    for e in run:
++        target = min(anchor, calendar.monthrange(e.day.year, e.day.month)[1])
++        if abs(e.day.day - target) > _DAY_TOLERANCE:
++            return False
++    latest = run[-1].amount
++    return all(
++        abs(e.amount - latest) * 100 <= latest * _AMOUNT_TOLERANCE_PCT for e in run
++    )
++
++
++def find_recurring(rows: Sequence[Expense], *, min_months: int = 3) -> list[Recurring]:
++    _check_int(min_months, "min_months")
++    if min_months < 2:
++        raise ValueError(f"min_months は 2 以上である必要があります: {min_months}")
++
++    groups: dict[tuple[str, str], dict[int, Expense]] = {}
++    for e in rows:
++        if e.amount <= 0:
++            continue
++        by_month = groups.setdefault((_normalize(e.category), _normalize(e.memo)), {})
++        idx = _month_index(e.day)
++        cur = by_month.get(idx)
++        if cur is None or (e.day, e.amount) > (cur.day, cur.amount):
++            by_month[idx] = e
++
++    out: list[Recurring] = []
++    for by_month in groups.values():
++        idxs = sorted(by_month)
++        start = len(idxs) - 1
++        while start > 0 and idxs[start - 1] == idxs[start] - 1:
++            start -= 1
++        run = [by_month[i] for i in idxs[start:]]
++        if len(run) < min_months or not _is_series(run):
++            continue
++        latest = run[-1]
++        anchor = max(e.day.day for e in run)
++        out.append(
++            Recurring(
++                category=latest.category,
++                memo=latest.memo.strip(),
++                amount=latest.amount,
++                anchor_day=anchor,
++                months=len(run),
++                last_date=latest.day,
++                next_date=next_monthly_date(latest.day, anchor),
++            )
++        )
++    out.sort(key=lambda r: (r.next_date, r.category, r.memo))
++    return out
+diff --git a/tests/test_recurring.py b/tests/test_recurring.py
+new file mode 100644
+index 0000000..a2368cd
+--- /dev/null
++++ b/tests/test_recurring.py
+@@ -0,0 +1,465 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.core import Expense
++from kakeibo.recurring import Recurring, find_recurring, next_monthly_date
++
++
++def _e(y, m, d, category="rent", amount=1000, memo=""):
++    return Expense(day=date(y, m, d), category=category, amount=amount, memo=memo)
++
++
++# D1: 同一とみなす鍵 = (NFKC/casefold/空白正規化/末尾の空白+数字除去後の category, memo)
++
++
++def test_d1_normalized_keys_are_same_series():
++    rows = [
++        _e(2026, 1, 5, category="Netflix", amount=1000),
++        _e(2026, 2, 5, category="ＮＥＴＦＬＩＸ", amount=1000),
++        _e(2026, 3, 5, category="netflix 2", amount=1000),
++    ]
++    assert find_recurring(rows) == [
++        Recurring(
++            category="netflix 2",
++            memo="",
++            amount=1000,
++            anchor_day=5,
++            months=3,
++            last_date=date(2026, 3, 5),
++            next_date=date(2026, 4, 5),
++        )
++    ]
++
++
++def test_d1_memo_whitespace_and_width_normalized():
++    rows = [
++        _e(2026, 1, 5, memo="  電気 "),
++        _e(2026, 2, 5, memo="電気"),
++        _e(2026, 3, 5, memo="電　気"),
++    ]
++    # 全角空白は半角空白の連続扱いになるため "電 気" と "電気" は別鍵。
++    # 同一鍵の検証は完全一致側(前後空白のみ)で行う。
++    result = find_recurring(rows[:2] + [_e(2026, 3, 5, memo="電気")])
++    assert len(result) == 1
++    assert result[0].months == 3
++
++
++def test_d1_empty_memo_keyed_by_category_only():
++    rows = [
++        _e(2026, 1, 10, category="gym", memo=""),
++        _e(2026, 2, 10, category="gym", memo=""),
++        _e(2026, 3, 10, category="gym", memo=""),
++    ]
++    result = find_recurring(rows)
++    assert len(result) == 1
++    assert result[0].category == "gym"
++    assert result[0].memo == ""
++    assert result[0].months == 3
++
++
++# D2: 金額 <= 0 の行は無視する
++
++
++def test_d2_refund_and_zero_rows_are_ignored():
++    rows = [
++        _e(2026, 1, 10, amount=80000, memo="家賃"),
++        _e(2026, 2, 10, amount=80000, memo="家賃"),
++        _e(2026, 3, 10, amount=80000, memo="家賃"),
++        _e(2026, 4, 10, amount=-5000, memo="家賃"),
++        _e(2026, 5, 10, amount=0, memo="家賃"),
++    ]
++    assert find_recurring(rows) == [
++        Recurring(
++            category="rent",
++            memo="家賃",
++            amount=80000,
++            anchor_day=10,
++            months=3,
++            last_date=date(2026, 3, 10),
++            next_date=date(2026, 4, 10),
++        )
++    ]
++
++
++# D3: 同じ鍵・同じ月は日付が最も新しい 1 件だけ数える
++
++
++def test_d3_same_month_uses_newest_day_only():
++    # 1/1 を使うと anchor=5 と 1 の差が 4 日になり繰り返しではなくなる。
++    # 最新の 1/5 を使うので繰り返しとして残る。
++    rows = [
++        _e(2026, 1, 1, memo="A"),
++        _e(2026, 1, 5, memo="A"),
++        _e(2026, 2, 5, memo="A"),
++        _e(2026, 3, 5, memo="A"),
++    ]
++    result = find_recurring(rows)
++    assert len(result) == 1
++    assert result[0].months == 3
++    assert result[0].anchor_day == 5
++    assert result[0].last_date == date(2026, 3, 5)
++
++
++def test_d3_identical_duplicate_rows_count_once():
++    rows = [
++        _e(2026, 1, 5, memo="A"),
++        _e(2026, 2, 5, memo="A"),
++        _e(2026, 2, 5, memo="A"),
++        _e(2026, 3, 5, memo="A"),
++    ]
++    result = find_recurring(rows)
++    assert len(result) == 1
++    assert result[0].months == 3
++
++
++def test_d3_duplicates_do_not_make_two_months():
++    rows = [
++        _e(2026, 1, 5, memo="A"),
++        _e(2026, 1, 5, memo="A"),
++        _e(2026, 2, 5, memo="A"),
++    ]
++    assert find_recurring(rows) == []
++
++
++# D4: 月が抜けたら、最新側の連続した末尾だけが系列
++
++
++def test_d4_gap_cuts_older_months():
++    rows = [
++        _e(2026, m, 5, category="gym", amount=1000, memo="X") for m in (1, 2, 3, 5, 6)
++    ]
++    assert find_recurring(rows, min_months=3) == []
++
++
++def test_d4_min_months_2_uses_tail_only():
++    rows = [
++        _e(2026, m, 5, category="gym", amount=1000, memo="X") for m in (1, 2, 3, 5, 6)
++    ]
++    assert find_recurring(rows, min_months=2) == [
++        Recurring(
++            category="gym",
++            memo="X",
++            amount=1000,
++            anchor_day=5,
++            months=2,
++            last_date=date(2026, 6, 5),
++            next_date=date(2026, 7, 5),
++        )
++    ]
++
++
++# D5: 系列の月数が min_months(既定 3)以上で繰り返し。並び順に依らない。空は []
++
++
++def test_d5_default_min_months_is_3():
++    three = [_e(2026, m, 5, memo="A") for m in (1, 2, 3)]
++    two = [_e(2026, m, 5, memo="A") for m in (1, 2)]
++    assert len(find_recurring(three)) == 1
++    assert find_recurring(two) == []
++
++
++def test_d5_input_order_does_not_matter():
++    rows = [
++        _e(2026, 1, 5, memo="A"),
++        _e(2026, 2, 5, memo="A"),
++        _e(2026, 3, 5, memo="A"),
++        _e(2026, 1, 20, memo="B"),
++        _e(2026, 2, 20, memo="B"),
++        _e(2026, 3, 20, memo="B"),
++    ]
++    assert find_recurring(rows) == find_recurring(list(reversed(rows)))
++
++
++def test_d5_empty_input_returns_empty_list():
++    assert find_recurring([]) == []
++
++
++# D6: anchor_day = 系列内 day の最大値。各日付は min(anchor, 月末) から 3 日以内
++
++
++def test_d6_day_consistent_anchor_is_max():
++    rows = [
++        _e(2026, 1, 27, memo="A"),
++        _e(2026, 2, 27, memo="A"),
++        _e(2026, 3, 25, memo="A"),
++    ]
++    assert find_recurring(rows) == [
++        Recurring(
++            category="rent",
++            memo="A",
++            amount=1000,
++            anchor_day=27,
++            months=3,
++            last_date=date(2026, 3, 25),
++            next_date=date(2026, 4, 27),
++        )
++    ]
++
++
++def test_d6_day_inconsistent_returns_nothing():
++    rows = [
++        _e(2026, 1, 5, memo="A"),
++        _e(2026, 2, 5, memo="A"),
++        _e(2026, 3, 20, memo="A"),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_d6_month_end_anchor_31_with_feb_28():
++    rows = [
++        _e(2026, 1, 31, memo="A"),
++        _e(2026, 2, 28, memo="A"),
++        _e(2026, 3, 31, memo="A"),
++    ]
++    result = find_recurring(rows)
++    assert len(result) == 1
++    assert result[0].anchor_day == 31
++    assert result[0].next_date == date(2026, 4, 30)
++
++
++def test_d6_boundary_3_days_is_ok():
++    rows = [
++        _e(2026, 1, 10, memo="A"),
++        _e(2026, 2, 7, memo="A"),
++        _e(2026, 3, 10, memo="A"),
++    ]
++    assert len(find_recurring(rows)) == 1
++
++
++def test_d6_boundary_4_days_is_not_recurring():
++    rows = [
++        _e(2026, 1, 10, memo="A"),
++        _e(2026, 2, 6, memo="A"),
++        _e(2026, 3, 10, memo="A"),
++    ]
++    assert find_recurring(rows) == []
++
++
++# D7: 系列の全金額が最新金額の ±20% 以内(境界含む)
++
++
++def test_d7_amount_increase_within_20_percent_is_ok():
++    rows = [
++        _e(2026, 1, 5, amount=1000, memo="A"),
++        _e(2026, 2, 5, amount=1000, memo="A"),
++        _e(2026, 3, 5, amount=1100, memo="A"),
++    ]
++    result = find_recurring(rows)
++    assert len(result) == 1
++    assert result[0].amount == 1100
++
++
++def test_d7_amount_over_20_percent_is_not_recurring():
++    rows = [
++        _e(2026, 1, 5, amount=1000, memo="A"),
++        _e(2026, 2, 5, amount=1000, memo="A"),
++        _e(2026, 3, 5, amount=2000, memo="A"),
++    ]
++    assert find_recurring(rows) == []
++
++
++def test_d7_boundary_exactly_20_percent_is_ok():
++    rows = [
++        _e(2026, 1, 5, amount=800, memo="A"),
++        _e(2026, 2, 5, amount=1000, memo="A"),
++        _e(2026, 3, 5, amount=1000, memo="A"),
++    ]
++    assert len(find_recurring(rows)) == 1
++
++
++def test_d7_boundary_just_over_20_percent_is_not_recurring():
++    rows = [
++        _e(2026, 1, 5, amount=799, memo="A"),
++        _e(2026, 2, 5, amount=1000, memo="A"),
++        _e(2026, 3, 5, amount=1000, memo="A"),
++    ]
++    assert find_recurring(rows) == []
++
++
++# D8: next_date = 最新日の翌月の anchor_day 日。翌月末を超えたら末日に丸める
++
++
++def test_d8_next_date_clamps_to_month_end():
++    assert next_monthly_date(date(2026, 1, 31), 31) == date(2026, 2, 28)
++
++
++def test_d8_next_date_leap_year_feb_29():
++    assert next_monthly_date(date(2024, 1, 31), 31) == date(2024, 2, 29)
++
++
++def test_d8_next_date_year_rollover():
++    assert next_monthly_date(date(2026, 12, 5), 5) == date(2027, 1, 5)
++
++
++def test_d8_find_recurring_next_date_clamped_at_april_end():
++    rows = [
++        _e(2026, 1, 31, memo="A"),
++        _e(2026, 2, 28, memo="A"),
++        _e(2026, 3, 31, memo="A"),
++    ]
++    result = find_recurring(rows)
++    assert result[0].next_date == date(2026, 4, 30)
++
++
++# D9: next_monthly_date は anchor_day を使う(last の day は使わない)
++
++
++def test_d9_next_monthly_date_uses_anchor_not_last_day():
++    assert next_monthly_date(date(2026, 1, 15), 20) == date(2026, 2, 20)
++
++
++# D10: memo が違えば別系列
++
++
++def test_d10_same_category_different_memo_gives_two_series():
++    rows = [
++        _e(2026, 1, 5, memo="A"),
++        _e(2026, 2, 5, memo="A"),
++        _e(2026, 3, 5, memo="A"),
++        _e(2026, 1, 20, memo="B"),
++        _e(2026, 2, 20, memo="B"),
++        _e(2026, 3, 20, memo="B"),
++    ]
++    result = find_recurring(rows)
++    assert len(result) == 2
++    assert [r.memo for r in result] == ["A", "B"]
++    assert [r.anchor_day for r in result] == [5, 20]
++
++
++# D11: 並びは next_date 昇順 → category → memo
++
++
++def test_d11_sort_by_next_date_then_category_then_memo():
++    rows = []
++    for m in (1, 2, 3):
++        rows.append(_e(2026, m, 1, category="c", memo=""))
++        rows.append(_e(2026, m, 10, category="a", memo="z"))
++        rows.append(_e(2026, m, 10, category="a", memo="y"))
++        rows.append(_e(2026, m, 10, category="b", memo=""))
++    result = find_recurring(rows)
++    assert [(r.category, r.memo) for r in result] == [
++        ("c", ""),
++        ("a", "y"),
++        ("a", "z"),
++        ("b", ""),
++    ]
++    assert [r.next_date for r in result] == [
++        date(2026, 4, 1),
++        date(2026, 4, 10),
++        date(2026, 4, 10),
++        date(2026, 4, 10),
++    ]
++
++
++# D12: 古さは判定しない。過去の next_date もそのまま返す
++
++
++def test_d12_past_next_date_is_returned_as_is():
++    rows = [
++        _e(2020, 1, 5, memo="A"),
++        _e(2020, 2, 5, memo="A"),
++        _e(2020, 3, 5, memo="A"),
++    ]
++    result = find_recurring(rows)
++    assert len(result) == 1
++    assert result[0].next_date == date(2020, 4, 5)
++
++
++# D13: amount/memo/last_date は最新行から、months は系列の月数
++
++
++def test_d13_fields_come_from_latest_row():
++    rows = [
++        _e(2026, 1, 5, amount=1000, memo="  電気 "),
++        _e(2026, 2, 5, amount=1000, memo="  電気 "),
++        _e(2026, 3, 5, amount=1100, memo="  電気 "),
++    ]
++    assert find_recurring(rows) == [
++        Recurring(
++            category="rent",
++            memo="電気",
++            amount=1100,
++            anchor_day=5,
++            months=3,
++            last_date=date(2026, 3, 5),
++            next_date=date(2026, 4, 5),
++        )
++    ]
++
++
++# 引数の検査
++
++
++def test_min_months_float_raises_type_error():
++    with pytest.raises(TypeError):
++        find_recurring([], min_months=2.5)  # type: ignore[arg-type]
++
++
++def test_min_months_str_raises_type_error():
++    with pytest.raises(TypeError):
++        find_recurring([], min_months="3")  # type: ignore[arg-type]
++
++
++def test_min_months_none_raises_type_error():
++    with pytest.raises(TypeError):
++        find_recurring([], min_months=None)  # type: ignore[arg-type]
++
++
++def test_min_months_1_raises_value_error():
++    with pytest.raises(ValueError, match="min_months"):
++        find_recurring([], min_months=1)
++
++
++def test_min_months_0_raises_value_error():
++    with pytest.raises(ValueError, match="min_months"):
++        find_recurring([], min_months=0)
++
++
++def test_min_months_negative_raises_value_error():
++    with pytest.raises(ValueError, match="min_months"):
++        find_recurring([], min_months=-1)
++
++
++def test_anchor_day_0_raises_value_error():
++    with pytest.raises(ValueError, match="anchor_day"):
++        next_monthly_date(date(2026, 1, 5), 0)
++
++
++def test_anchor_day_32_raises_value_error():
++    with pytest.raises(ValueError, match="anchor_day"):
++        next_monthly_date(date(2026, 1, 5), 32)
++
++
++def test_anchor_day_float_raises_type_error():
++    with pytest.raises(TypeError):
++        next_monthly_date(date(2026, 1, 5), 1.0)  # type: ignore[arg-type]
++
++
++def test_anchor_day_str_raises_type_error():
++    with pytest.raises(TypeError):
++        next_monthly_date(date(2026, 1, 5), "5")  # type: ignore[arg-type]
++
++
++def test_anchor_day_boundaries_1_and_31_are_valid():
++    assert next_monthly_date(date(2026, 1, 5), 1) == date(2026, 2, 1)
++    assert next_monthly_date(date(2026, 1, 5), 31) == date(2026, 2, 28)
++
++
++def test_min_months_bool_raises_type_error():
++    with pytest.raises(TypeError):
++        find_recurring([], min_months=True)
++
++
++def test_anchor_day_bool_raises_type_error():
++    with pytest.raises(TypeError):
++        next_monthly_date(date(2026, 1, 5), True)
++
++
++def test_d10_same_key_on_5th_and_20th_keeps_latest_per_month():
++    rows = [_e(2026, m, d, memo="A") for m in (1, 2, 3) for d in (5, 20)]
++    # D3: the 20th wins each month -> one series with anchor 20
++    result = find_recurring(rows)
++    assert [(r.anchor_day, r.months, r.next_date) for r in result] == [
++        (20, 3, date(2026, 4, 20))
++    ]
