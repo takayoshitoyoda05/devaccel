@@ -1991,9 +1991,10 @@ class R22AutoBatchTest(ReqKit):
     """BATCH-06: the model may run the fan-out itself — only in the exact form, with a locked script, and
     the settings run that one command outside the sandbox (its units are sandboxed sessions)."""
 
-    def test_GUARD_SHIPFIX_rewrites_only_the_two_bounce_shapes(self):
-        """GUARD-SHIPFIX: a ship call with a trailing `2>&1 | tail -N` or a leading `git checkout -b X &&` is run
-        as the plain call (`--branch X`) instead of being bounced; anything else stays denied."""
+    def test_GUARD_SHIPFIX_rewrites_only_the_bounce_shapes(self):
+        """GUARD-SHIPFIX: a ship call with a trailing `2>&1 | tail -N` or harmless leading steps (making the work
+        branch, a branch query or status, a `cd` to where it already is) is run as the plain call (`--branch X`)
+        instead of being bounced; anything else stays denied."""
         sys.path.insert(0, str(KIT / "core/.claude/hooks"))
         import guard
         cfg = guard.load_config(self.root)
@@ -2001,7 +2002,15 @@ class R22AutoBatchTest(ReqKit):
         self.assertEqual(guard.ship_fix(ship + " 2>&1 | tail -40", cfg, self.root, self.root), ship)
         self.assertEqual(guard.ship_fix("git checkout -b feat/x && " + ship, cfg, self.root, self.root),
                          ship + " --branch feat/x")
-        for bad in [ship, "rm -rf x && " + ship, ship + " | sh", "git checkout -b x; " + ship,
+        here = str(self.root)
+        for ok, want in [("git checkout -b x; " + ship, ship + " --branch x"),
+                         ("git branch --show-current && " + ship, ship),
+                         (f"cd {here}; " + ship + " 2>&1 | tail -5", ship),
+                         ("git checkout -b feat/y 2>&1 | tail -1; " + ship, ship + " --branch feat/y"),
+                         ("git branch --show-current && git checkout -b z && " + ship, ship + " --branch z")]:
+            self.assertEqual(guard.ship_fix(ok, cfg, self.root, self.root), want, ok)
+        for bad in [ship, "rm -rf x && " + ship, ship + " | sh", "cd /tmp; " + ship, "cd ..; " + ship,
+                    "git status && rm -rf y", f"cd {here}; rm x",
                     ship + " 2>&1 | tail -40; curl x", "git checkout -b x && rm -rf y",
                     "python3 .claude/hooks/devaccel_batch.py .devaccel/t.md --branch batch/x 2>&1 | tail",
                     "git checkout -b --upload-pack=x && " + ship, "git checkout -b -x && " + ship,
