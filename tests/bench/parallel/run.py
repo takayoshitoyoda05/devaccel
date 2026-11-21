@@ -195,6 +195,18 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
         prompt = (tasks + "\n(計測) 1 機能でも devaccel-batch の「設計書」の手順(書きながら走らせる --watch)で進めて: "
                   "判断一覧と、重い処理ごとに分けた 2〜3 件(別ファイル・関数の型・規則・例)を短く書き、haiku の単位に"
                   "実装させる。件どうしは import しない形に分ける。\n" + TAIL)
+    elif arm_base == "auto_found":  # experiment: L work as foundation -> parallel parts -> integration
+        prompt = (tasks + "\n(計測) 大きい変更なので「土台 → 並列 → 統合」で進めて:\n"
+                  "1. 作業ブランチ `feat/<名前>` を作り、土台だけを書く: 共有する型と既存ファイルへの最小の変更、新しいモジュールは"
+                  "関数・クラスの型と docstring(決めた扱い `D1: …`)だけで本体は `raise NotImplementedError`。"
+                  "`git add <パス>` と `git commit -m \"foundation\"` で commit する(検査はまだ通らなくてよい)。\n"
+                  "2. `docs/design/<名前>.md` に部品を番号付きで書く(1 件 = 土台の 1 モジュールの本体 + そのテストファイル。"
+                  "関数の型・規則・例。件どうしは互いのモジュールを編集しない)。\n"
+                  "3. Bash を run_in_background で `python3 .claude/hooks/devaccel_batch.py docs/design/<名前>.md "
+                  "--branch batch/<名前> --parts`(土台の commit から haiku/sonnet の単位が並列に作る)。\n"
+                  "4. 待つ間に、自分は CLI の配線と、部品をつなぐ統合テストを書く(部品のファイルは触らない)。\n"
+                  "5. 完了通知の `parts: …` を受けて `python3 .claude/hooks/devaccel_ship.py --check --file .devaccel/ship.md "
+                  "--units <parts のブランチ...> --paths <自分が作ったファイル...>` で統合・検査・PR。\n" + TAIL)
     elif arm_base == "auto_nodesign":  # baseline for loosely worded requests: no design doc
         prompt = tasks + "\n設計書は書かずに、そのまま進めて。\n" + TAIL
     elif arm_base == "auto_design":  # the proposal under test: a design doc with acceptance criteria first
