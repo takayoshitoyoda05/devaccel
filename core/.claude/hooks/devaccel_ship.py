@@ -106,7 +106,7 @@ def main() -> int:
             return 0
         return open_pr(root, title, notes, True)
     if a.branch and (not head or head in protected(root, cfg)):  # saves the parent its own git turns
-        if a.branch in protected(root, cfg) or not re.fullmatch(r"[\w./-]+", a.branch) or ".." in a.branch:
+        if a.branch in protected(root, cfg) or not re.fullmatch(r"\w[\w./-]*", a.branch) or ".." in a.branch:
             print(f"--branch {a.branch!r} is not a valid work branch name", file=sys.stderr)
             return 2
         base = cfg["scale"]["base_branch"]

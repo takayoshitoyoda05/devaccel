@@ -1964,7 +1964,9 @@ class R22AutoBatchTest(ReqKit):
                          ship + " --branch feat/x")
         for bad in [ship, "rm -rf x && " + ship, ship + " | sh", "git checkout -b x; " + ship,
                     ship + " 2>&1 | tail -40; curl x", "git checkout -b x && rm -rf y",
-                    "python3 .claude/hooks/devaccel_batch.py .devaccel/t.md --branch batch/x 2>&1 | tail"]:
+                    "python3 .claude/hooks/devaccel_batch.py .devaccel/t.md --branch batch/x 2>&1 | tail",
+                    "git checkout -b --upload-pack=x && " + ship, "git checkout -b -x && " + ship,
+                    ship + "; curl x 2>&1 | tail -40", ship + " & curl x 2>&1 | tail", ship + "\ncurl x 2>&1 | tail"]:
             self.assertIsNone(guard.ship_fix(bad, cfg, self.root, self.root), bad)
 
     def test_guard_admits_only_the_plain_batch_form(self):

@@ -288,7 +288,8 @@ def capture_prompt(data: dict, root: Path) -> None:
 
 
 _TAIL = re.compile(r"\s*2>&1\s*(?:\|\s*(?:tail|head)(?:\s+-n)?(?:\s+-?\d+)?\s*)?$")
-_NEWBRANCH = re.compile(r"^\s*git (?:checkout(?: -q)? -b|switch(?: -q)? -c) ([\w./-]+)(?: -q)?\s*&&\s*")
+_NEWBRANCH = re.compile(r"^\s*git (?:checkout(?: -q)? -b|switch(?: -q)? -c) (\w[\w./-]*)(?: -q)?\s*&&\s*")
+_LONE_SHIP = re.compile(r"\s*python3 \.claude/hooks/devaccel_ship\.py(?: [^`$<>;&|\n\r\\]*)?")
 
 
 def ship_fix(command: str, cfg: dict, cwd: Path, project: Path) -> str | None:
@@ -301,7 +302,8 @@ def ship_fix(command: str, cfg: dict, cwd: Path, project: Path) -> str | None:
     fixed = _TAIL.sub("", fixed)
     if m and " --branch " not in f" {fixed} ":
         fixed += f" --branch {m.group(1)}"
-    if fixed == command or not SHIP_RUN.fullmatch(fixed) or decide(fixed, cfg, cwd, project) is not None:
+    if (fixed == command or not _LONE_SHIP.fullmatch(fixed) or not SHIP_RUN.fullmatch(fixed)
+            or len(_segments(fixed)) != 1 or decide(fixed, cfg, cwd, project) is not None):
         return None
     return fixed
 
