@@ -28,7 +28,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.5   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.6   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
@@ -37,6 +37,7 @@ git add -A && git commit       # .claude/ ごとコミット → 他の人は cl
 ```
 
 更新: `cd ~/devaccel && git fetch --tags && git checkout <新しいタグ>` → プロジェクトで `~/devaccel/update.sh` → `.claude/` をコミット(未コミットだと /batch の単位が PR を作れない。doctor が知らせる)。
+update.sh は `.claude/settings.json` を書き換えない。0.15.6 の速い PR 作成(下書き PR で返り、証拠は裏で作る)を使うには、install が出す settings の `hooks.PostToolUse`(finalize)を自分の settings.json に足す(doctor が知らせる。無ければ従来どおり ship が証拠を待つ)。
 
 | コマンド | 用途 |
 |---|---|

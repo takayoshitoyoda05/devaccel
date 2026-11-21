@@ -32,6 +32,10 @@ from devaccel_common import DEFAULTS  # noqa: E402
 HOOK_CMDS = {
     "guard": 'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/guard.py',
     "stop": 'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/stop_gate.py',
+    # after each Bash call; python starts only when ship left a request (0.15.6: the PR evidence finishes after
+    # ship returns, outside the sandbox where a process ship started would be killed)
+    "finalize": 'f="$CLAUDE_PROJECT_DIR"/.devaccel/finalize.json; { [ -e "$f" ] || [ -L "$f" ]; } || exit 0; '
+                'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/devaccel_finalize.py',
 }
 
 # Tool-level pieces: each contributes check stages and allow rules. Presets are lists of pieces.
@@ -302,6 +306,8 @@ def render_settings(presets: list[str]) -> dict:
         "hooks": {
             "PreToolUse": [{"matcher": "Bash", "hooks": [
                 {"type": "command", "command": HOOK_CMDS["guard"], "timeout": 10}]}],
+            "PostToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": HOOK_CMDS["finalize"], "timeout": 10}]}],
             "Stop": [{"hooks": [
                 {"type": "command", "command": HOOK_CMDS["stop"], "timeout": 120}]}],
             # /batch units are subagents: their end is SubagentStop, not Stop
@@ -584,6 +590,13 @@ def cmd_doctor(root: Path) -> int:
                      "allow it, add to .claude/settings.json: permissions.allow \"Bash(python3 .claude/hooks/"
                      "devaccel_batch.py *)\" and sandbox.excludedCommands [\"python3 .claude/hooks/devaccel_batch.py *\"]"
                      " (it then runs outside the sandbox without a prompt; units stay sandboxed)")
+    try:
+        post = json.loads((root / ".claude/settings.json").read_text()).get("hooks", {}).get("PostToolUse", [])
+    except (OSError, ValueError, AttributeError):
+        post = []
+    if "devaccel_finalize.py" not in json.dumps(post):
+        notes.append("ship waits for the PR evidence here (0.15.6): add the PostToolUse(Bash) finalize hook from "
+                     "install's settings to .claude/settings.json to let ship return once the draft PR exists")
     try:  # every session pays for plugin skill/agent listings and connector tool names at start (D17)
         user = json.loads((Path.home() / ".claude/settings.json").read_text())
         local = json.loads((root / ".claude/settings.local.json").read_text()) if \

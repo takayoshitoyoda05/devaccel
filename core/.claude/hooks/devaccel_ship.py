@@ -21,6 +21,7 @@ work branch only (never main/master/base/origin HEAD), remote origin only, no fo
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import time
@@ -31,7 +32,7 @@ sys.dont_write_bytecode = True
 sys.path.append(str(Path(__file__).resolve().parent))  # (planted modules are refused by guard _pr_script_intact)
 from devaccel_common import git, load_config, trusted_root  # noqa: E402
 from devaccel_common import write_nofollow  # noqa: E402
-from devaccel_pr import SECRET, need_confinement, open_pr, read_notes, stamp  # noqa: E402
+from devaccel_pr import SECRET, in_agent_sandbox, need_confinement, open_draft, open_pr, read_notes, stamp  # noqa: E402,E501
 
 IDENT = ["-c", "user.name=devaccel-ship", "-c", "user.email=devaccel-ship@localhost"]
 
@@ -169,6 +170,12 @@ def main() -> int:
     if not git(root, "config", "--get", "remote.origin.url").strip():
         print("no origin remote", file=sys.stderr)
         return 2
+    if a.check and not a.units and async_ready(root, cfg) and re.fullmatch(r"\w[\w./-]*", head) and ".." not in head:
+        rc = ship_async(root, a, title, notes, head, pre, fast_check, fast_failed, t)
+        if rc is not None:
+            if rc == 0:
+                cleanup_notes(root, a)
+            return rc
     # check.sh fast (working tree) and the evidence (check.sh full on a snapshot of HEAD) run side by side;
     # the push waits for fast to pass, so a failure still leaves nothing committed and nothing pushed
     from concurrent.futures import ThreadPoolExecutor
@@ -204,13 +211,62 @@ def main() -> int:
         fast, redo = None, []
         rc = open_pr(root, title, notes, False, units=max(1, len(merged)), before_publish=wait_push, fetched=fetched)
     if rc == 0:  # used: a later ship must never reuse these notes (a failed Write would ship stale ones)
-        nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
-        if root.resolve() in nf.resolve().parents:
-            write_nofollow(nf, None)
+        cleanup_notes(root, a)
         for b in dict.fromkeys(x for x in a.units if x.startswith("unit/")):  # shipped parts: no longer needed
             if sh(root, "merge-base", "--is-ancestor", f"refs/heads/{b}", "HEAD").returncode == 0:
                 sh(root, "branch", "-q", "-D", b)
     return rc
+
+
+def cleanup_notes(root: Path, a) -> None:
+    nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
+    if root.resolve() in nf.resolve().parents:
+        write_nofollow(nf, None)
+
+
+def async_ready(root: Path, cfg: dict) -> bool:
+    """The evidence can finish after ship returns only when Claude Code will run the finalize hook (it starts the
+    detached step outside the sandbox). Elsewhere (a terminal, no sandbox, an older settings.json) ship stays
+    synchronous."""
+    if not cfg.get("pr", {}).get("async_evidence", True) or not in_agent_sandbox():
+        return False
+    try:
+        hooks = json.loads((trusted_root({"cwd": str(root)}) / ".claude/settings.json").read_text()).get("hooks", {})
+    except (OSError, ValueError):
+        return False
+    return "devaccel_finalize.py" in json.dumps(hooks.get("PostToolUse", []))
+
+
+def ship_async(root: Path, a, title: str, notes: str, head: str, pre: str, fast_check, fast_failed,
+               t: float) -> int | None:
+    """check.sh fast -> push -> draft PR -> request for the finalize hook -> return. The hook (outside the
+    sandbox) starts devaccel_pr.py --finalize, which judges the pushed commit with the base check.sh, fills in
+    the body and label and readies the PR. None: no draft, so the caller takes the synchronous path."""
+    res, out, secs = fast_check()
+    t = stamp("check.sh fast", t)
+    if res != "pass":
+        if git(root, "rev-parse", "HEAD").strip() != pre:
+            sh(root, "reset", "-q", pre) if pre else sh(root, "update-ref", "-d", "HEAD")
+        return fast_failed(res, out, secs)
+    if git(root, "status", "--porcelain", "--untracked-files=no").strip():  # fast auto-fixed formatting
+        sh(root, "add", "-u")
+        sh(root, "commit", "-q", "--amend", "--no-edit") if pre and git(root, "rev-parse", "HEAD").strip() != pre \
+            else sh(root, "commit", "-q", "-m", title)
+    sha = git(root, "rev-parse", "HEAD").strip()
+    p = subprocess.run(["git", "-C", str(root), "push", "origin", f"HEAD:refs/heads/{head}"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if p.returncode != 0:
+        print("push failed: " + (p.stderr.strip() or p.stdout.strip())[:300], file=sys.stderr)
+        return 1
+    t = stamp("push", t)
+    url = open_draft(root, title, head, sha)
+    t = stamp("draft PR", t)
+    if not url:
+        return None
+    write_nofollow(root / ".devaccel" / "finalize.json",
+                   json.dumps({"sha": sha, "branch": head, "title": title, "notes": notes}, ensure_ascii=False))
+    print(f"{url}  [証拠を作成中: base の check.sh full がこの commit で終わるとラベルが付き、下書きが解除される]")
+    return 0
 
 
 if __name__ == "__main__":

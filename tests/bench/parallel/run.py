@@ -71,8 +71,14 @@ def save_answer(patch: Path, j: dict) -> None:
 
 
 def open_prs(trial: Path) -> list[dict]:
-    r = sh(["gh", "pr", "list", "--state", "open", "--json", "number,headRefName,labels,title"], trial)
-    return json.loads(r.stdout or "[]")
+    """Open PRs; waits (up to 4 min) while ship's background finalize still holds any of them as a draft."""
+    for _ in range(48):
+        r = sh(["gh", "pr", "list", "--state", "open", "--json", "number,headRefName,labels,title,isDraft"], trial)
+        prs = json.loads(r.stdout or "[]")
+        if not any(p.get("isDraft") for p in prs):
+            return prs
+        time.sleep(5)
+    return prs
 
 
 def grade(trial: Path, branches: list[str], heldout: Path, patch: Path | None = None) -> dict:

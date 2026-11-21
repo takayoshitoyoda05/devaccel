@@ -101,6 +101,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1640,6 +1641,133 @@ class R6ShipTest(ReqKit):
         self.assertEqual(self.gv("python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md"), "deny")
 
 
+class AsyncShipTest(ReqKit):
+    """SHIP-10 (0.15.6): inside Claude Code's sandbox, ship returns once the draft PR exists; the PostToolUse
+    finalize hook (outside the sandbox) starts the evidence for exactly the pushed commit and readies the PR."""
+    land = td.KitTest.land
+    SBX = {"SANDBOX_RUNTIME": "1"}
+
+    def notes(self) -> str:
+        d = self.root / ".devaccel"
+        d.mkdir(exist_ok=True)
+        (d / "ship.md").write_text("Add thing\nran it -> ok\n")
+        return ".devaccel/ship.md"
+
+    def ship(self):
+        prs, log = self.tmp / "prs.json", self.tmp / "gh.log"
+        prs.write_text("[]")
+        log.write_text("")
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_PRS": str(prs), "FAKE_GH_LOG": str(log),
+               "FAKE_GH_VIEW": "", **self.SBX}
+        r = sh(self.root, "python3", ".claude/hooks/devaccel_ship.py", "--check", "--file", self.notes(), env=env)
+        return r, env, log
+
+    def hook(self, env: dict) -> subprocess.CompletedProcess:
+        # finalize fetches https://github.com/o/r.git into a private repo: map it to the test origin globally
+        gc = self.tmp / "gitconfig"
+        gc.write_text(f'[url "{self.tmp / "o.git"}"]\n\tinsteadOf = https://github.com/o/r.git\n')
+        e = {k: v for k, v in env.items() if k != "SANDBOX_RUNTIME"} | {"GIT_CONFIG_GLOBAL": str(gc)}
+        return sh(self.root, "python3", ".claude/hooks/devaccel_finalize.py", env=e,
+                  stdin=json.dumps({"cwd": str(self.root), "tool_name": "Bash"}))
+
+    def test_SHIP10_settings_wire_the_finalize_hook(self):
+        post = json.loads((self.root / ".claude/settings.json").read_text())["hooks"]["PostToolUse"]
+        self.assertIn("devaccel_finalize.py", json.dumps(post))
+
+    @unittest.skipUnless(shutil.which("bwrap"), "finalize confines the base check with bubblewrap")
+    def test_SHIP10_draft_then_hook_finalizes_the_pushed_commit(self):
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 2\n")
+        r, env, log = self.ship()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("証拠を作成中", r.stdout)
+        self.assertIn("--draft", log.read_text())
+        req = json.loads((self.root / ".devaccel/finalize.json").read_text())
+        pushed = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual((req["sha"], req["branch"]), (pushed, "feat"))
+        (self.root / "app.py").write_text("X = BROKEN\n")  # the session keeps editing: must not be judged
+        env["FAKE_GH_VIEW"] = json.dumps({"url": "https://github.com/o/r/pull/9", "state": "OPEN", "labels": [],
+                                          "isDraft": True, "body": f"x\n<!-- pending head={pushed} -->\n",
+                                          "headRefOid": pushed, "baseRefName": "main", "isCrossRepository": False})
+        self.assertEqual(self.hook(env).returncode, 0)
+        self.assertFalse((self.root / ".devaccel/finalize.json").exists())
+        for _ in range(200):
+            if "pr ready" in log.read_text():
+                break
+            time.sleep(0.2)
+        text = log.read_text()
+        self.assertIn("pr ready", text, (self.root / ".claude/state/finalize.log").read_text())
+        self.assertIn("evidence-ok", text)
+        self.assertIn(f"head={pushed}", text)
+
+    @unittest.skipUnless(shutil.which("bwrap"), "finalize confines the base check with bubblewrap")
+    def test_SHIP10_finalize_judges_github_not_the_local_object_store(self):
+        """A `git replace` in the project's .git (writable from the sandbox) must not make a failing commit pass:
+        finalize fetches the commit from the remote into a private repository and judges that."""
+        self.set_check('if grep -q BROKEN app.py; then echo "== failed: tests (0s)"; exit 1; fi\n'
+                       'echo "== ok: tests (0s)"\n')
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X = 3\n")
+        self.commit("good")
+        good = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        (self.root / "app.py").write_text("X = BROKEN\n")
+        self.commit("bad")
+        bad = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        sh(self.root, "git", "push", "-q", "origin", "HEAD:refs/heads/feat")
+        sh(self.root, "git", "replace", bad, good)  # locally, "bad" now reads as "good"
+        self.assertNotIn("BROKEN", sh(self.root, "git", "show", f"{bad}:app.py").stdout)
+        d = self.root / ".devaccel"
+        d.mkdir(exist_ok=True)
+        (d / "finalize.json").write_text(json.dumps({"sha": bad, "branch": "feat", "title": "t"}))
+        log = self.tmp / "gh.log"
+        log.write_text("")
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_LOG": str(log), "FAKE_GH_PRS": "[]",
+               "FAKE_GH_VIEW": json.dumps({"url": "https://github.com/o/r/pull/9", "state": "OPEN", "labels": [],
+                                           "isDraft": True, "body": f"<!-- pending head={bad} -->",
+                                           "headRefOid": bad, "baseRefName": "main", "isCrossRepository": False})}
+        self.hook(env)
+        for _ in range(200):
+            if "pr edit" in log.read_text():
+                break
+            time.sleep(0.2)
+        text = log.read_text()
+        self.assertIn("--add-label needs-human", text, (self.root / ".claude/state/finalize.log").read_text())
+        self.assertNotIn("--add-label evidence-ok", text)
+
+    def test_SHIP10_hook_refuses_bad_requests(self):
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        sha = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        d = self.root / ".devaccel"
+        d.mkdir(exist_ok=True)
+        secret = self.tmp / "secret.json"
+        secret.write_text(json.dumps({"sha": sha, "branch": "feat", "title": "t"}))
+        cases = [{"sha": sha, "branch": "main", "title": "t"},           # protected branch
+                 {"sha": sha, "branch": "-x", "title": "t"},             # not a branch name
+                 {"sha": sha, "branch": "feat", "title": "ghp_" + "a" * 36}]  # credential-looking
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_LOG": str(self.tmp / "gh.log")}
+        for c in cases:
+            (d / "finalize.json").write_text(json.dumps(c))
+            self.hook(env)
+            self.assertFalse((d / "finalize.json").exists(), c)
+        (d / "finalize.json").symlink_to(secret)  # a link planted from the sandbox is not followed
+        self.hook(env)
+        self.assertFalse((self.root / ".claude/state/finalize.log").exists())
+        self.assertFalse((self.root / ".claude/hooks/__pycache__").exists())  # the guard would refuse ship then
+        # well-formed but no draft PR pending for it on GitHub: finalize refuses before running any check
+        (d / "finalize.json").unlink(missing_ok=True)
+        (d / "finalize.json").write_text(json.dumps({"sha": "0" * 40, "branch": "feat", "title": "t"}))
+        self.hook(env)
+        log = self.root / ".claude/state/finalize.log"
+        for _ in range(50):
+            if "no draft PR pending" in (log.read_text() if log.exists() else ""):
+                break
+            time.sleep(0.1)
+        self.assertIn("no draft PR pending", log.read_text())
+
+
 class R7ShipBranchTest(ReqKit):
     land = td.KitTest.land
 
@@ -1816,8 +1944,11 @@ class R16PrConfinementTest(unittest.TestCase):
             os.environ.pop("CLAUDECODE", None)
             self.assertTrue(p.need_confinement(cfg))
             self.assertFalse(p.need_confinement({"gate": {"sandbox": False}}))
-        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}), mock.patch("shutil.which", return_value=None):
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "SANDBOX_RUNTIME": "1"}):
             self.assertFalse(p.need_confinement(cfg))  # inside Claude Code's sandbox: already confined
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}), mock.patch("shutil.which", return_value=None):
+            os.environ.pop("SANDBOX_RUNTIME", None)
+            self.assertTrue(p.need_confinement(cfg))  # no positive signal: confine (fails closed without bwrap)
 
 
 class R17ShipDryRunTest(R6ShipTest):
