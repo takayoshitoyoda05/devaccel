@@ -468,6 +468,21 @@ class ConfinementTest(ReqKit):
         self.assertFalse(visible & {".ssh", ".aws", ".config", ".claude", ".gnupg", ".netrc"}, visible)
 
 
+    @unittest.skipUnless(shutil.which("bwrap") and Path("/run").is_dir(), "bubblewrap required")
+    def test_GATE17_host_sockets_under_run_are_hidden(self):
+        """GATE-17: /run (= /var/run) is empty inside the confinement: no docker.sock, D-Bus, ssh-agent or WSL
+        interop socket to connect to (a read-only bind would not stop connect())."""
+        sys.path.insert(0, str(self.root / ".claude/hooks"))
+        try:
+            from devaccel_common import confined
+        finally:
+            sys.path.pop(0)
+        cmd, env = confined(["ls", "-A", "/run", "/var/run"], self.root)
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([ln for ln in r.stdout.splitlines() if ln and not ln.endswith(":")], [], r.stdout)
+
+
 class TriageEvasionTest(ReqKit):
     """PR-04 / PR-05: renames, non-ASCII paths, config files and .gitattributes must not slip through."""
 

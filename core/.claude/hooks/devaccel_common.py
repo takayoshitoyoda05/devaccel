@@ -287,7 +287,10 @@ def confined(cmd: list[str], tree: Path, protect: list[Path] | None = None,
     tree = tree.resolve()
     # --new-session: no TIOCSTI into the user's terminal; own pid/ipc/uts namespaces (network stays shared)
     args = [bw, "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--new-session", "--die-with-parent",
-            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", str(HOME)]
+            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", str(HOME),
+            # host sockets live under /run (= /var/run): docker.sock (root-equivalent), the D-Bus session bus
+            # (systemd-run), ssh-agent, WSL interop (Windows executables). A read-only bind does not stop connect()
+            "--tmpfs", "/run"]
     for rel in HOME_RO:
         p = HOME / rel
         if p.exists():
