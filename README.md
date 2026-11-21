@@ -28,7 +28,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.4   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.5   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
@@ -186,7 +186,7 @@ install が `.claude/settings.json` にサンドボックス設定を書く。�
 - `failIfUnavailable: true` のため、bubblewrap/socat が無いと Claude Code は起動しない(黙って保護なしで動くより安全)。協業者にも初回のインストールを案内する。
 - `allowUnsandboxedCommands: false` で、Claude がサンドボックス外での再実行を求める抜け道を閉じる。
 - `autoAllowBashIfSandboxed: true` で、サンドボックス内の Bash は確認なしで動く(/batch の単位が確認待ちで止まらない)。`denyWrite` で、本体の検証基盤(`.claude/hooks` 等・`scripts/check.sh`)とゲートの状態をエージェントの Bash から守る。
-- フックと Read/Edit ツールはサンドボックスの外で動く(Read の秘密は permissions が担当)。そのためゲートと land は check.sh(エージェントが書いたテストを含む)を**自前の bubblewrap で隔離して**実行する: ファイルシステムは読み取り専用、`$HOME` は空(ツールチェーンは読み取り専用で戻し、ツールのキャッシュだけ書ける)、書けるのは作業ツリーだけ(`.git` は読み取り専用)、`.env` は隠し、環境変数は最小限。ネットワークは依存の取得のため許可(リポジトリのコードを外に送れる残余リスク)。
+- フックと Read/Edit ツールはサンドボックスの外で動く(Read の秘密は permissions が担当)。そのためゲートと land は check.sh(エージェントが書いたテストを含む)を**自前の bubblewrap で隔離して**実行する: ファイルシステムは読み取り専用、`$HOME` は空(ツールチェーンは読み取り専用で戻し、ツールのキャッシュだけ書ける)、書けるのは作業ツリーだけ(`.git` は読み取り専用)、`.env` は隠し、環境変数は最小限、`/run` は空(docker.sock・D-Bus・ssh-agent・WSL interop のソケットに届かない)。ネットワークは依存の取得のため許可(リポジトリのコードを外に送れる残余リスク。抽象名前空間の Unix ソケットも同じ理由で残る)。
 - 読み取りは既定で広い。ほかに守りたい場所は `denyRead` に**パスを直接**足す(`~/**/x` のようなホーム全体のグロブは Bash のたびに $HOME を走査して数秒〜十数秒遅くなる)。そのため**他のプロジェクトの `.env` は守られない**(速度との引き換え。気になるなら秘密は `~/.config/<app>/` 等にまとめて直接指定)。`~/.config/gh` は PR 作成と push に必要なので読める(D12)。
 
 ## 開発
