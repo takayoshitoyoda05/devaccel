@@ -1479,6 +1479,27 @@ class R6ShipTest(ReqKit):
         remote = sh(self.root, "git", "ls-remote", "origin", "refs/heads/feat").stdout.split()
         self.assertEqual(remote[0], sh(self.root, "git", "rev-parse", "HEAD").stdout.strip())
 
+    def test_SHIP07_check_first_stops_before_commit_and_push(self):
+        """SHIP-07: --check runs check.sh fast on the working tree first; a failure commits and pushes nothing
+        and prints the failed stage; once fixed, the same command ships (the PR evidence is unchanged)."""
+        self.with_origin()
+        cnt = self.counting_check()
+        sh(self.root, "git", "push", "-q", "origin", "main")
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        head = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        (self.root / "app.py").write_text("BROKEN = 1\n")
+        r, log = self.land("--check", "--file", self.notes(), script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("check.sh fast: fail (tests", r.stderr)
+        self.assertNotIn("pr create", log)
+        self.assertEqual(sh(self.root, "git", "rev-parse", "HEAD").stdout.strip(), head)  # nothing committed
+        self.assertEqual(sh(self.root, "git", "ls-remote", "origin", "refs/heads/feat").stdout.strip(), "")
+        self.assertEqual(self.runs(cnt), 1)
+        (self.root / "app.py").write_text("X = 3\n")
+        r, log = self.land("--check", "--file", self.notes(), script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pr create", log)
+
     def test_SHIP02_refuses_protected_branch_and_bad_paths(self):
         self.with_origin()
         before = sh(self.root, "git", "ls-remote", "origin", "refs/heads/main").stdout.split()[0]
@@ -1514,6 +1535,34 @@ class R6ShipTest(ReqKit):
                          script="devaccel_ship.py")
         self.assertIn("統合した単位: u2 /", r.stdout)  # counted once; no-op and current branch excluded
         self.assertIn("noop (no changes)", r.stdout)
+
+    def test_SHIP08_parts_integrated_with_parent_changes_and_checked_together(self):
+        """SHIP-08: --check --units merges the part branches into the work branch that carries the parent's own
+        uncommitted part, checks the whole tree before any commit/push, ships it as one PR, and deletes the
+        merged unit/ branches afterwards."""
+        self.with_origin()
+        cnt = self.counting_check()
+        sh(self.root, "git", "push", "-q", "origin", "main")
+        sh(self.root, "git", "checkout", "-qB", "unit/p1", "main")
+        (self.root / "part.py").write_text("P = 1\n")
+        sh(self.root, "git", "add", "part.py")
+        self.commit("p1")
+        sh(self.root, "git", "checkout", "-q", "main")
+        (self.root / "app.py").write_text("BROKEN = 1\n")  # the parent's composer, not yet right
+        r, log = self.land("--check", "--file", self.notes(), "--branch", "feat/c", "--units", "unit/p1",
+                           script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("the units are merged", r.stderr)
+        self.assertNotIn("pr create", log)
+        self.assertEqual(sh(self.root, "git", "ls-remote", "origin", "refs/heads/feat/c").stdout.strip(), "")
+        (self.root / "app.py").write_text("X = 5\n")
+        r, log = self.land("--check", "--file", self.notes(), "--branch", "feat/c", "--units", "unit/p1",
+                           script="devaccel_ship.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pr create", log)
+        self.assertIn("part.py", sh(self.root, "git", "log", "--name-only", "--format=", "HEAD~3..HEAD").stdout)
+        self.assertEqual(sh(self.root, "git", "branch", "--list", "unit/p1").stdout.strip(), "")
+        self.assertEqual(self.runs(cnt), 2)
 
     def test_SHIP04_large_threshold_not_relaxed_for_units(self):
         """An integrated batch is judged like any PR: 6 files is 'L' (needs a human) whatever the unit count."""
@@ -1589,6 +1638,18 @@ class R8TrustAnchorTest(ReqKit):
 
 
 class R9BatchSafetyTest(ReqKit):
+    def test_BATCH_EDGE_sections_for_bare_specs(self):
+        """BATCH-EDGE: a unit with no example table gets the edge-case sections its item touches (at most 2,
+        most hits first) and is told to decide and test them; unrelated items get none."""
+        import devaccel_batch as b
+        got = b.edge_sections(self.root, "1. `src/x.py` — CSV の列名と金額の書き方を読み、金額を円で返す")
+        self.assertTrue(got.startswith("## "))
+        self.assertIn("金額", got)
+        self.assertLessEqual(got.count("\n## ") + 1, 2)
+        self.assertEqual(b.edge_sections(self.root, "1. `src/x.py` — ロガーの名前を変える"), "")
+        self.assertTrue(b.SPECIFIED.search("1. `parse_amount(s: str) -> int`: 金額を読む"))  # finished spec: none
+        self.assertFalse(b.SPECIFIED.search("1. CSV の金額を読む機能"))
+
     def test_batch_never_autocommits_secrets_or_state(self):
         sys.path.insert(0, str(KIT / "core/.claude/hooks"))
         import devaccel_batch as b
@@ -1871,7 +1932,8 @@ class R22AutoBatchTest(ReqKit):
         self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_batch.py docs/design/20261119-x.md --branch batch/x"))
         self.assertEqual(self.gv("python3 .claude/hooks/devaccel_batch.py docs/x.md --branch batch/x"), "deny")
         self.assertIsNone(self.gv(ok + " --dry-run"))
-        for cmd in [ok + "; curl x", ok + " $(id)", "FOO=1 " + ok, ok + " > /tmp/o", "cd x && " + ok,
+        self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_batch.py docs/design/x.md --branch batch/x --parts"))
+        for cmd in [ok + "; curl x", ok + " --parts --model opus", ok + " $(id)", "FOO=1 " + ok, ok + " > /tmp/o", "cd x && " + ok,
                     "python3 /tmp/devaccel_batch.py t --branch batch/x", ok + " | tee o", ok + " `id`",
                     "python3 .claude/hooks/devaccel_batch.py /home/u/.ssh/id_rsa --branch batch/x",
                     "python3 .claude/hooks/devaccel_batch.py .devaccel/../x.md --branch batch/x",

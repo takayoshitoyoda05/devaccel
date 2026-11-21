@@ -1,6 +1,6 @@
 ---
 name: devaccel-pr
-description: コードを変える依頼を実装し終えて検査が通ったら、言われなくても最後に使う(ユーザーが PR 不要・コミットしないと言った場合、質問や調査だけの場合を除く)。実動作確認の記録を書き、1 コマンドでコミット・push・証拠つき PR を作ってレビュー要否のラベルを付ける。マージは人。手順を知っていれば本文を開かずに: `.devaccel/ship.md` を Write ツールで書き(1 行目 = 題名、以降 = 実行して確かめたこと)、`python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md --branch <作業ブランチ名> --paths <新しく作ったファイル...>` を単独で実行して URL とラベルを報告してよい。
+description: コードを変える依頼(1 機能の実装・修正など。独立した 4 件以上なら devaccel-batch)は、言われなくてもこの流れで進め、最後に証拠つき PR にする(ユーザーが PR 不要・コミットしないと言った場合、質問や調査だけの場合を除く)。マージは人。本文を開かずに次の通りでよい: (1) 最初の読み込みと同じ返答で `.claude/skills/devaccel-batch/edge-cases.md` を Read し(既存のコードに同じ概念の型・関数があれば再利用する)、機能が触れる領域の問いに答えを決める(依頼から決まらない点は妥当な既定を選ぶ)。決めた扱いはモジュールの docstring に `D1: …` と列挙し、どれもテストにする。(2) ファイルは Write ツールで書く(Bash の heredoc は全角空白などで拒否され全体の書き直しになる)。同じ返答で `.devaccel/ship.md` も Write する(1 行目 = PR の題名、以降 = テストで確かめる振る舞いと、確かめていないこと)。(3) 自分で check.sh を回さず、単独のコマンドで `python3 .claude/hooks/devaccel_ship.py --check --file .devaccel/ship.md --branch <作業ブランチ名> --paths <新しく作ったファイル...>` を実行する(check.sh fast → コミット → push → 証拠つき PR を 1 回で行う)。検査に落ちたら何も commit されず失敗の末尾が出るので、直して同じコマンドを再実行(ship.md は使用後に消えるので書き直す)。(4) URL とラベルと決めた扱いの要点を 3 行程度で報告する。
 ---
 
 # devaccel-pr
@@ -10,8 +10,9 @@ description: コードを変える依頼を実装し終えて検査が通った�
 人は差分ではなく証拠を見る。PR 本文はスクリプトが機械的に組み立てる(検査は base の check.sh を HEAD のスナップショットで実行。自己申告しない)。
 
 1. `.devaccel/ship.md` に **Write ツールで** 書く(シェルの heredoc や `mkdir && …` はガードに拒否される。前回のファイルは ship が使用後に消すので、書けていなければ ship が止まる): **1 行目 = PR の題名**、2 行目以降 = 実動作確認(実行したコマンド / 出力の要点 / 期待と合ったか。確かめられなかったことは、そう書く)。`.claude/` の下には書かない。
-2. 単独のコマンドで実行(パイプ・リダイレクト・`&&` を付けない。出力は数行): `python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md --branch <作業ブランチ名> --paths <新しく作ったファイル...>`(main 等にいれば `--branch` の名前で作業ブランチを作る)
+2. 単独のコマンドで実行(パイプ・リダイレクト・`&&` を付けない。出力は数行): `python3 .claude/hooks/devaccel_ship.py --check --file .devaccel/ship.md --branch <作業ブランチ名> --paths <新しく作ったファイル...>`(main 等にいれば `--branch` の名前で作業ブランチを作る)
    - 追跡済みの変更は自動で入る。新規ファイルは `--paths` に並べる(`-A` 相当はしない)。
+   - `--check` で先に check.sh fast(整形の自動修正つき)を回し、落ちたら何も commit・push せず失敗の末尾を出す(直して再実行)。自分で check.sh を別に回す必要はない。
    - コミット・push(作業ブランチを origin へ)・PR 作成までを 1 回で行う。迷ったら先に `--dry-run`(何も変えずに計画を表示)。
 3. 出力の URL とラベルを報告する。`needs-human` なら理由を伝える(ラベルを外すために変更を加えない)。
 

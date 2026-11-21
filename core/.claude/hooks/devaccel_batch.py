@@ -7,7 +7,10 @@ sandbox (devaccel's settings do; inside the sandbox the nested `claude` cannot r
 
 usage: python3 .claude/hooks/devaccel_batch.py TASKS.md --branch batch/NAME [--title T] [--jobs N]
               [--model M] [--effort E] [--strong K] [--hedge K] [--speculate] [--no-context]
-              [--unit-timeout S] [--keep] [--dry-run]
+              [--unit-timeout S] [--keep] [--dry-run] [--parts]
+  --parts: build the items as parts of one feature the parent is writing meanwhile: verify them exactly the
+           same way, keep the passing unit branches and print them; no PR (the parent then runs
+           `devaccel_ship.py --check --units <branches> ...`, which integrates, re-checks and opens the PR).
   TASKS.md: optional common paragraph, then items starting with "1. ", "2. ", ... (one unit each).
 Verification: each unit's session ends with the enforcing gate (check.sh fast, confined) for feedback;
 then this script commits the unit's tree itself and re-runs the main checkout's check.sh fast on exactly
@@ -90,6 +93,39 @@ def task_warnings(item: str) -> list[str]:
     if len(item) < 80:
         w.append("短すぎる(型・境界の例・例外を書くと単位の往復が減る)")
     return w
+
+
+EDGE_KEYS = {  # edge-cases.md section title prefix -> words in an item that make it relevant
+    "金額": ("金額", "円", "amount", "yen", "price", "数値", "parse"),
+    "CSV": ("csv", "CSV", "列", "ヘッダー", "header", "tsv", "取り込"),
+    "日付": ("日付", "date", "月", "期間", "日数", "next", "day"),
+    "繰り返し": ("繰り返し", "定期", "recurring", "サブスク", "毎月", "group", "グループ"),
+    "並び": ("並び", "sort", "集計", "合計", "top", "ランキング", "平均", "比較", "増減", "total"),
+    "検索": ("検索", "filter", "query", "条件", "search", "絞り込"),
+}
+
+
+# an item that already gives signatures is a finished spec: extra edge-case decisions only slowed its unit
+# (measured: numbered 4-task batch, units 45-60 s -> 74-104 s, same held-out result)
+SPECIFIED = re.compile(r"\)\s*->")
+
+
+def edge_sections(root: Path, item: str, limit: int = 2) -> str:
+    """The edge-case checklist sections an item touches (most keyword hits first), for units that get a bare
+    spec with no example table: they decide and test those cases instead of only the ones the spec names."""
+    try:
+        text = (root / ".claude" / "skills" / "devaccel-batch" / "edge-cases.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    low = item.lower()
+    scored = []
+    for sec in text.split("\n## ")[1:]:
+        title = sec.split("\n", 1)[0]
+        keys = next((v for k, v in EDGE_KEYS.items() if title.startswith(k)), ())
+        hits = sum(low.count(w.lower()) for w in keys)
+        if hits:
+            scored.append((-hits, title, sec))
+    return "\n\n".join("## " + sec.strip() for _, _, sec in sorted(scored)[:limit])
 
 
 def context_files(root: Path, text: str, max_files: int = 3, max_bytes: int = 8192) -> str:
@@ -299,12 +335,14 @@ def main() -> int:
                     help="the file is still being written: start each item's unit as soon as it is complete (items "
                          "before a `<!-- more -->` line, all items once `<!-- end -->` is there)")
     ap.add_argument("--dry-run", action="store_true", help="check everything and show the plan; run nothing")
+    ap.add_argument("--parts", action="store_true",
+                    help="parts of one feature: keep the passing unit branches and print them; no PR")
     a = ap.parse_args()
 
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or Path.cwd())
     if os.environ.get("CLAUDECODE"):  # started by the model, outside the sandbox: the guard's grammar, re-checked
         tf = Path(os.path.realpath(a.tasks))
-        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run", "watch") and v != ap.get_default(k)]
+        extra = [k for k, v in vars(a).items() if k not in ("tasks", "branch", "dry_run", "watch", "parts") and v != ap.get_default(k)]
         allowed = [d for d in (root / ".devaccel", root / "docs" / "design")  # real directories inside the repo:
                    if not any(p.is_symlink() for p in (d, d.parent))]  # a linked dir could point at ~/.ssh
         if (tf.parent not in [d.resolve() for d in allowed] or not tf.is_relative_to(root.resolve())
@@ -365,6 +403,10 @@ def main() -> int:
         if example_ids(it):
             ctx += ("\n\n例の表の全行を、ID をテストの中に書いて(parametrize の ids など)テストに写してから実装する。"
                     "端のケースは表に列挙済みなので考え直さない。ID が 1 つでもテストに無ければ統合されない。")
+        elif not SPECIFIED.search(it) and (edges := edge_sections(root, it)):
+            ctx += ("\n\n端のケースの問い(この件が触れる領域だけ):\n" + edges + "\n\nこの件に関わる問いにだけ、仕様と"
+                    "矛盾しない扱いを決め(仕様が決めていない点は妥当な既定)、モジュールの docstring に `D1: …` と列挙し、"
+                    "それぞれをテストにしてから実装する。関わらない問いは無視する。")
         tester = None
         if dual:  # dual track: a tester writes the spec tests while this unit implements, in the same worktree
             tfiles = sorted(set(re.findall(r"`((?:[\w./-]*/)?tests?/[\w./-]+\.py|(?:[\w./-]*/)?test_[\w.-]+\.py)`", it)))
@@ -704,6 +746,9 @@ def main() -> int:
         print("no unit to integrate", file=sys.stderr)
         cleanup(root, units, a.keep, branches=True)
         return 1
+    if a.parts:  # the parent integrates them with its own part: ship --check --units re-checks the whole
+        print("parts: " + " ".join(ok))
+        return 0 if len(ok) == len(items) else 1
     notes = root / ".devaccel" / f"batch-{slug}-pr.md"  # its own file (never the session's ship.md); ship removes it
     title = a.title or f"batch: {len(ok)} units ({slug})"
     if not write_nofollow(notes, title + "\n" + "\n".join(lines) + "\n"):

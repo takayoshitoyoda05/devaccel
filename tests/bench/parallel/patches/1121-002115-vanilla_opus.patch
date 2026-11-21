@@ -1,0 +1,328 @@
+diff --git a/src/kakeibo/budget.py b/src/kakeibo/budget.py
+new file mode 100644
+index 0000000..dd594ac
+--- /dev/null
++++ b/src/kakeibo/budget.py
+@@ -0,0 +1,138 @@
++"""Budget status checks (pure functions, no I/O).
++
++カテゴリごとの月予算に対して、実績を OK / NEAR(もうすぐ超えそう) / OVER(超過)
++に分類する。予算の読み込みは ``kakeibo.core.load_budget``、月×カテゴリ集計は
++``kakeibo.core.monthly_totals`` を使う。
++
++判定ルール(金額はすべて円の整数、判定は整数演算のみ):
++
++- OVER: ``actual > limit``(ちょうど予算は超過ではない。``find_overruns`` と同じ)
++- NEAR: OVER ではなく、``actual > 0`` かつ ``actual * 100 >= limit * warn_percent``
++- OK:   それ以外(支出 0 は予算 0 でも OK)
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable, Mapping
++from dataclasses import dataclass
++from enum import Enum
++
++from kakeibo.core import Budget
++
++DEFAULT_WARN_PERCENT = 80
++
++
++class BudgetStatus(Enum):
++    OK = "ok"
++    NEAR = "near"
++    OVER = "over"
++
++
++@dataclass(frozen=True)
++class BudgetCheck:
++    month: str  # "YYYY-MM"
++    category: str
++    limit: int
++    actual: int
++    status: BudgetStatus
++
++    @property
++    def remaining(self) -> int:
++        """予算の残り(超過時は負)。"""
++        return self.limit - self.actual
++
++    @property
++    def used_percent(self) -> int | None:
++        """予算の消化率(%、切り捨て)。予算 0 のときは None。"""
++        if self.limit == 0:
++            return None
++        return self.actual * 100 // self.limit
++
++
++def _validate_warn_percent(warn_percent: int) -> None:
++    if (
++        isinstance(warn_percent, bool)
++        or not isinstance(warn_percent, int)
++        or not 0 <= warn_percent <= 100
++    ):
++        raise ValueError(
++            f"warn_percent は 0〜100 の整数である必要があります: {warn_percent!r}"
++        )
++
++
++def classify(
++    actual: int, limit: int, warn_percent: int = DEFAULT_WARN_PERCENT
++) -> BudgetStatus:
++    """実績 actual と予算 limit から状態を返す。"""
++    _validate_warn_percent(warn_percent)
++    if limit < 0:
++        raise ValueError(f"limit は 0 以上である必要があります: {limit!r}")
++    if actual > limit:
++        return BudgetStatus.OVER
++    if actual > 0 and actual * 100 >= limit * warn_percent:
++        return BudgetStatus.NEAR
++    return BudgetStatus.OK
++
++
++def check_month(
++    month: str,
++    actuals: Mapping[str, int],
++    limits: Mapping[str, int],
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> list[BudgetCheck]:
++    """1か月分を判定する。予算のあるカテゴリだけが対象(支出なしは実績 0)。
++
++    結果はカテゴリ名の昇順。予算のないカテゴリの支出は無視する。
++    """
++    _validate_warn_percent(warn_percent)
++    return [
++        BudgetCheck(
++            month=month,
++            category=cat,
++            limit=limits[cat],
++            actual=actuals.get(cat, 0),
++            status=classify(actuals.get(cat, 0), limits[cat], warn_percent),
++        )
++        for cat in sorted(limits)
++    ]
++
++
++def check_budget(
++    totals: Mapping[str, Mapping[str, int]],
++    budget: Budget,
++    warn_percent: int = DEFAULT_WARN_PERCENT,
++) -> list[BudgetCheck]:
++    """``monthly_totals`` の結果全体を判定する。
++
++    対象月は totals に現れる月(昇順)。各月の予算は ``budget.for_month`` で決まる。
++    """
++    _validate_warn_percent(warn_percent)
++    out: list[BudgetCheck] = []
++    for month in sorted(totals):
++        out.extend(
++            check_month(month, totals[month], budget.for_month(month), warn_percent)
++        )
++    return out
++
++
++def alerts(checks: Iterable[BudgetCheck]) -> list[BudgetCheck]:
++    """知らせるべきもの(OVER と NEAR)だけを、OVER → NEAR の順で返す。
++
++    同じ状態の中では元の順序(月昇順・カテゴリ名昇順)を保つ。
++    """
++    lst = [c for c in checks if c.status is not BudgetStatus.OK]
++    return sorted(lst, key=lambda c: c.status is not BudgetStatus.OVER)
++
++
++def format_alert(check: BudgetCheck) -> str:
++    """通知用の1行メッセージ。OK を渡すと ValueError。"""
++    head = f"{check.month} {check.category}"
++    detail = f"予算 {check.limit:,} / 実績 {check.actual:,}"
++    if check.status is BudgetStatus.OVER:
++        return f"警告: {head} {-check.remaining:,}円超過 ({detail})"
++    if check.status is BudgetStatus.NEAR:
++        return (
++            f"注意: {head} 予算の{check.used_percent}%を使用 "
++            f"残り {check.remaining:,}円 ({detail})"
++        )
++    raise ValueError("OK の項目は通知対象ではありません")
+diff --git a/tests/test_budget_status.py b/tests/test_budget_status.py
+new file mode 100644
+index 0000000..eb16955
+--- /dev/null
++++ b/tests/test_budget_status.py
+@@ -0,0 +1,178 @@
++from datetime import date
++
++import pytest
++
++from kakeibo.budget import (
++    BudgetCheck,
++    BudgetStatus,
++    alerts,
++    check_budget,
++    check_month,
++    classify,
++    format_alert,
++)
++from kakeibo.core import Budget, Expense, find_overruns, monthly_totals
++
++OK, NEAR, OVER = BudgetStatus.OK, BudgetStatus.NEAR, BudgetStatus.OVER
++
++
++@pytest.mark.parametrize(
++    ("actual", "limit", "expected"),
++    [
++        (0, 1000, OK),
++        (799, 1000, OK),
++        (800, 1000, NEAR),  # 閾値ちょうどは NEAR
++        (999, 1000, NEAR),
++        (1000, 1000, NEAR),  # 予算ちょうどは超過ではない
++        (1001, 1000, OVER),
++        (0, 0, OK),  # 予算 0・支出 0
++        (1, 0, OVER),
++        (1, 1, NEAR),
++        (-500, 1000, OK),  # 返金などで負
++    ],
++)
++def test_classify_default_threshold(actual, limit, expected):
++    assert classify(actual, limit) is expected
++
++
++def test_classify_threshold_uses_integer_math():
++    # 1/3 などで浮動小数の誤差が出ないこと: 3 * 100 >= 10 * 30
++    assert classify(3, 10, warn_percent=30) is NEAR
++    assert classify(2, 10, warn_percent=30) is OK
++    assert classify(70, 100, warn_percent=70) is NEAR
++    assert classify(69, 100, warn_percent=70) is OK
++
++
++def test_classify_threshold_edges():
++    assert classify(1000, 1000, warn_percent=100) is NEAR
++    assert classify(999, 1000, warn_percent=100) is OK
++    assert classify(1, 1000, warn_percent=0) is NEAR
++    assert classify(0, 1000, warn_percent=0) is OK
++
++
++@pytest.mark.parametrize("pct", [-1, 101, 80.0, True, "80"])
++def test_classify_rejects_bad_warn_percent(pct):
++    with pytest.raises(ValueError):
++        classify(10, 100, warn_percent=pct)
++
++
++def test_classify_rejects_negative_limit():
++    with pytest.raises(ValueError):
++        classify(10, -1)
++
++
++def test_check_month_only_budgeted_categories_sorted():
++    res = check_month(
++        "2026-11",
++        {"food": 900, "misc": 99999, "rent": 80001},
++        {"rent": 80000, "food": 1000, "hobby": 5000},
++    )
++    assert res == [
++        BudgetCheck("2026-11", "food", 1000, 900, NEAR),
++        BudgetCheck("2026-11", "hobby", 5000, 0, OK),  # 支出なしは実績 0
++        BudgetCheck("2026-11", "rent", 80000, 80001, OVER),
++    ]
++
++
++def test_check_month_rejects_bad_warn_percent_even_without_limits():
++    with pytest.raises(ValueError):
++        check_month("2026-11", {}, {}, warn_percent=200)
++
++
++def test_check_budget_uses_month_override():
++    budget = Budget(
++        default={"food": 1000, "rent": 90000},
++        months={"2026-11": {"food": 3000}},
++    )
++    totals = {
++        "2026-11": {"rent": 80000, "food": 2000},
++        "2026-10": {"food": 1200},
++    }
++    res = check_budget(totals, budget)
++    assert [(c.month, c.category, c.limit, c.status) for c in res] == [
++        ("2026-10", "food", 1000, OVER),
++        ("2026-10", "rent", 90000, OK),
++        ("2026-11", "food", 3000, OK),
++        ("2026-11", "rent", 90000, NEAR),
++    ]
++
++
++def test_check_budget_empty():
++    assert check_budget({}, Budget({"food": 1}, {})) == []
++    assert check_budget({"2026-11": {"food": 5}}, Budget({}, {})) == []
++
++
++def test_check_budget_custom_warn_percent():
++    budget = Budget({"food": 1000}, {})
++    totals = {"2026-11": {"food": 500}}
++    assert check_budget(totals, budget)[0].status is OK
++    assert check_budget(totals, budget, warn_percent=50)[0].status is NEAR
++
++
++def test_check_budget_over_matches_find_overruns():
++    rows = [
++        Expense(date(2026, 10, 31), "food", 1500),
++        Expense(date(2026, 11, 1), "food", 1000),
++        Expense(date(2026, 11, 2), "rent", 80000),
++        Expense(date(2026, 11, 3), "hobby", 4500),
++        Expense(date(2026, 11, 4), "misc", 10),
++    ]
++    budget = Budget({"food": 1000, "rent": 79999, "hobby": 5000}, {})
++    totals = monthly_totals(rows)
++    over = {
++        (c.month, c.category, -c.remaining, c.limit, c.actual)
++        for c in check_budget(totals, budget)
++        if c.status is OVER
++    }
++    assert over == set(find_overruns(totals, budget))
++
++
++def test_check_budget_is_pure():
++    budget = Budget({"food": 1000}, {"2026-11": {"food": 2000}})
++    totals = {"2026-11": {"food": 1900}}
++    check_budget(totals, budget)
++    assert totals == {"2026-11": {"food": 1900}}
++    assert budget == Budget({"food": 1000}, {"2026-11": {"food": 2000}})
++
++
++def test_remaining_and_used_percent():
++    c = BudgetCheck("2026-11", "food", 1000, 1234, OVER)
++    assert c.remaining == -234
++    assert c.used_percent == 123
++    assert BudgetCheck("2026-11", "food", 3, 2, NEAR).used_percent == 66  # 切り捨て
++    assert BudgetCheck("2026-11", "food", 0, 0, OK).used_percent is None
++
++
++def test_alerts_over_first_then_near_stable():
++    checks = [
++        BudgetCheck("2026-10", "a", 100, 90, NEAR),
++        BudgetCheck("2026-10", "b", 100, 10, OK),
++        BudgetCheck("2026-10", "c", 100, 150, OVER),
++        BudgetCheck("2026-11", "a", 100, 101, OVER),
++        BudgetCheck("2026-11", "b", 100, 80, NEAR),
++    ]
++    assert [(c.month, c.category) for c in alerts(checks)] == [
++        ("2026-10", "c"),
++        ("2026-11", "a"),
++        ("2026-10", "a"),
++        ("2026-11", "b"),
++    ]
++    assert alerts([]) == []
++    assert alerts(iter(checks[:2])) == [checks[0]]
++
++
++def test_format_alert_over_matches_cli_warning():
++    c = BudgetCheck("2026-11", "food", 1000, 2000, OVER)
++    assert format_alert(c) == "警告: 2026-11 food 1,000円超過 (予算 1,000 / 実績 2,000)"
++
++
++def test_format_alert_near():
++    c = BudgetCheck("2026-11", "rent", 90000, 85500, NEAR)
++    assert format_alert(c) == (
++        "注意: 2026-11 rent 予算の95%を使用 残り 4,500円 (予算 90,000 / 実績 85,500)"
++    )
++
++
++def test_format_alert_rejects_ok():
++    with pytest.raises(ValueError):
++        format_alert(BudgetCheck("2026-11", "food", 1000, 10, OK))

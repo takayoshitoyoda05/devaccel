@@ -1,0 +1,346 @@
+diff --git a/src/kakeibo/__init__.py b/src/kakeibo/__init__.py
+index d8ec261..656bb6e 100644
+--- a/src/kakeibo/__init__.py
++++ b/src/kakeibo/__init__.py
+@@ -15,6 +15,7 @@ from kakeibo.core import (
+     monthly_totals,
+     total_by_category,
+ )
++from kakeibo.jsonio import JsonError, export_json, load_json
+ 
+ 
+ def _version() -> str:
+@@ -54,6 +55,18 @@ def main() -> None:
+         help="既定出力の並び順: amount=金額降順(既定) / name=カテゴリ名昇順(--report では無視)",
+     )
+     p.add_argument("--budget", type=Path, help="予算 JSON(超過を stderr に警告)")
++    p.add_argument(
++        "--import",
++        dest="import_json",
++        action="store_true",
++        help="入力ファイルを CSV ではなく JSON として読む(--export の出力形式)",
++    )
++    p.add_argument(
++        "--export",
++        type=Path,
++        metavar="PATH",
++        help="読み込んだ全件を JSON で PATH に書く(--memo の絞り込み前。集計表示も通常どおり行う)",
++    )
+     args = p.parse_args()
+     budget = None
+     if args.budget is not None:
+@@ -63,11 +76,17 @@ def main() -> None:
+             print(e, file=sys.stderr)
+             sys.exit(2)
+     try:
+-        rows = load_csv(args.csv)
+-    except CsvError as e:
+-        for line, reason in e.errors:
+-            print(f"{line}: {reason}", file=sys.stderr)
++        rows = load_json(args.csv) if args.import_json else load_csv(args.csv)
++    except (CsvError, JsonError) as e:
++        for where, reason in e.errors:
++            print(f"{where}: {reason}", file=sys.stderr)
+         sys.exit(1)
++    if args.export is not None:
++        try:
++            export_json(rows, args.export)
++        except OSError as e:
++            print(f"書き出せません: {e.strerror}: {args.export}", file=sys.stderr)
++            sys.exit(2)
+     if args.memo is not None:
+         had_rows = bool(rows)
+         rows = [r for r in rows if args.memo in r.memo]
+diff --git a/src/kakeibo/jsonio.py b/src/kakeibo/jsonio.py
+new file mode 100644
+index 0000000..82e8b31
+--- /dev/null
++++ b/src/kakeibo/jsonio.py
+@@ -0,0 +1,113 @@
++"""JSON export / import of expenses.
++
++形式: {"expenses": [{"date": "2026-11-01", "category": "food", "amount": 1200, "memo": "lunch"}]}
++
++判断:
++D1: 最上位はオブジェクト({"expenses": [...]})か、配列そのもの。どちらも受ける。それ以外は拒否。
++D2: date は ISO 形式の文字列(CSV と同じ date.fromisoformat)。category は文字列(前後の空白は除く)。
++D3: amount は整数のみ。小数(12.5)・文字列("500")・真偽値は拒否。負数は CSV と同じく受ける(返金)。
++D4: memo は省略・null で ""。あるなら文字列。
++D5: 未知のキーは無視する。空の配列は空の結果。
++D6: 誤りは全件報告する。1 件に複数あれば全部。場所は `expenses[2].amount` の形、値も添える。
++D7: 壊れた JSON は 1 件の誤りとして行・列を報告する。読めないファイルも JsonError。
++D8: export は読み込んだ全件を入力の順で、ensure_ascii=False・indent=2 で書く(--memo の絞り込み前)。
++"""
++
++from __future__ import annotations
++
++import json
++from datetime import date
++from pathlib import Path
++
++from kakeibo.core import Expense
++
++
++class JsonError(ValueError):
++    """Raised when JSON input is invalid. errors: list of (location, reason)."""
++
++    def __init__(self, errors: list[tuple[str, str]]) -> None:
++        super().__init__("; ".join(f"{where}: {why}" for where, why in errors))
++        self.errors = errors
++
++
++def export_json(rows: list[Expense], path: Path) -> None:
++    data = {
++        "expenses": [
++            {
++                "date": e.day.isoformat(),
++                "category": e.category,
++                "amount": e.amount,
++                "memo": e.memo,
++            }
++            for e in rows
++        ]
++    }
++    path.write_text(
++        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
++    )
++
++
++def _parse_item(
++    item: object, where: str, errors: list[tuple[str, str]]
++) -> Expense | None:
++    if not isinstance(item, dict):
++        errors.append((where, f"オブジェクトである必要があります: {item!r}"))
++        return None
++    n = len(errors)
++    day = None
++    for col in ("date", "category", "amount"):
++        if col not in item:
++            errors.append((f"{where}.{col}", "項目がありません"))
++    raw = item.get("date")
++    if "date" in item:
++        try:
++            day = date.fromisoformat(raw) if isinstance(raw, str) else None
++        except ValueError:
++            day = None
++        if day is None:
++            errors.append((f"{where}.date", f"日付が不正です(YYYY-MM-DD): {raw!r}"))
++    cat = item.get("category")
++    if "category" in item and not isinstance(cat, str):
++        errors.append((f"{where}.category", f"文字列である必要があります: {cat!r}"))
++    amount = item.get("amount")
++    if "amount" in item and (isinstance(amount, bool) or not isinstance(amount, int)):
++        errors.append((f"{where}.amount", f"整数である必要があります: {amount!r}"))
++    memo = item.get("memo")
++    if memo is not None and not isinstance(memo, str):
++        errors.append((f"{where}.memo", f"文字列である必要があります: {memo!r}"))
++    if len(errors) > n:
++        return None
++    assert day is not None and isinstance(cat, str) and isinstance(amount, int)
++    return Expense(day=day, category=cat.strip(), amount=amount, memo=memo or "")
++
++
++def load_json(path: Path) -> list[Expense]:
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except OSError as e:
++        raise JsonError([(str(path), f"読めません: {e.strerror}")]) from None
++    except json.JSONDecodeError as e:
++        raise JsonError(
++            [(f"{e.lineno}行{e.colno}列", f"JSON が不正です: {e.msg}")]
++        ) from None
++    except ValueError as e:  # UnicodeDecodeError
++        raise JsonError([(str(path), f"JSON が不正です: {e}")]) from None
++    if isinstance(data, dict):
++        if "expenses" not in data:
++            raise JsonError([("expenses", "項目がありません")])
++        items = data["expenses"]
++        base = "expenses"
++    else:
++        items = data
++        base = "$"
++    if not isinstance(items, list):
++        raise JsonError([(base, "配列である必要があります")])
++    rows: list[Expense] = []
++    errors: list[tuple[str, str]] = []
++    for i, item in enumerate(items):
++        e = _parse_item(item, f"{base}[{i}]", errors)
++        if e is not None:
++            rows.append(e)
++    if errors:
++        raise JsonError(errors)
++    return rows
+diff --git a/tests/test_json.py b/tests/test_json.py
+new file mode 100644
+index 0000000..926c553
+--- /dev/null
++++ b/tests/test_json.py
+@@ -0,0 +1,168 @@
++import json
++from datetime import date
++
++import pytest
++
++from kakeibo import main
++from kakeibo.core import Expense
++from kakeibo.jsonio import JsonError, export_json, load_json
++
++HEADER = "date,category,amount,memo\n"
++BODY = "2026-11-01,food,1200,昼食\n2026-11-02,rent,80000,\n2026-11-03,food,800,coffee\n"
++
++
++def _run(monkeypatch, *argv):
++    monkeypatch.setattr("sys.argv", ["kakeibo", *map(str, argv)])
++    try:
++        main()
++    except SystemExit as e:
++        return e.code
++    return 0
++
++
++def _json(tmp_path, obj):
++    p = tmp_path / "in.json"
++    p.write_text(obj if isinstance(obj, str) else json.dumps(obj), encoding="utf-8")
++    return p
++
++
++def _item(**kw):
++    base = {"date": "2026-11-01", "category": "food", "amount": 100}
++    return {**base, **kw}
++
++
++def _errors(tmp_path, obj):
++    with pytest.raises(JsonError) as ei:
++        load_json(_json(tmp_path, obj))
++    return dict(ei.value.errors)
++
++
++def test_roundtrip(tmp_path):
++    rows = [
++        Expense(date(2026, 11, 1), "food", 1200, "昼食"),
++        Expense(date(2026, 11, 2), "refund", -300),
++    ]
++    p = tmp_path / "out.json"
++    export_json(rows, p)
++    assert "昼食" in p.read_text(encoding="utf-8")  # ensure_ascii=False (D8)
++    assert load_json(p) == rows
++
++
++def test_top_level_list_and_empty(tmp_path):
++    assert load_json(_json(tmp_path, [_item()]))[0].amount == 100  # D1
++    assert load_json(_json(tmp_path, {"expenses": []})) == []  # D5
++
++
++def test_optional_memo_and_unknown_keys(tmp_path):
++    rows = load_json(_json(tmp_path, {"expenses": [_item(memo=None, extra=1)]}))
++    assert rows[0].memo == ""  # D4, D5
++
++
++def test_category_stripped(tmp_path):
++    assert load_json(_json(tmp_path, [_item(category=" food ")]))[0].category == "food"
++
++
++def test_broken_json_reports_position(tmp_path):
++    errs = _errors(tmp_path, '{"expenses": [\n  {"date": }\n]}')
++    ((where, reason),) = errs.items()
++    assert where == "2行12列"  # D7
++    assert "JSON が不正" in reason
++
++
++def test_missing_file(tmp_path):
++    with pytest.raises(JsonError):
++        load_json(tmp_path / "nope.json")
++
++
++def test_bad_top_level(tmp_path):
++    assert "expenses" in _errors(tmp_path, {"foo": []})
++    assert "配列" in _errors(tmp_path, {"expenses": {}})["expenses"]
++    assert "配列" in _errors(tmp_path, '"x"')["$"]
++
++
++def test_missing_fields_reported_by_path(tmp_path):
++    errs = _errors(
++        tmp_path, {"expenses": [_item(), {"date": "2026-11-01", "memo": "x"}]}
++    )
++    assert errs == {
++        "expenses[1].category": "項目がありません",
++        "expenses[1].amount": "項目がありません",
++    }
++
++
++@pytest.mark.parametrize(
++    "field,value",
++    [
++        ("amount", 12.5),
++        ("amount", "500"),
++        ("amount", True),
++        ("amount", None),
++        ("date", "2026-02-30"),
++        ("date", "2026/11/01"),
++        ("date", 20261101),
++        ("category", 5),
++        ("memo", 5),
++    ],
++)
++def test_bad_values(tmp_path, field, value):
++    errs = _errors(tmp_path, {"expenses": [_item(**{field: value})]})
++    assert list(errs) == [f"expenses[0].{field}"]
++    assert repr(value) in errs[f"expenses[0].{field}"]  # 元の値を含む
++
++
++def test_non_object_item(tmp_path):
++    assert "オブジェクト" in _errors(tmp_path, {"expenses": [1]})["expenses[0]"]
++
++
++def test_all_errors_reported(tmp_path):
++    errs = _errors(
++        tmp_path,
++        {"expenses": [_item(amount="x", date="bad"), _item(), _item(category=1)]},
++    )
++    assert list(errs) == [
++        "expenses[0].date",
++        "expenses[0].amount",
++        "expenses[2].category",
++    ]  # D6
++
++
++def test_cli_export_then_import_same_totals(tmp_path, monkeypatch, capsys):
++    csv_p = tmp_path / "in.csv"
++    csv_p.write_text(HEADER + BODY, encoding="utf-8")
++    out = tmp_path / "out.json"
++    assert _run(monkeypatch, csv_p, "--export", out) == 0
++    from_csv = capsys.readouterr().out
++    assert from_csv == "rent\t80,000\nfood\t2,000\n"
++    assert _run(monkeypatch, out, "--import") == 0
++    assert capsys.readouterr().out == from_csv
++    assert _run(monkeypatch, out, "--import", "--report") == 0
++    assert capsys.readouterr().out == "2026-11\trent\t80000\n2026-11\tfood\t2000\n"
++
++
++def test_cli_export_ignores_memo_filter(tmp_path, monkeypatch, capsys):
++    csv_p = tmp_path / "in.csv"
++    csv_p.write_text(HEADER + BODY, encoding="utf-8")
++    out = tmp_path / "out.json"
++    _run(monkeypatch, csv_p, "--memo", "coffee", "--export", out)
++    assert capsys.readouterr().out == "food\t800\n"
++    assert len(load_json(out)) == 3  # D8
++
++
++def test_cli_import_error_exit_1(tmp_path, monkeypatch, capsys):
++    p = _json(tmp_path, {"expenses": [_item(amount="x"), _item(date="bad")]})
++    assert _run(monkeypatch, p, "--import") == 1
++    err = capsys.readouterr().err
++    assert "expenses[0].amount:" in err
++    assert "expenses[1].date:" in err
++
++
++def test_cli_import_broken_json_exit_1(tmp_path, monkeypatch, capsys):
++    assert _run(monkeypatch, _json(tmp_path, "{"), "--import") == 1
++    assert "1行2列: JSON が不正です" in capsys.readouterr().err
++
++
++def test_cli_export_unwritable_exit_2(tmp_path, monkeypatch, capsys):
++    csv_p = tmp_path / "in.csv"
++    csv_p.write_text(HEADER + BODY, encoding="utf-8")
++    assert _run(monkeypatch, csv_p, "--export", tmp_path / "no" / "out.json") == 2
++    assert "書き出せません" in capsys.readouterr().err

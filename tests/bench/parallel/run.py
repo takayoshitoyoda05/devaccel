@@ -38,11 +38,11 @@ def sh(cmd: list[str], cwd: Path, timeout: int = 3600) -> subprocess.CompletedPr
 CAP: int | None = None  # --cap: CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS for this run (command-line settings win)
 
 
-def claude(prompt: str, cwd: Path, model: str) -> tuple[dict, float]:
+def claude(prompt: str, cwd: Path, model: str, effort: str = "") -> tuple[dict, float]:
     t0 = time.time()
     extra = ["--settings", json.dumps({"env": {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": str(CAP)}})] if CAP else []
     r = sh(["claude", "-p", prompt, "--output-format", "json", "--model", model, "--permission-mode", "acceptEdits",
-            *extra], cwd)
+            *(["--effort", effort] if effort else []), *extra], cwd)
     wall = time.time() - t0
     try:
         return json.loads(r.stdout), wall
@@ -121,7 +121,39 @@ def run_fanout(trial: Path, extra: list[str] | None = None) -> tuple[dict, float
             "result": (r.stdout + r.stderr)[-2500:]}, wall
 
 
+VANILLA = Path.home() / "programming/python/devaccel-vanilla"  # the trial without devaccel (same personal trimming)
+
+
+def run_vanilla(arm: str, tasks: str, heldout: Path, effort: str = "") -> dict:
+    """Plain Claude Code, one session, sequential, no devaccel; commits at the end (no PR: that only flatters
+    the baseline). Quality is graded on the resulting diff exactly like the other arms."""
+    model = {"vanilla_sonnet": "claude-sonnet-5-5", "vanilla_opus": "claude-opus-5-5"}[arm]
+    base = sh(["git", "rev-parse", "HEAD"], VANILLA).stdout.strip()
+    prompt = tasks + "\n実装とテストが終わったら git commit して。" + TAIL
+    j, wall = claude(prompt, VANILLA, model, effort)
+    sh(["git", "add", "-A"], VANILLA)
+    sh(["git", "-c", "user.name=b", "-c", "user.email=b@b", "commit", "-qm", "leftover"], VANILLA)
+    patch = HERE / "patches" / f"{dt.datetime.now():%m%d-%H%M%S}-{arm}.patch"
+    patch.parent.mkdir(exist_ok=True)
+    patch.write_text(sh(["git", "diff", base, "HEAD"], VANILLA).stdout, encoding="utf-8")
+    wt = Path(sh(["mktemp", "-d"], VANILLA).stdout.strip()) / "g"
+    sh(["git", "worktree", "add", "-q", "--detach", str(wt), "HEAD"], VANILLA)
+    shutil.copy(heldout, wt / "tests" / heldout.name)
+    sh(["uv", "sync", "-q"], wt)
+    r = sh(["uv", "run", "pytest", "-q", f"tests/{heldout.name}"], wt)
+    sh(["git", "worktree", "remove", "--force", str(wt)], VANILLA)
+    sh(["git", "reset", "-q", "--hard", base], VANILLA)
+    sh(["git", "clean", "-q", "-fdx", "-e", ".claude/settings.local.json", "-e", ".venv"], VANILLA)
+    return {"arm": arm + ("_med" if effort else ""), "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"),
+            "turns": j.get("num_turns"), "models": usage(j), "prs": [], "result_tail": (j.get("result") or "")[-300:],
+            "heldout": (r.stdout.strip().splitlines() or [""])[-1], "heldout_ok": r.returncode == 0,
+            "merge_conflicts": [], "patch": patch.name}
+
+
 def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dict:
+    if arm.startswith("vanilla_"):
+        med = arm.endswith("_med")
+        return run_vanilla(arm[: -len("_med")] if med else arm, tasks, heldout, "medium" if med else "")
     sh(["git", "checkout", "-q", "main"], trial)
     sh(["git", "pull", "-q"], trial)
     before = {p["number"] for p in open_prs(trial)}
@@ -140,6 +172,9 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
         rec["patch"] = patch.name
         cleanup(trial, new)
         return rec
+    effort, label = "", arm
+    if arm.endswith("_med"):  # the parent session at medium effort (units keep their own)
+        effort, arm, label = "medium", arm[: -len("_med")], arm
     if arm.endswith("_haiku"):  # the whole session (parent) on haiku; units are haiku anyway
         model = "claude-haiku-5-5"
         arm_base = arm[: -len("_haiku")]
@@ -161,7 +196,7 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
         how = OLD_PR if arm_base == "seq_old" else "最後に devaccel-pr スキルで PR を 1 本作って。"
         prompt = tasks + "\n上の各件を 1 つのセッションで順番に実装し、" + how + TAIL
     t_start = time.time()
-    j, wall = claude(prompt, trial, model)
+    j, wall = claude(prompt, trial, model, effort)
     new = [p for p in open_prs(trial) if p["number"] not in before]
     fan = trial / ".devaccel" / "batch-last.json"  # nested fan-out units are billed outside this session's JSON
     fan_cost = None
@@ -171,7 +206,7 @@ def run_arm(arm: str, trial: Path, tasks: str, heldout: Path, model: str) -> dic
             fan_cost = fj.get("cost_usd")
     if fan_cost is not None and j.get("total_cost_usd") is not None:
         j["total_cost_usd"] = round(j["total_cost_usd"] + fan_cost, 4)
-    rec = {"arm": arm, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "fanout_cost": fan_cost, "turns": j.get("num_turns"),
+    rec = {"arm": label, "wall_s": round(wall), "cost_usd": j.get("total_cost_usd"), "fanout_cost": fan_cost, "turns": j.get("num_turns"),
            "models": usage(j), "prs": [(p["number"], [x["name"] for x in p["labels"]]) for p in new],
            "result_tail": (j.get("result") or "")[-300:]}
     patch = HERE / "patches" / f"{dt.datetime.now():%m%d-%H%M%S}-{arm}.patch"
