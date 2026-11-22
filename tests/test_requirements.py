@@ -1687,6 +1687,19 @@ class AsyncShipTest(ReqKit):
         r = sh(self.root, "python3", ".claude/hooks/devaccel_ship.py", "--check", "--file", self.notes(), env=env)
         return r, env, log
 
+    def tearDown(self):
+        # the hook starts finalize detached: let it finish before the temp dirs go (CI raced on rmtree)
+        for lock in (self.root / ".claude/state").glob("finalize-*.pid"):
+            try:
+                pid = int(lock.read_text())
+            except (OSError, ValueError):
+                continue
+            for _ in range(150):
+                if not Path(f"/proc/{pid}").exists():
+                    break
+                time.sleep(0.2)
+        super().tearDown()
+
     def hook(self, env: dict) -> subprocess.CompletedProcess:
         # finalize fetches https://github.com/o/r.git into a private repo: map it to the test origin globally
         gc = self.tmp / "gitconfig"
