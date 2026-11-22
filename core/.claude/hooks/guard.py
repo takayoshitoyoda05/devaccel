@@ -288,20 +288,28 @@ def capture_prompt(data: dict, root: Path) -> None:
 
 
 _TAIL = re.compile(r"\s*2>&1\s*(?:\|\s*(?:tail|head)(?:\s+-n)?(?:\s+-?\d+)?\s*)?$")
-_NEWBRANCH = re.compile(r"^\s*git (?:checkout(?: -q)? -b|switch(?: -q)? -c) (\w[\w./-]*)(?: -q)?\s*&&\s*")
+# harmless leading steps the model chains before ship (each bounce cost a turn): a branch query or status, a
+# `cd` to where it already is, or making the work branch (ship's --branch does that)
+_PREFIX = re.compile(r"^\s*(?:cd\s+(?P<cd>[^\s;&|`$<>'\"]+)|git branch --show-current|git status(?: --short| -s)?|"
+                     r"git (?:checkout(?: -q)? -b|switch(?: -q)? -c) (?P<br>\w[\w./-]*)(?: -q)?"
+                     r"(?:\s*2>&1\s*\|\s*(?:tail|head)(?:\s+-n)?(?:\s+-?\d+)?)?)\s*(?:&&|;)\s*")
 _LONE_SHIP = re.compile(r"\s*python3 \.claude/hooks/devaccel_ship\.py(?: [^`$<>;&|\n\r\\]*)?")
 
 
 def ship_fix(command: str, cfg: dict, cwd: Path, project: Path) -> str | None:
-    """The two shapes that made the ship call bounce (16 of 30 runs, a turn each): a trailing `2>&1 | tail -N`
-    and a leading `git checkout -b X &&`. Rewritten to the plain form the model was told to use (`--branch X`
-    makes the branch), and only if that form is a lone ship call the guard itself has no objection to."""
-    fixed, m = command, _NEWBRANCH.match(command)
-    if m:
+    """The shapes that made the ship call bounce (16 of 30 runs, a turn each; on click 8 of 22): a trailing
+    `2>&1 | tail -N` and harmless leading steps (`git checkout -b X &&`, `git branch --show-current;`, `cd <here>;`).
+    Rewritten to the plain form the model was told to use (`--branch X` makes the branch), and only if that form
+    is a lone ship call the guard itself has no objection to."""
+    fixed, branch = command, ""
+    while (m := _PREFIX.match(fixed)) and "devaccel_ship" in fixed[m.end():]:
+        if m.group("cd") and Path(m.group("cd")).expanduser().resolve() != cwd.resolve():
+            return None  # a cd elsewhere changes which repository ship acts on
+        branch = m.group("br") or branch
         fixed = fixed[m.end():]
     fixed = _TAIL.sub("", fixed)
-    if m and " --branch " not in f" {fixed} ":
-        fixed += f" --branch {m.group(1)}"
+    if branch and " --branch " not in f" {fixed} ":
+        fixed += f" --branch {branch}"
     if (fixed == command or not _LONE_SHIP.fullmatch(fixed) or not SHIP_RUN.fullmatch(fixed)
             or len(_segments(fixed)) != 1 or decide(fixed, cfg, cwd, project) is not None):
         return None

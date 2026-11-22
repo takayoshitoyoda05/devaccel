@@ -126,7 +126,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | GATE-14 | trusted root の `check.sh` が無い、または認識できない `cd` 行を持つ場合、ゲートは別の木を検査してはならず、`missing` として記録しなければならない。 | 0.8.3 | unit |
 | GATE-15 | `DEVACCEL_GATE_MODE` が `off` / `observe` / `enforce` のいずれかなら対話セッションの `mode` だけを上書きし(単位の `unit_mode` は上書きしない)、それ以外の値は無視しなければならない。 | README, 0.9.0 | unit |
 | GATE-16 | 本物の Claude Code で /batch の単位(サブエージェント)が終了するとき、`SubagentStop` でゲートが発火し、単位の worktree を検査して本体に記録しなければならない。 | 0.6.0、0.6.4、D13 | e2e-smoke |
-| GATE-17 | ゲートと land は check.sh を bubblewrap で隔離して実行しなければならない: 作業ツリー以外は読み取り専用、作業ツリーの `.git` と本体の検証基盤も読み取り専用、`$HOME` は許可リスト(ツールチェーンは読み取り専用、ツールのキャッシュのみ書き込み可)、`.env` は隠し、環境変数は最小限、`/run`(= `/var/run`)は空にする(docker.sock・D-Bus・ssh-agent・WSL interop のソケットに接続させない: 0.15.5)。bwrap が無ければ未検査として表示しなければならない(素の権限で実行してはならない)。 | 0.10.0 監査 H1 | unit |
+| GATE-17 | ゲートと land は check.sh を bubblewrap で隔離して実行しなければならない: 作業ツリー以外は読み取り専用、作業ツリーの `.git` と本体の検証基盤も読み取り専用、`$HOME` は許可リスト(ツールチェーンは読み取り専用、ツールのキャッシュのみ書き込み可)、`.env` は隠し、環境変数は最小限、`/run`(= `/var/run`)は空にする(docker.sock・D-Bus・ssh-agent・WSL interop のソケットに接続させない: 0.15.5)。bwrap が無ければ未検査として表示しなければならない(素の権限で実行してはならない)。すでに隔離されているとみなすのは Claude Code のサンドボックスの目印(`SANDBOX_RUNTIME=1`)があるときだけ(0.15.6)。 | 0.10.0 監査 H1 | unit |
 | GATE-18 | 作業単位は、ブランチ名(`spike/*`)や worktree の `.git` リンクの破壊でゲートを止められてはならない。判定前後で同じ「検査対象」の定義を使い、コミット済みの変更でエスカレーション後もブロックし続けてはならない。 | 0.10.0 監査 | unit |
 
 ### 2.6 GUARD(`guard.py`)
@@ -171,6 +171,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | SHIP-07 | `--check` は作業ツリーで check.sh fast を先に実行し、失敗したら何も commit・push せず失敗した段の末尾を出さなければならない(PR の証拠の計算は変えない)。 | 0.15.0 | unit |
 | SHIP-08 | `--check --units` は部品のブランチを作業ブランチ(親の未コミットの変更を含む)に統合してから全体を検査し、通るまで commit・push しない。出荷後、HEAD に含まれる `unit/` ブランチを消す。 | 0.15.0 | unit |
 | SHIP-09 | `--check` の check.sh fast は、ローカルの commit の後に PR の証拠(check.sh full)と並べて実行してよい。fast が落ちたら commit を取り消し(新規ファイルは未追跡に戻る)、push しない。fast が自動修正したら、修正を commit してその commit で証拠を取り直す。 | 0.15.1 | unit |
+| SHIP-10 | Claude Code のサンドボックスの中(`SANDBOX_RUNTIME=1`)で、settings に PostToolUse の finalize フックがあれば、ship は check.sh fast → push → 下書き PR まで行って返ってよい。証拠はフック(サンドボックスの外)が起動する `devaccel_pr.py --finalize` が作り、次を満たさなければならない: (1) GitHub に、その commit を待つ下書き PR(本文に `pending head=<sha>`)があるときだけ検査を始める、(2) commit と base は GitHub から専用の場所(`.claude/state/judge`)へ取り寄せて検査し、プロジェクトの `.git`(サンドボックスから書ける)は読まない、(3) 同じブランチの finalize は同時に 1 つ、(4) 本文・ラベルの更新と下書きの解除は PR の head がその commit のままのときだけで、解除の後にも確かめ、動いていたら下書きに戻して evidence-ok を外す。依頼ファイルは辿らず(O_NOFOLLOW・通常ファイルのみ)読み、フックは `.claude/hooks` に何も残してはならない。それ以外(端末・サンドボックスなし・フックなし)では従来どおり同期で証拠を作る。 | 0.15.6 | unit |
 | BATCH-EDGE | 関数の型が書かれていない番号付きの件の単位には、件が触れる端のケースの節(最大 2 つ)を渡す。型まで書かれた件には渡さない。 | 0.15.0 | unit |
 | BATCH-01 | `devaccel_batch.py` は単位ごとに `<main>/.claude/worktrees/<x>` を作り、`claude -p` を同時に起動しなければならない。Claude Code のサンドボックスの中(入れ子の bwrap が起動できない)では、単位を起動する前に拒否する。 | 0.12.0 / 0.13.0 | integration |
 | BATCH-02 | 単位を統合するのは、コミットがあり、かつスクリプト自身がそのコミットを本体の check.sh fast で隔離して検査して通り、検査の前後で木が変わらなかったものだけでなければならない(単位が書けるゲートの記録は信用しない)。 | 0.12.0 / 0.13.0(監査 M2) | integration |
