@@ -93,6 +93,27 @@ LAND_MERGE = re.compile(r"devaccel_land.*\s-+m", re.S)  # defense in depth, anyw
 PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 HOOKS_GLOB = re.compile(r"\.claude/hooks/\S*[*?\[{]|\.claude/hooks/?\s|\.claude/hook[*?\[{]|\.claude/[*?\[{]")
 PTY = re.compile(r"(?:^|[\s;&|(])(?:script|unbuffer|expect|empty|socat)\s")
+# The whole command is one `cat > f <<'EOF'` / `cat >> f <<'EOF'` / `tee [-a] f <<'EOF'` / `python3 - <<'EOF'` with a
+# quoted delimiter
+# (bash takes the body literally: no $(...), no backticks) and an exact closing line: the body is file content, not
+# commands (test code naming `expect`, an edit script with "empty" in a message, were refused, losing the whole
+# write). A Python body is still searched (see _pty). Anything else is checked as it is.
+_DATA_HEREDOC = re.compile(r"(?:cat[ \t]*>>?[ \t]*[\w./-]+|tee(?:[ \t]+-a)?[ \t]+[\w./-]+|(?:uv run )?python3? -)[ \t]*"
+                           r"<<[ \t]*(['\"])(\w+)\1[ \t]*\n(?:(?!\2\n)[^\n]*\n)*\2\n?")  # body: no line equal to the delimiter
+
+
+_PY_PTY = re.compile(r"""["'](?:script|unbuffer|expect|empty|socat)\b""")  # how Python would launch one
+
+
+def _pty(command: str) -> bool:
+    """Whole-command data heredocs (cat/tee) are file content; a Python heredoc is still searched, for a string that
+    starts with a wrapper's name ("expect x", ["script", ...]) rather than for the bare words its code uses."""
+    m = _DATA_HEREDOC.fullmatch(command)
+    if m and not command.lstrip().startswith(("cat", "tee")):
+        return bool(_PY_PTY.search(command))
+    if m:
+        return False
+    return bool(PTY.search(command.replace("'", "").replace('"', "").replace("\\", "")))
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
 PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
 GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
@@ -177,7 +198,7 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         if not branch or branch in _protected_branches(cwd, cfg):
             return "deny", f"デフォルトブランチ({branch or 'detached HEAD'})へは push できません。作業ブランチを切ってください。"
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
-    if PTY.search(flat):
+    if _pty(command):
         return "deny", "script / unbuffer / expect などの疑似端末ラッパーは使えません(人の確認を偽装できるため)。"
     if HOOKS_GLOB.search(flat):
         return "deny", ".claude/hooks/ のファイルはワイルドカードや展開を使わず、名前を正確に書いてください。"

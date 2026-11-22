@@ -942,6 +942,17 @@ class GuardReqTest(unittest.TestCase):
         """GRD-09: expect / empty / socat pseudo-terminal wrappers are denied."""
         for cmd in ["expect x", "empty -f x", "socat - x"]:
             self.assertEqual(self.v(cmd), "deny", cmd)
+        # a file written from a heredoc is data: test code naming `expect` is not a wrapper (it cost a whole write)
+        self.assertIsNone(self.v("cat >> tests/test_x.py <<'EOF'\ndef test_a(t, expect):\n    assert t == expect\nEOF"))
+        self.assertIsNone(self.v("python3 - <<'EOF'\nmsg = 'must not be empty or'\nexpect = 1\nEOF"))
+        for cmd in ["cat <<'EOF' | bash\nexpect x\nEOF", "bash <<EOF\nscript -q x\nEOF",
+                    "cat >> f <<EOF\nx\nEOF\nexpect y", "cat > f <<EOF; expect z\nEOF",
+                    "cat > f <<EOF\n$(expect x)\nEOF",  # unquoted delimiter: the body is expanded
+                    "echo 'x\ncat > f <<\"EOF\"\n'; expect y\nEOF",  # header inside a quoted string
+                    "cat > f <<'EOF'\nx\nEOF\nexpect y\nEOF",
+                    "python3 - <<'EOF'\nimport os\nos.system('expect x')\nEOF",
+                    "python3 - <<'EOF'\nimport subprocess\nsubprocess.run([\"script\", \"-q\"])\nEOF"]:  # the first EOF closes it: `expect y` runs
+            self.assertEqual(self.v(cmd), "deny", cmd)
 
     def test_GRD10_ask_regex_applies(self):
         """GRD-10: a valid project guard.ask_regex is applied."""

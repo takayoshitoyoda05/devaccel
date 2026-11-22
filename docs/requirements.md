@@ -141,7 +141,7 @@ devaccel は Claude Code 用のプロジェクト配布型キットである。�
 | GRD-06 | `devaccel_pr.py` の実行は `python3 .claude/hooks/devaccel_pr.py …` の形で単独(同じコマンドに並べてよいのは読むだけのコマンドのみ)に限り、環境変数の代入・`export`・`alias`・`source`・関数定義・`cd`・他コマンドへのパイプと並べた形を deny しなければならない。 | 0.5.1、0.5.2、0.8.3、0.8.4 | unit |
 | GRD-07 | `devaccel_land.py` は引数なしか `--dry-run` の形だけを通し、`--merge` とその省略形(`--m…`)はコマンド内のどこにあっても(改行をまたいでも)deny しなければならない。 | 0.5.0〜0.5.2 | unit |
 | GRD-08 | PR / land スクリプトの実行は、実行する木の `devaccel_pr.py`・`devaccel_land.py`・`devaccel_common.py`・`stop_gate.py` が trusted root の lock のハッシュと一致するときだけ通し、lock が無い・読めない場合は deny しなければならない。guard の設定と lock は worktree から読んではならない。 | 0.4.0、0.6.1 | unit |
-| GRD-09 | guard は疑似端末ラッパー(`script`、`unbuffer`、`expect`、`empty`、`socat`)と、`.claude/hooks/` を指すワイルドカード・ブレース展開、`cd .claude/hooks` を deny しなければならない。 | 0.5.3 | unit |
+| GRD-09 | guard は疑似端末ラッパー(`script`、`unbuffer`、`expect`、`empty`、`socat`)と、`.claude/hooks/` を指すワイルドカード・ブレース展開、`cd .claude/hooks` を deny しなければならない。ただし、コマンド全体が区切りを引用した 1 つの `cat`/`tee` の heredoc なら本文は調べず、`python3 - <<'EOF'` の本文はラッパー名で始まる文字列だけを調べる(本文は展開されないファイルの中身・コードのため)。 | 0.5.3、0.15.8 | unit |
 | GRD-10 | guard は内部エラー時に許可してはならず(ask に倒す)、`project.json` の不正な正規表現で組み込み規則を無効にしてはならず、有効な `guard.deny_regex` / `ask_regex` は適用しなければならない。 | 0.1.1 | unit |
 | GRD-11 | guard は通常の開発コマンド(具体的なパスの `rm -rf`、`git commit -F`、`2>&1`、検査語を含む引用符つき文字列やヒアドキュメントでのファイル作成、`.env` という語を含むだけのコマンド)を deny / ask にしてはならない。 | 0.1.12、0.2.0、D5b | unit |
 | GRD-12 | guard は PR/land スクリプトの横(作業単位の `.claude/hooks/`)に lock 外のファイル(`json.py` 等、`__pycache__`)があれば実行を拒否しなければならない(モジュールのすり替え)。(sys.path の順序はスクリプト実行では防御にならないため、余剰ファイルの拒否と sandbox の denyWrite で守る。) | 0.10.0 監査 H3 | unit |
