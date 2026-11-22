@@ -133,9 +133,10 @@ def main() -> int:
                                         sandbox=need_confinement(cfg))
         return res, out, secs
 
-    def fast_failed(res: str, out: str, secs: float) -> int:
+    def fast_failed(res: str, out: str, secs: float, kept: str = "") -> int:
         stage, tail = failed_section(out) if res == "fail" else (res, out[-1500:])
-        print(f"check.sh fast: {res} ({stage}, {secs:.0f}s) — your changes are not committed and nothing was pushed"
+        print(f"check.sh fast: {res} ({stage}, {secs:.0f}s) — "
+              f"{kept or 'your changes are not committed and nothing was pushed'}"
               f"{' (the units are merged)' if merged else ''}; fix and re-run\n{tail}",
               file=sys.stderr)
         return 1
@@ -218,6 +219,18 @@ def main() -> int:
     return rc
 
 
+def early_fix(root: Path, title: str, head: str, pre: str, sha: str) -> tuple[str, bool]:
+    """check.sh fast reformats first and its later stages only read, so edits seen while it still runs are the
+    formatter's: fold them into the commit and push that before the draft names a sha (the end of ship checks
+    the tree again, so anything later still gets the slow path)."""
+    sh(root, "add", "-u")
+    sh(root, "commit", "-q", "--amend", "--no-edit") if pre and sha != pre else sh(root, "commit", "-q", "-m", title)
+    new = git(root, "rev-parse", "HEAD").strip()
+    q = subprocess.run(["git", "-C", str(root), "push", "-q", f"--force-with-lease=refs/heads/{head}:{sha}", "origin",
+                        f"HEAD:refs/heads/{head}"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    return new, q.returncode == 0
+
+
 def cleanup_notes(root: Path, a) -> None:
     nf = Path(a.file) if Path(a.file).is_absolute() else Path.cwd() / a.file
     if root.resolve() in nf.resolve().parents:
@@ -239,35 +252,86 @@ def async_ready(root: Path, cfg: dict) -> bool:
 
 def ship_async(root: Path, a, title: str, notes: str, head: str, pre: str, fast_check, fast_failed,
                t: float) -> int | None:
-    """check.sh fast -> push -> draft PR -> request for the finalize hook -> return. The hook (outside the
+    """check.sh fast beside push + draft PR -> request for the finalize hook -> return. The hook (outside the
     sandbox) starts devaccel_pr.py --finalize, which judges the pushed commit with the base check.sh, fills in
-    the body and label and readies the PR. None: no draft, so the caller takes the synchronous path."""
-    res, out, secs = fast_check()
-    t = stamp("check.sh fast", t)
+    the body and label and readies the PR. None: no draft, so the caller takes the synchronous path.
+
+    The push and the draft (~6 s on GitHub) overlap check.sh fast. That is safe because nothing is judged yet:
+    a draft cannot be merged and only a passing fast writes the finalize request. If fast fails, the branch on
+    GitHub is put back (or removed, if this push created it) and the local commit is undone, as before."""
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(1)
+    fast = pool.submit(fast_check)
+    sha = git(root, "rev-parse", "HEAD").strip()
+    p = subprocess.run(["git", "-C", str(root), "push", "--porcelain", "origin", f"HEAD:refs/heads/{head}"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    pushed = p.returncode == 0
+    old = None  # what the branch on GitHub was before this push ("" = this push created it; None = unknown)
+    m = re.search(r"^([ +*])\t[^\t]*\t(\S+)", p.stdout, re.M) if pushed else None  # flag, from:to, summary
+    if m and m.group(2).startswith("[new"):
+        old = ""
+    elif m and ".." in m.group(2):  # "abc1234..def5678" (abbreviated): resolve locally, or leave it alone
+        old = git(root, "rev-parse", "-q", "--verify", m.group(2).split("..")[0] + "^{commit}").strip() or None
+    t = stamp("push", t)
+    failed_early = fast.done() and fast.result()[0] != "pass"  # no draft for a commit that is going back
+    if pushed and not failed_early and git(root, "status", "--porcelain", "--untracked-files=no").strip():
+        new, ok = early_fix(root, title, head, pre, sha)  # fast's formatter already ran: amend before the draft
+        if not ok:  # GitHub still has the first push: a PR on this branch must not stay ready with it
+            open_draft(root, title, head, sha)
+            fast.result()
+            pool.shutdown()
+            print("push failed after the formatter's fix (the PR is a draft); re-run ship", file=sys.stderr)
+            return 1
+        sha = new
+    url = open_draft(root, title, head, sha) if pushed and not failed_early else ""
+    t = stamp("draft PR", t)
+    res, out, secs = fast.result()
+    pool.shutdown()
+    t = stamp("waited for check.sh fast", t)
+
+    def put_back() -> bool:
+        if old is None:
+            return False
+        lease = f"--force-with-lease=refs/heads/{head}:{sha}"
+        spec = f"{old}:refs/heads/{head}" if old else f":refs/heads/{head}"
+        return subprocess.run(["git", "-C", str(root), "push", "-q", lease, "origin", spec], capture_output=True,
+                              stdin=subprocess.DEVNULL).returncode == 0
     if res != "pass":
+        if pushed and put_back():
+            print("(the branch on GitHub was put back; a PR it already had stays a draft until the next ship)",
+                  file=sys.stderr)
+        elif pushed:
+            if not url:  # this push may have moved a PR that was ready: it must not stay ready with it
+                open_draft(root, title, head, sha)
+            # keep the local commit too, so the next push is a fast-forward
+            return fast_failed(res, out, secs, kept=f"this commit stays (locally and on GitHub's {head}, as a draft "
+                               "that cannot be merged); the next ship adds the fix on top")
         if git(root, "rev-parse", "HEAD").strip() != pre:
             sh(root, "reset", "-q", pre) if pre else sh(root, "update-ref", "-d", "HEAD")
         return fast_failed(res, out, secs)
-    if git(root, "status", "--porcelain", "--untracked-files=no").strip():  # fast auto-fixed formatting
-        sh(root, "add", "-u")
-        sh(root, "commit", "-q", "--amend", "--no-edit") if pre and git(root, "rev-parse", "HEAD").strip() != pre \
-            else sh(root, "commit", "-q", "-m", title)
-    sha = git(root, "rev-parse", "HEAD").strip()
-    p = subprocess.run(["git", "-C", str(root), "push", "origin", f"HEAD:refs/heads/{head}"],
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    if p.returncode != 0:
+    if not pushed:
         print("push failed: " + (p.stderr.strip() or p.stdout.strip())[:300], file=sys.stderr)
         return 1
-    t = stamp("push", t)
-    url = open_draft(root, title, head, sha)
-    t = stamp("draft PR", t)
+    if git(root, "status", "--porcelain", "--untracked-files=no").strip():  # fast auto-fixed formatting
+        sh(root, "add", "-u")
+        sh(root, "commit", "-q", "--amend", "--no-edit") if pre and sha != pre \
+            else sh(root, "commit", "-q", "-m", title)
+        new = git(root, "rev-parse", "HEAD").strip()
+        q = subprocess.run(["git", "-C", str(root), "push", f"--force-with-lease=refs/heads/{head}:{sha}", "origin",
+                            f"HEAD:refs/heads/{head}"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if q.returncode != 0:
+            print("push failed: " + (q.stderr.strip() or q.stdout.strip())[:300] + " (the PR stays a draft; re-run"
+                  " ship)", file=sys.stderr)
+            return 1
+        sha = new
+        url = open_draft(root, title, head, sha) if url else ""
+        t = stamp("amend + push + draft", t)
     if not url:
         return None
     write_nofollow(root / ".devaccel" / "finalize.json",
                    json.dumps({"sha": sha, "branch": head, "title": title, "notes": notes}, ensure_ascii=False))
     print(f"{url}  [証拠を作成中: base の check.sh full がこの commit で終わるとラベルが付き、下書きが解除される]")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

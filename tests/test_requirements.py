@@ -1695,6 +1695,64 @@ class AsyncShipTest(ReqKit):
         return sh(self.root, "python3", ".claude/hooks/devaccel_finalize.py", env=e,
                   stdin=json.dumps({"cwd": str(self.root), "tool_name": "Bash"}))
 
+    def test_SHIP10_failed_fast_puts_github_back(self):
+        """The push and the draft overlap check.sh fast: when fast fails, the branch on GitHub is put back (a new
+        branch is removed, an existing one returns to its old commit), nothing stays committed locally and no
+        finalize request is written."""
+        self.with_origin()
+        origin = self.tmp / "o.git"
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("BROKEN\n")
+        r, _env, _log = self.ship()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("put back", r.stderr)
+        self.assertNotEqual(sh(origin, "git", "rev-parse", "-q", "--verify", "refs/heads/feat").returncode, 0)
+        self.assertFalse((self.root / ".devaccel/finalize.json").exists())
+        self.assertEqual(sh(self.root, "git", "rev-parse", "HEAD").stdout, sh(self.root, "git", "rev-parse", "main").stdout)
+        (self.root / "app.py").write_text("X = 3\n")
+        self.commit("good")
+        sh(self.root, "git", "push", "-q", "origin", "HEAD:refs/heads/feat")
+        good = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        (self.root / "app.py").write_text("BROKEN\n")
+        r, _env, _log = self.ship()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(sh(origin, "git", "rev-parse", "refs/heads/feat").stdout.strip(), good)
+        self.assertEqual(sh(self.root, "git", "rev-parse", "HEAD").stdout.strip(), good)
+        self.assertEqual((self.root / "app.py").read_text(), "BROKEN\n")  # the work is kept, uncommitted
+
+    def test_SHIP10_formatter_fix_is_folded_in_before_the_draft(self):
+        """fast's formatter edits the tree while the push runs: the fix is amended and pushed before the draft
+        names a sha, so the draft, the finalize request and GitHub all carry the formatted commit."""
+        self.set_check('if [ "$1" = fast ]; then sed -i "s/X=4/X = 4/" app.py; sleep 4; fi\n'
+                       'echo "== stage: tests"\necho "== ok: tests (0s)"\n')
+        self.with_origin()
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        (self.root / "app.py").write_text("X=4\n")
+        r, _env, log = self.ship()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        head = sh(self.root, "git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(sh(self.root, "git", "show", "HEAD:app.py").stdout, "X = 4\n")
+        self.assertEqual(sh(self.tmp / "o.git", "git", "rev-parse", "refs/heads/feat").stdout.strip(), head)
+        self.assertEqual(json.loads((self.root / ".devaccel/finalize.json").read_text())["sha"], head)
+        self.assertEqual(log.read_text().count("pr create"), 1)
+        self.assertIn(f"head={head}", log.read_text())
+
+    def test_SHIP11_hand_run_fast_check_with_edits_goes_to_ship(self):
+        """check.sh fast by hand while there are edits: denied (ship --check runs it next); clean tree, full, or
+        spike/* branches are left alone (and nothing changes with pr.auto off)."""
+        self.set_cfg({"pr": {"auto": True}})
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        self.assertIsNone(self.gv("scripts/check.sh fast 2>&1 | tail -25"))  # clean: a baseline run is fine
+        (self.root / "app.py").write_text("X = 9\n")
+        for cmd in ["scripts/check.sh fast", "scripts/check.sh fast 2>&1 | tail -25", "bash scripts/check.sh fast"]:
+            self.assertEqual(self.gv(cmd), "deny", cmd)
+        self.assertIsNone(self.gv("scripts/check.sh full"))
+        sh(self.root, "git", "checkout", "-qb", "spike/x")
+        self.assertIsNone(self.gv("scripts/check.sh fast"))
+        sh(self.root, "git", "checkout", "-q", "feat")
+        self.set_cfg({"pr": {"auto": False}}, commit=False)
+        self.assertIsNone(self.gv("scripts/check.sh fast"))
+
     def test_SHIP10_settings_wire_the_finalize_hook(self):
         post = json.loads((self.root / ".claude/settings.json").read_text())["hooks"]["PostToolUse"]
         self.assertIn("devaccel_finalize.py", json.dumps(post))

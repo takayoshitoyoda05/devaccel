@@ -15,6 +15,7 @@ On internal error it asks instead of allowing.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -256,6 +257,8 @@ def decide(command: str, cfg: dict, cwd: Path | None = None, project: Path | Non
     for rx, why in _compile_extra(extra.get("ask_regex", []), "guard.ask_regex"):
         if rx.search(flat):
             return "ask", why
+    if fast_dup(command, cfg, cwd):
+        return "deny", FAST_DUP
     return None
 
 
@@ -314,6 +317,22 @@ def ship_fix(command: str, cfg: dict, cwd: Path, project: Path) -> str | None:
             or len(_segments(fixed)) != 1 or decide(fixed, cfg, cwd, project) is not None):
         return None
     return fixed
+
+
+_FAST_RUN = re.compile(r"\s*(?:(?:ba)?sh\s+)?(?:\./)?scripts/check\.sh\s+fast\s*(?:2>&1)?\s*"
+                       r"(?:\|\s*(?:tail|head)(?:\s+-n)?(?:\s+-?\d+)?\s*)?")
+FAST_DUP = ("ship --check が同じ check.sh fast を行い、落ちれば何も commit せず失敗の末尾を返す。ここでは回さず、"
+            ".devaccel/ship.md を Write して ship を実行する(click で 3 割の回が 7〜15 秒ずつ二重に払っていた)")
+
+
+def fast_dup(command: str, cfg: dict, cwd: Path) -> bool:
+    """`scripts/check.sh fast` run by hand while there are edits to ship: ship --check runs exactly that next."""
+    if not cfg.get("pr", {}).get("auto", True) or not _FAST_RUN.fullmatch(command):
+        return False
+    br = _current_branch(cwd)
+    if any(fnmatch.fnmatch(br, g) for g in cfg.get("gate", {}).get("skip_branches", [])):
+        return False
+    return bool(git(cwd, "status", "--porcelain").strip())
 
 
 def main() -> int:
