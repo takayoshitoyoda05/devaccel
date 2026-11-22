@@ -29,6 +29,10 @@ DEFAULTS: dict = {
     },
     "scale": {
         "large_if_files_over": 3,
+        # prose (changelog, docs) is still in the diff but not in the file count: a 1-module feature with its
+        # changelog line and docs page is not "L" (click features hit 5 files this way). .claude/**, CLAUDE.md
+        # and AGENTS.md stay "machinery" (always a human)
+        "prose_globs": ["*.md", "*.rst", "*.adoc"],
         "base_branch": "main",
         "risky_paths": [
             "**/auth/**",

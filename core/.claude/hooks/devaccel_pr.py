@@ -225,8 +225,10 @@ def static_triage(root: Path, cfg: dict, base: str, ref: str,
                 tests_shrunk.append(path)
     reasons = []
     # same threshold for integrated batches: more files = a human reads it (no relaxation per unit)
-    if len(files) > int(scale["large_if_files_over"]):
-        reasons.append(f"L 規模({len(files)} ファイル)")
+    counted = [f for f in files if not match_any(f, scale.get("prose_globs", []))]
+    if len(counted) > int(scale["large_if_files_over"]):
+        extra = f"、文書 {len(files) - len(counted)} を除く" if len(counted) < len(files) else ""
+        reasons.append(f"L 規模({len(counted)} ファイル{extra})")
     if risky:
         reasons.append("リスクのあるパス: " + ", ".join(risky[:5]))
     if odd:

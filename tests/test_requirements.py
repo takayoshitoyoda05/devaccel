@@ -1630,6 +1630,31 @@ class R6ShipTest(ReqKit):
             reasons = devaccel_pr.static_triage(self.root, cfg, base, "HEAD", units)[1]
             self.assertTrue(any("L 規模" in x for x in reasons), units)
 
+    def test_PR04_prose_not_counted(self):
+        """Changelog and docs pages do not make a 1-module feature 'L'; code and machinery still count."""
+        sys.path.insert(0, str(KIT / "core/.claude/hooks"))
+        import devaccel_pr
+        cfg = json.loads(json.dumps(DEFAULTS))
+        sh(self.root, "git", "checkout", "-qb", "feat")
+        base = sh(self.root, "git", "rev-parse", "main").stdout.strip()
+        for f, body in [("src/m.py", "Z = 1\n"), ("tests/test_m.py", "def test_z():\n    pass\n"),
+                        ("tests/test_n.py", "def test_n():\n    pass\n"), ("CHANGES.md", "- m\n"),
+                        ("docs/m.rst", "m\n")]:
+            (self.root / f).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / f).write_text(body)
+        self.commit("feature + docs")
+        reasons = devaccel_pr.static_triage(self.root, cfg, base, "HEAD")[1]
+        self.assertFalse(any("L 規模" in x for x in reasons), reasons)
+        (self.root / "src/k.py").write_text("K = 1\n")
+        self.commit("one more module")
+        reasons = devaccel_pr.static_triage(self.root, cfg, base, "HEAD")[1]
+        self.assertTrue(any("L 規模(4 ファイル、文書 2 を除く)" in x for x in reasons), reasons)
+        (self.root / ".claude").mkdir(exist_ok=True)
+        (self.root / ".claude/x.md").write_text("x\n")
+        self.commit("machinery md")
+        reasons = devaccel_pr.static_triage(self.root, cfg, base, "HEAD")[1]
+        self.assertTrue(any("検証基盤" in x for x in reasons), reasons)
+
     def test_SHIP05_guard_forms(self):
         sh(self.root, "git", "checkout", "-qb", "feat")
         self.assertIsNone(self.gv("python3 .claude/hooks/devaccel_ship.py --file .devaccel/ship.md --paths a.py"))
