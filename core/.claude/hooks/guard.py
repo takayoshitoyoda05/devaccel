@@ -15,6 +15,7 @@ On internal error it asks instead of allowing.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -92,6 +93,27 @@ LAND_MERGE = re.compile(r"devaccel_land.*\s-+m", re.S)  # defense in depth, anyw
 PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 HOOKS_GLOB = re.compile(r"\.claude/hooks/\S*[*?\[{]|\.claude/hooks/?\s|\.claude/hook[*?\[{]|\.claude/[*?\[{]")
 PTY = re.compile(r"(?:^|[\s;&|(])(?:script|unbuffer|expect|empty|socat)\s")
+# The whole command is one `cat > f <<'EOF'` / `cat >> f <<'EOF'` / `tee [-a] f <<'EOF'` / `python3 - <<'EOF'` with a
+# quoted delimiter
+# (bash takes the body literally: no $(...), no backticks) and an exact closing line: the body is file content, not
+# commands (test code naming `expect`, an edit script with "empty" in a message, were refused, losing the whole
+# write). A Python body is still searched (see _pty). Anything else is checked as it is.
+_DATA_HEREDOC = re.compile(r"(?:cat[ \t]*>>?[ \t]*[\w./-]+|tee(?:[ \t]+-a)?[ \t]+[\w./-]+|(?:uv run )?python3? -)[ \t]*"
+                           r"<<[ \t]*(['\"])(\w+)\1[ \t]*\n(?:(?!\2\n)[^\n]*\n)*\2\n?")  # body: no line equal to the delimiter
+
+
+_PY_PTY = re.compile(r"""["'](?:script|unbuffer|expect|empty|socat)\b""")  # how Python would launch one
+
+
+def _pty(command: str) -> bool:
+    """Whole-command data heredocs (cat/tee) are file content; a Python heredoc is still searched, for a string that
+    starts with a wrapper's name ("expect x", ["script", ...]) rather than for the bare words its code uses."""
+    m = _DATA_HEREDOC.fullmatch(command)
+    if m and not command.lstrip().startswith(("cat", "tee")):
+        return bool(_PY_PTY.search(command))
+    if m:
+        return False
+    return bool(PTY.search(command.replace("'", "").replace('"', "").replace("\\", "")))
 # anywhere in a segment (bash -c "git push ...", xargs git push, eval ...): not just at the start
 PUSH_ANY = re.compile(r"(?<![\w./-])git\s+(?:\S+\s+)*?push\b")
 GH_ANY = re.compile(r"(?<![\w./-])gh\s+(?:pr|api|repo|release|run|workflow|auth|secret|variable|issue|label|"
@@ -176,7 +198,7 @@ def _git_policy(command: str, cfg: dict, cwd: Path, project: Path) -> tuple[str,
         if not branch or branch in _protected_branches(cwd, cfg):
             return "deny", f"デフォルトブランチ({branch or 'detached HEAD'})へは push できません。作業ブランチを切ってください。"
     flat = command.replace("'", "").replace('"', "").replace("\\", "")
-    if PTY.search(flat):
+    if _pty(command):
         return "deny", "script / unbuffer / expect などの疑似端末ラッパーは使えません(人の確認を偽装できるため)。"
     if HOOKS_GLOB.search(flat):
         return "deny", ".claude/hooks/ のファイルはワイルドカードや展開を使わず、名前を正確に書いてください。"
@@ -256,6 +278,8 @@ def decide(command: str, cfg: dict, cwd: Path | None = None, project: Path | Non
     for rx, why in _compile_extra(extra.get("ask_regex", []), "guard.ask_regex"):
         if rx.search(flat):
             return "ask", why
+    if fast_dup(command, cfg, cwd):
+        return "deny", FAST_DUP
     return None
 
 
@@ -314,6 +338,22 @@ def ship_fix(command: str, cfg: dict, cwd: Path, project: Path) -> str | None:
             or len(_segments(fixed)) != 1 or decide(fixed, cfg, cwd, project) is not None):
         return None
     return fixed
+
+
+_FAST_RUN = re.compile(r"\s*(?:(?:ba)?sh\s+)?(?:\./)?scripts/check\.sh\s+fast\s*(?:2>&1)?\s*"
+                       r"(?:\|\s*(?:tail|head)(?:\s+-n)?(?:\s+-?\d+)?\s*)?")
+FAST_DUP = ("ship --check が同じ check.sh fast を行い、落ちれば何も commit せず失敗の末尾を返す。ここでは回さず、"
+            ".devaccel/ship.md を Write して ship を実行する(click で 3 割の回が 7〜15 秒ずつ二重に払っていた)")
+
+
+def fast_dup(command: str, cfg: dict, cwd: Path) -> bool:
+    """`scripts/check.sh fast` run by hand while there are edits to ship: ship --check runs exactly that next."""
+    if not cfg.get("pr", {}).get("auto", True) or not _FAST_RUN.fullmatch(command):
+        return False
+    br = _current_branch(cwd)
+    if any(fnmatch.fnmatch(br, g) for g in cfg.get("gate", {}).get("skip_branches", [])):
+        return False
+    return bool(git(cwd, "status", "--porcelain").strip())
 
 
 def main() -> int:
