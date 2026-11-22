@@ -28,7 +28,7 @@ Claude Code で **並列・無人の作業に検証の安全網を足す** プ�
 ## 使い方
 
 ```bash
-git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.6   # タグで固定
+git clone https://github.com/takayoshitoyoda05/devaccel ~/devaccel && cd ~/devaccel && git checkout v0.15.7   # タグで固定
 cd /path/to/project            # git リポジトリのルート
 ~/devaccel/install.sh          # 導入(既存ファイルは上書きしない)
 claude                         # 起動して信頼ダイアログを承認(必須・1台1回)→ /devaccel-setup
@@ -113,7 +113,7 @@ update.sh は `.claude/settings.json` を書き換えない。0.15.6 の速い P
 2. 大きな独立作業の束(逐次で 5 分を超えそう・4 件以上・ファイルの重なりなし)は `/devaccel-batch <一覧>`: 作業単位 `devaccel-unit`(haiku・worktree)が実装・テスト・コミットだけを並列に行い、親が `devaccel_ship.py --units` で統合(衝突した単位は外す)→ base の check.sh を 1 回 → PR 1 本。本文はスクリプトが機械的に組み立てる証拠: `check.sh full` の結果、実動作確認の記録、受け入れ条件、変更規模、統合した/外した単位。L は並列化せず design スキルで 1 本ずつ。
 3. ラベルで振り分け:
    - `evidence-ok`: 検査通過・実動作確認あり・S/M・リスクのあるパスなし → 証拠だけ見てマージ
-   - `needs-human`: 理由つき(検査失敗、確認なし、L 規模、risky_paths、テスト削除/skip、ゲートの判断依頼、未チェックの受け入れ条件) → 差分を読む
+   - `needs-human`: 理由つき(検査失敗、確認なし、L 規模(文書は数えない)、risky_paths、テスト削除/skip、ゲートの判断依頼、未チェックの受け入れ条件) → 差分を読む
 4. 任意: `.claude/project.json` の `"parallel": {"auto_merge": true}` で `evidence-ok` を自動マージ(GitHub 側で auto-merge を許可し、`check` ワークフローを必須チェックにしたブランチ保護が必要)。最初は off で振り分けの精度を見て、evidence-ok のリバートが出ない期間が続いてから。
 5. 押し出しの規則: push は作業ブランチから origin の同名ブランチへだけ(main/master・デフォルトブランチ・force・他リモート不可)。シェルの `git push origin HEAD` は guard が、`devaccel_ship.py` の push はスクリプト自身が同じ規則で検査する。`gh` は直接使えず、PR は lock と一致する `devaccel_pr.py` / `devaccel_ship.py` だけが作る。サンドボックス内のコマンドは確認なしで動く(`autoAllowBashIfSandboxed`)ので、並列の単位が確認待ちで止まらない。**本当の境界は GitHub 側**: guard は文字列判定の best-effort(`bash -c` 等の経由も拒否するが、完全ではない)。デフォルトブランチを保護する(PR 必須・force push 禁止・`check` を必須チェック)のが最後の砦で、`~/devaccel/protect.sh`(人が実行、確認あり)で設定できる。Claude も同じアカウントで動くため「承認必須」は個人開発では自分を締め出すだけなので入れない。サーバーが保証するのは「main に直接入らない・CI が赤いものはマージできない」まで。プランによっては非公開リポジトリでブランチ保護が使えないので、その場合は guard と PR 判定のみが頼り。より厳密にするなら、push と PR 作成だけができる fine-grained token を使う。
 6. **統合(land)**: 各 PR の証拠は分岐時点の base に対するもの。兄弟 PR が先に入ると古くなる(テキスト衝突、「単独では緑・合わせると赤」)。マージは `python3 .claude/hooks/devaccel_land.py --merge`(人が実行)で行う: `evidence-ok` の PR をコード → docs の順に最新 base へ一時 worktree で 1 本ずつ合わせ、そのつど base 側の `check.sh full` を実行。衝突・失敗した PR は理由つきで `needs-human` に落とし(昇格はしない)、通った PR を squash merge する(検証した木 = マージ後の木。途中で base が動いたら止まる)。`--merge` なしは検証と降格だけ、`--dry-run` は何も変えない。重なるファイルを持つ PR は最初に表示される。落ちた PR は担当の作業ツリーで `git merge origin/main` → push → devaccel-pr 再実行で直す(force push 不要)。
